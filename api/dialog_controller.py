@@ -1,105 +1,69 @@
-import json
+"""HTTP controller for the OpenAI-compatible chat endpoint.
+
+Thin: it routes (resume / start-bridge / plain chat) and acts as the composition
+root — it injects the active provider's tool strategy (`providers.active().run`)
+into the provider-agnostic MCP engine. OpenAI request parsing lives in
+`conversation/openai_request.py`; the engine lives in `mcp_bridge/`.
+"""
+import logging
 import time
 
-from fastapi import APIRouter
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException
+
+import providers
+from conversation import openai_request as oreq
+from conversation.non_streaming_responder import NonStreamingResponder
+from conversation.streaming_responder import StreamingResponder
+from mcp_bridge import server as engine
+from model.chat import ChatCompletionRequest, ChatCompletionResponse
+
+log = logging.getLogger("mcp_bridge")
 
 router = APIRouter()
 
 
-class ChatRequest(BaseModel):
-    message: str
-    context_path: str
-    conversation_session_id: str
-
-
-class ChatResponse(BaseModel):
-    reply: str
-    conversation_session_id: str
-
-
-@router.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
-    return ChatResponse(
-        reply=f"Received: {request.message}",
-        conversation_session_id=request.conversation_session_id,
-    )
-
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-
-class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: list[ChatMessage]
-    stream: bool = False
-
-
-class ChatCompletionChoice(BaseModel):
-    index: int
-    message: ChatMessage
-    finish_reason: str
-
-
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: list[ChatCompletionChoice]
-
-
 @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-def chat_completions(request: ChatCompletionRequest):
-    user_messages = [m for m in request.messages if m.role == "user"]
-    last = user_messages[-1] if user_messages else request.messages[-1]
-
+async def chat_completions(request: ChatCompletionRequest):
     created = int(time.time())
 
-    if request.stream:
-        def event_stream():
-            content_chunk = {
-                "id": "chatcmpl-dumb-router",
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": request.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": last.content},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-            yield f"data: {json.dumps(content_chunk)}\n\n"
+    provider = providers.active()
 
-            final_chunk = {
-                "id": "chatcmpl-dumb-router",
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": request.model,
-                "choices": [
-                    {"index": 0, "delta": {}, "finish_reason": "stop"}
-                ],
-            }
-            yield f"data: {json.dumps(final_chunk)}\n\n"
+    if request.tools:
+        log.info("tools received from JetBrains: %s", oreq.advertised_names(request))
 
-            yield "data: [DONE]\n\n"
+    # STATELESS tool calling (Ollama): re-run the model from the full resent
+    # history each request. No background run / futures / resume — the client
+    # (JetBrains) drives the loop by resending the conversation with tool results.
+    if provider.NAME == "ollama" and request.stream and request.tools:
+        messages = oreq.to_messages(request)
+        events = provider.tool_chat(messages, oreq.all_tool_specs(request))
+        return StreamingResponder().tool_chat_response(events, request.model, created)
 
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-    return ChatCompletionResponse(
-        id="chatcmpl-dumb-router",
-        created=created,
-        model=request.model,
-        choices=[
-            ChatCompletionChoice(
-                index=0,
-                message=ChatMessage(role="assistant", content=last.content),
-                finish_reason="stop",
+    # RESUME: the client returned one or more tool results. Resolve each pending
+    # future by tool_call_id and continue streaming the same execution.
+    results = oreq.tool_results(request)
+    if results:
+        run = None
+        for m in results:
+            run = engine.resume(m.tool_call_id, m.content or "") or run
+        if run is None:
+            return StreamingResponder().reply(
+                "No pending tool call matched this result (it may have timed out).",
+                request.model, created,
             )
-        ],
-    )
+        return StreamingResponder().drain(run, request.model, created)
+
+    # START BRIDGE: streaming request advertising supported tools. The active
+    # provider's tool strategy is injected here so the engine stays agnostic.
+    if request.stream and oreq.supported_names(request):
+        prompt, system = oreq.build_prompt(request)
+        run = engine.start_run(prompt, system, oreq.tool_specs(request), strategy=providers.active().run)
+        return StreamingResponder().drain(run, request.model, created)
+
+    # PLAIN CHAT: no supported tools → tool calling disabled, unchanged behavior.
+    responder = StreamingResponder() if request.stream else NonStreamingResponder()
+    prompt, system = oreq.build_prompt(request)
+    try:
+        return await responder.build_completion(prompt, system, request.model, created)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Claude call failed: {exc}") from exc
