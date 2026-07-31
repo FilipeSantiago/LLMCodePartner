@@ -54,7 +54,6 @@ class ChatCompletionResponse(BaseModel):
 
 @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 def chat_completions(request: ChatCompletionRequest):
-    print(request)
     user_messages = [m for m in request.messages if m.role == "user"]
     last = user_messages[-1] if user_messages else request.messages[-1]
 
