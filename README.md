@@ -56,6 +56,46 @@ JetBrains Chat
               → Claude/Codex resumes  (same execution continues; answer streams out)
 ```
 
+### Sequence diagram
+
+Detailed round trip for the **Ollama** provider (stateless: the client re-sends the
+full conversation each turn; the tool decision is constrained by a JSON schema).
+Claude follows the same wire shape but intercepts tools via its in-process MCP
+server instead of a `/api/chat` decision call.
+
+![Tool-call sequence diagram](docs/img/sequence.svg)
+
+<details><summary>Mermaid source (for editing)</summary>
+
+```mermaid
+sequenceDiagram
+    participant J as JetBrains Chat
+    participant B as Backend /v1/chat/completions
+    participant P as Ollama provider
+    participant O as Ollama (qwen2.5-coder)
+
+    Note over J,O: Turn 1 — model decides it needs a tool
+    J->>B: POST (messages + tools, stream:true)
+    B->>B: to_messages(history); select provider (LLM_PROVIDER)
+    B->>P: tool_chat(messages, tool specs)
+    P->>O: POST /api/chat (format=decision schema, stream:false, temp:0)
+    O-->>P: {"tool":"get_file_text_by_path","arguments":{...}}
+    P-->>B: ("tool_calls", [...])
+    B-->>J: SSE delta.tool_calls + finish_reason=tool_calls + [DONE]
+    J->>J: execute the tool against the ACTIVE project
+
+    Note over J,O: Turn 2 — client re-sends full history (incl. role:tool result) → answer
+    J->>B: POST (full history + role:"tool" result)
+    B->>P: tool_chat(history)
+    P->>O: POST /api/chat (decision schema)
+    O-->>P: {"tool":"none"}
+    P->>O: POST /api/chat (stream:true, no tools)
+    O-->>P: streamed answer tokens
+    P-->>B: ("text", chunks)
+    B-->>J: SSE content deltas + finish_reason=stop + [DONE]
+```
+</details>
+
 Because the tool runs in the IDE, a call is bounced out to JetBrains and its
 result arrives on the *next* HTTP request. The in-flight Claude execution is held
 open in the meantime by an `asyncio.Future` keyed by `tool_call_id`.

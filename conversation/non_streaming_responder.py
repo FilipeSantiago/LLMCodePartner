@@ -5,7 +5,7 @@ from model.chat import ChatCompletionResponse, ChatCompletionChoice, ChatMessage
 
 class NonStreamingResponder(ChatResponder):
     """Non-streaming delivery: returns one complete `chat.completion` JSON object,
-    all at once, after Claude finishes."""
+    all at once, after the active provider finishes."""
 
     def __init__(self):
         super().__init__()

@@ -2,6 +2,11 @@ import asyncio
 import logging
 
 from dotenv import load_dotenv
+
+# Load .env BEFORE importing modules that read env vars at import time (e.g.
+# providers/ollama.py OLLAMA_MODEL/HOST, mcp_bridge/bridge.py MCP_TOOL_TIMEOUT).
+load_dotenv()
+
 from fastapi import FastAPI
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
@@ -9,7 +14,6 @@ from hypercorn.config import Config
 from api import dialog_controller, model_controller
 from logger.raw_log_middleware import RawLogMiddleware
 
-load_dotenv()
 logging.basicConfig(level=logging.INFO)  # surface mcp_bridge tool logs
 
 app = FastAPI(title="LLMCodePartner")

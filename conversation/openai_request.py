@@ -6,7 +6,7 @@ The single place that understands the OpenAI request shape. It turns a
 sees these OpenAI/pydantic types.
 """
 from model.chat import ChatCompletionRequest, ChatMessage
-from mcp_bridge.registry import SUPPORTED, ToolSpec
+from mcp_bridge.registry import ToolSpec
 
 _EMPTY_SCHEMA = {"type": "object", "properties": {}}
 
@@ -75,22 +75,8 @@ def tool_specs(request: ChatCompletionRequest) -> list[ToolSpec]:
     return specs
 
 
-# Same as tool_specs today, but named for the stateless path where we expose ALL
-# advertised tools (JetBrains executes them; no MCP server to build).
-all_tool_specs = tool_specs
-
-
 def advertised_names(request: ChatCompletionRequest) -> list[str]:
     return [n for n in (_function(t).get("name") for t in request.tools or []) if n]
-
-
-def supported_names(request: ChatCompletionRequest) -> list[str]:
-    """Advertised names the engine actually supports (for start-vs-plain routing)."""
-    out = []
-    for name in advertised_names(request):
-        if name in SUPPORTED and name not in out:
-            out.append(name)
-    return out
 
 
 def tool_results(request: ChatCompletionRequest) -> list[ChatMessage]:

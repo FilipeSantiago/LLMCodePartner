@@ -34,6 +34,10 @@ class DoneEvent:
     terminal: str
 
 
+# The neutral events a provider's `tools()` may yield, as one name.
+Event = TextEvent | ToolCallEvent | ErrorEvent | DoneEvent
+
+
 @dataclass
 class Run:
     """One in-flight Claude/Codex execution, isolated per request.
