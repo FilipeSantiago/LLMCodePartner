@@ -1,0 +1,210 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="1180" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13">
+<rect width="1160" height="1180" fill="#ffffff"/>
+<defs>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#24292f"/></marker>
+  <marker id="arrp" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#8250df"/></marker>
+  <marker id="arro" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#bc6c1a"/></marker>
+</defs>
+
+<!-- title -->
+<text x="40" y="30" font-size="17" font-weight="700" fill="#24292f">MCP bridge — components, tool-call flow, and where the guardrails sit</text>
+<text x="40" y="50" font-size="12" fill="#57606a">LLMCodePartner · the backend only <tspan font-weight="600">relays</tspan> tool calls; the IDE is what <tspan font-weight="600">executes</tspan> them</text>
+
+<!-- 1. JetBrains IDE -->
+<rect x="40" y="70" width="600" height="62" rx="8" fill="#e3f0ff" stroke="#1f6feb" stroke-width="1.5"/>
+<text x="340" y="90" text-anchor="middle" font-size="13" font-weight="600" fill="#1f6feb">JetBrains IDE  (chat client)</text>
+<text x="340" y="108" text-anchor="middle" font-size="10.5" fill="#3a3f45">advertises tools[] · EXECUTES every tool in the active project · re-sends the whole history each turn</text>
+<text x="340" y="124" text-anchor="middle" font-size="10.5" font-weight="600" fill="#cf222e">the only component with filesystem authority</text>
+
+<line x1="340" y1="136" x2="340" y2="156" stroke="#24292f" stroke-width="1.5" marker-end="url(#arr)"/>
+<text x="350" y="152" font-size="10" fill="#3a3f45">POST /v1/chat/completions  (messages + tools[], stream:true)</text>
+
+<!-- 2. dialog_controller -->
+<rect x="40" y="160" width="600" height="58" rx="8" fill="#e8f7ee" stroke="#1a7f37" stroke-width="1.5"/>
+<text x="340" y="181" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1a7f37">api/dialog_controller.py  —  POST /v1/chat/completions</text>
+<text x="340" y="200" text-anchor="middle" font-size="10.5" fill="#3a3f45">route: pipeline.run (optimizer on + stream + tools) · providers.active().tools · plain chat</text>
+
+<line x1="340" y1="222" x2="340" y2="242" stroke="#24292f" stroke-width="1.5" marker-end="url(#arr)"/>
+
+<!-- 3. openai_request -->
+<rect x="40" y="246" width="600" height="54" rx="8" fill="#e8f7ee" stroke="#1a7f37" stroke-width="1.5"/>
+<text x="340" y="267" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1a7f37">conversation/openai_request.py</text>
+<text x="340" y="286" text-anchor="middle" font-size="10.5" fill="#3a3f45">to_messages(history)  ·  tool_specs() → ToolSpec(name, description, schema)</text>
+
+<line x1="340" y1="304" x2="340" y2="316" stroke="#24292f" stroke-width="1.5" marker-end="url(#arr)"/>
+
+<!-- 4. optimizer pipeline lane -->
+<rect x="40" y="320" width="600" height="130" rx="10" fill="#fbf7ff" stroke="#8250df" stroke-width="1.5" stroke-dasharray="6,4"/>
+<text x="54" y="338" font-size="11.5" font-weight="700" fill="#8250df">agent/pipeline.py — optional planning stage (OPTIMIZER_ENABLED, default false)</text>
+<text x="54" y="353" font-size="10" fill="#57606a">when off, dialog_controller calls providers.active().tools() directly — no gate, no optimizer</text>
+
+<rect x="54" y="362" width="170" height="68" rx="7" fill="#ffffff" stroke="#8250df" stroke-width="1.2"/>
+<text x="139" y="384" text-anchor="middle" font-size="11.5" font-weight="600" fill="#8250df">PromptOptimizer</text>
+<text x="139" y="400" text-anchor="middle" font-size="10" fill="#3a3f45">Ollama · emit_json(schema)</text>
+<text x="139" y="416" text-anchor="middle" font-size="10" fill="#1a7f37">no tool access at all</text>
+
+<rect x="242" y="362" width="160" height="68" rx="7" fill="#fff0f0" stroke="#cf222e" stroke-width="2"/>
+<text x="322" y="382" text-anchor="middle" font-size="11.5" font-weight="700" fill="#cf222e">G6 · HUMAN GATE</text>
+<text x="322" y="399" text-anchor="middle" font-size="10" fill="#3a3f45">user reply == "accept"</text>
+<text x="322" y="415" text-anchor="middle" font-size="9.5" fill="#57606a">carries ⟦enhanced-prompt⟧</text>
+
+<rect x="420" y="362" width="206" height="68" rx="7" fill="#ffffff" stroke="#8250df" stroke-width="1.2"/>
+<text x="523" y="384" text-anchor="middle" font-size="11.5" font-weight="600" fill="#8250df">agent/coder.py</text>
+<text x="523" y="400" text-anchor="middle" font-size="10" fill="#3a3f45">CODER_SYSTEM + history</text>
+<text x="523" y="416" text-anchor="middle" font-size="10" fill="#3a3f45">→ ClaudeProvider.tools()</text>
+
+<line x1="224" y1="396" x2="238" y2="396" stroke="#8250df" stroke-width="1.4" marker-end="url(#arrp)"/>
+<line x1="402" y1="396" x2="416" y2="396" stroke="#8250df" stroke-width="1.4" marker-end="url(#arrp)"/>
+<path d="M322,430 V440 H48 V396 H50" fill="none" stroke="#8250df" stroke-width="1.2" stroke-dasharray="5,3" marker-end="url(#arrp)"/>
+<rect x="112" y="432" width="148" height="14" fill="#fbf7ff"/>
+<text x="186" y="443" text-anchor="middle" font-size="10" fill="#8250df">anything else → refine</text>
+
+<path d="M523,430 V486 H184 V492" fill="none" stroke="#24292f" stroke-width="1.5" marker-end="url(#arr)"/>
+<text x="194" y="464" font-size="10" fill="#3a3f45">the enhanced prompt only —</text>
+<text x="194" y="478" font-size="10" fill="#3a3f45">footer + model suggestion stripped (_extract_prompt)</text>
+
+<!-- 5. providers -->
+<rect x="40" y="492" width="288" height="110" rx="8" fill="#fff4e5" stroke="#bc6c1a" stroke-width="1.5"/>
+<text x="184" y="513" text-anchor="middle" font-size="12" font-weight="600" fill="#bc6c1a">providers/claude.py · ClaudeProvider</text>
+<text x="184" y="531" text-anchor="middle" font-size="10" fill="#3a3f45">stateful · background Run · suspend/resume</text>
+<text x="184" y="548" text-anchor="middle" font-size="10" fill="#3a3f45">create_sdk_mcp_server("jetbrains")</text>
+<text x="184" y="567" text-anchor="middle" font-size="10" fill="#cf222e">G2  tools=[] → no native Read/Write/Bash</text>
+<text x="184" y="584" text-anchor="middle" font-size="10" fill="#cf222e">G3  allowed_tools=["mcp__jetbrains__…"]</text>
+
+<rect x="352" y="492" width="288" height="110" rx="8" fill="#fff4e5" stroke="#bc6c1a" stroke-width="1.5"/>
+<text x="496" y="513" text-anchor="middle" font-size="12" font-weight="600" fill="#bc6c1a">providers/ollama.py · OllamaProvider</text>
+<text x="496" y="531" text-anchor="middle" font-size="10" fill="#3a3f45">stateless · one decision turn per request</text>
+<text x="496" y="548" text-anchor="middle" font-size="10" fill="#cf222e">G4  format=_decision_schema · temp 0</text>
+<text x="496" y="567" text-anchor="middle" font-size="10" fill="#cf222e">G4  name re-checked against registered set</text>
+<text x="496" y="584" text-anchor="middle" font-size="10" fill="#3a3f45">mints its own call_ id (never in bridge)</text>
+
+<path d="M640,560 H670 V790 H694" fill="none" stroke="#bc6c1a" stroke-width="1.2" stroke-dasharray="5,3" marker-end="url(#arro)"/>
+
+<line x1="184" y1="602" x2="184" y2="630" stroke="#24292f" stroke-width="1.5" marker-end="url(#arr)"/>
+<text x="194" y="622" font-size="10" fill="#3a3f45">start_run(…, strategy)  /  resume(id, content)</text>
+
+<!-- 6. mcp_bridge -->
+<rect x="40" y="636" width="600" height="248" rx="10" fill="#fbf9ff" stroke="#8250df" stroke-width="1.8"/>
+<text x="54" y="655" font-size="11.5" font-weight="700" fill="#8250df">mcp_bridge/ — relay only: no filesystem, no subprocess, no project path</text>
+
+<rect x="54" y="662" width="572" height="48" rx="7" fill="#ffffff" stroke="#8250df" stroke-width="1.2"/>
+<text x="340" y="681" text-anchor="middle" font-size="12" font-weight="600" fill="#8250df">server.start_run(prompt, system, specs, strategy)</text>
+<text x="340" y="699" text-anchor="middle" font-size="10.5" fill="#3a3f45">Run(): per-request registry · asyncio.Queue · pending futures  (isolated per request)</text>
+
+<line x1="340" y1="712" x2="340" y2="726" stroke="#8250df" stroke-width="1.4" marker-end="url(#arrp)"/>
+
+<rect x="54" y="730" width="572" height="52" rx="7" fill="#fff5f5" stroke="#cf222e" stroke-width="1.8"/>
+<text x="340" y="750" text-anchor="middle" font-size="12" font-weight="700" fill="#cf222e">G1 · ToolRegistry.register(specs)  —  ALLOWLIST</text>
+<text x="340" y="768" text-anchor="middle" font-size="10.5" fill="#3a3f45">keeps only SUPPORTED ∩ what the IDE advertised (12 names); everything else is silently dropped</text>
+
+<line x1="340" y1="784" x2="340" y2="798" stroke="#8250df" stroke-width="1.4" marker-end="url(#arrp)"/>
+
+<rect x="54" y="802" width="572" height="76" rx="7" fill="#ffffff" stroke="#8250df" stroke-width="1.2"/>
+<text x="340" y="821" text-anchor="middle" font-size="12" font-weight="600" fill="#8250df">bridge.call_tool(run, name, args)</text>
+<text x="340" y="839" text-anchor="middle" font-size="10.5" fill="#3a3f45">id = "call_" + uuid4().hex[:24]  ·  register() parks a Future  ·  run.put(ToolCallEvent)</text>
+<text x="340" y="856" text-anchor="middle" font-size="10.5" fill="#cf222e">G5  await_result: asyncio.wait_for(fut, TOOL_TIMEOUT = MCP_TOOL_TIMEOUT, 120s)</text>
+<text x="340" y="872" text-anchor="middle" font-size="10" fill="#57606a">timeout → is_error tool result the model can recover from</text>
+
+<line x1="340" y1="888" x2="340" y2="906" stroke="#24292f" stroke-width="1.5" marker-end="url(#arr)"/>
+
+<!-- 7. streaming responder -->
+<rect x="40" y="910" width="600" height="70" rx="8" fill="#e8f7ee" stroke="#1a7f37" stroke-width="1.5"/>
+<text x="340" y="931" text-anchor="middle" font-size="12" font-weight="600" fill="#1a7f37">conversation/streaming_responder.py · drain_events()</text>
+<text x="340" y="949" text-anchor="middle" font-size="10.5" fill="#3a3f45">SSE:  delta.tool_calls  +  finish_reason:"tool_calls"  +  data: [DONE]</text>
+<text x="340" y="967" text-anchor="middle" font-size="10" fill="#57606a">the HTTP response ends here — the background task stays parked on the Future</text>
+
+<line x1="340" y1="984" x2="340" y2="1002" stroke="#24292f" stroke-width="1.5" marker-end="url(#arr)"/>
+
+<!-- 8. IDE executes -->
+<rect x="40" y="1006" width="600" height="50" rx="8" fill="#e3f0ff" stroke="#1f6feb" stroke-width="2"/>
+<text x="340" y="1028" text-anchor="middle" font-size="12" font-weight="600" fill="#1f6feb">JetBrains IDE executes the tool against the ACTIVE project</text>
+<text x="340" y="1046" text-anchor="middle" font-size="10" fill="#3a3f45">read / create / replace / refactor — IDE undo + VCS still apply</text>
+
+<line x1="340" y1="1060" x2="340" y2="1084" stroke="#24292f" stroke-width="1.5" marker-end="url(#arr)"/>
+<text x="350" y="1076" font-size="10" fill="#3a3f45">next request: {role:"tool", tool_call_id, content}</text>
+
+<!-- 9. resume -->
+<rect x="40" y="1088" width="600" height="68" rx="8" fill="#fbf9ff" stroke="#8250df" stroke-width="1.5"/>
+<text x="340" y="1109" text-anchor="middle" font-size="12" font-weight="600" fill="#8250df">server.resume → bridge.resolve(tool_call_id, content)</text>
+<text x="340" y="1127" text-anchor="middle" font-size="10.5" fill="#3a3f45">fut.set_result(content) → the parked handler returns the text to the model</text>
+<text x="340" y="1145" text-anchor="middle" font-size="10" fill="#cf222e">unknown id or fut.done() → None, logged "unknown/late tool result"</text>
+
+<path d="M640,1120 H658 V840 H630" fill="none" stroke="#8250df" stroke-width="1.4" marker-end="url(#arrp)"/>
+<text transform="rotate(-90 676 980)" x="676" y="980" text-anchor="middle" font-size="10" fill="#8250df">same Run resumes · loop until DoneEvent</text>
+
+<!-- R1: guardrails present -->
+<rect x="700" y="70" width="430" height="400" rx="10" fill="#fffafa" stroke="#cf222e" stroke-width="1.5"/>
+<text x="716" y="92" font-size="13" font-weight="700" fill="#cf222e">Security blocks that actually exist</text>
+
+<text x="716" y="116" font-size="11" font-weight="700" fill="#24292f">G1  Tool-name allowlist</text>
+<text x="716" y="131" font-size="10.5" fill="#3a3f45">mcp_bridge/registry.py — SUPPORTED ∩ advertised.</text>
+<text x="716" y="145" font-size="10.5" fill="#3a3f45">An unlisted name never becomes a callable tool.</text>
+
+<text x="716" y="167" font-size="11" font-weight="700" fill="#24292f">G2  Built-in tools denied</text>
+<text x="716" y="182" font-size="10.5" fill="#3a3f45">providers/claude.py — tools=[] (plus mcp_servers={}</text>
+<text x="716" y="196" font-size="10.5" fill="#3a3f45">on plain chat): no backend Read / Write / Bash.</text>
+
+<text x="716" y="218" font-size="11" font-weight="700" fill="#24292f">G3  Model-side allowlist</text>
+<text x="716" y="233" font-size="10.5" fill="#3a3f45">allowed_tools=["mcp__jetbrains__&lt;name&gt;"] — only</text>
+<text x="716" y="247" font-size="10.5" fill="#3a3f45">registered specs get an MCP handler at all.</text>
+
+<text x="716" y="269" font-size="11" font-weight="700" fill="#24292f">G4  Constrained tool decision (Ollama)</text>
+<text x="716" y="284" font-size="10.5" fill="#3a3f45">format= JSON schema + temperature 0, then the</text>
+<text x="716" y="298" font-size="10.5" fill="#3a3f45">chosen name is re-checked against the specs.</text>
+
+<text x="716" y="320" font-size="11" font-weight="700" fill="#24292f">G5  Tool-call timeout</text>
+<text x="716" y="335" font-size="10.5" fill="#3a3f45">MCP_TOOL_TIMEOUT (120s) on every parked Future;</text>
+<text x="716" y="349" font-size="10.5" fill="#3a3f45">a late result is refused, not silently applied.</text>
+
+<text x="716" y="371" font-size="11" font-weight="700" fill="#24292f">G6  Human accept gate</text>
+<text x="716" y="386" font-size="10.5" fill="#3a3f45">agent/pipeline.py — nothing reaches the Coder (the</text>
+<text x="716" y="400" font-size="10.5" fill="#3a3f45">only writer) until a user message == "accept".</text>
+
+<text x="716" y="422" font-size="11" font-weight="700" fill="#24292f">+  Run isolation &amp; cleanup</text>
+<text x="716" y="437" font-size="10.5" fill="#3a3f45">The registry is per-request; bridge.discard() cancels</text>
+<text x="716" y="451" font-size="10.5" fill="#3a3f45">orphan futures on end / cancel / timeout.</text>
+
+<!-- R2: not enforced -->
+<rect x="700" y="486" width="430" height="248" rx="10" fill="#f6f8fa" stroke="#57606a" stroke-width="1.5" stroke-dasharray="6,4"/>
+<text x="716" y="508" font-size="13" font-weight="700" fill="#57606a">NOT enforced in the backend</text>
+<text x="716" y="528" font-size="10.5" fill="#3a3f45">·  no path validation / project-root confinement —</text>
+<text x="716" y="545" font-size="10.5" fill="#3a3f45">   file paths pass through verbatim to the IDE</text>
+<text x="716" y="562" font-size="10.5" fill="#3a3f45">·  no sandbox, container or user separation</text>
+<text x="716" y="579" font-size="10.5" fill="#3a3f45">·  no size cap on tool results, prompts or history</text>
+<text x="716" y="596" font-size="10.5" fill="#3a3f45">·  no auth or rate limit on /v1/chat/completions</text>
+<text x="716" y="613" font-size="10.5" fill="#3a3f45">   (main.py binds 0.0.0.0:7777)</text>
+<text x="716" y="630" font-size="10.5" fill="#3a3f45">·  no argument-schema validation at the bridge</text>
+<text x="716" y="647" font-size="10.5" fill="#3a3f45">·  tool args are logged in full (bridge.register at</text>
+<text x="716" y="664" font-size="10.5" fill="#3a3f45">   INFO; RawLogMiddleware if RAW_LOG_ENABLED)</text>
+<text x="716" y="681" font-size="10.5" fill="#3a3f45">·  no max-turn enforcement — "maxTurnsReached"</text>
+<text x="716" y="698" font-size="10.5" fill="#3a3f45">   is only reported, never used to stop a run</text>
+<text x="716" y="722" font-size="11" font-weight="600" fill="#24292f">→ all real path / filesystem authority lives in the IDE.</text>
+
+<!-- R3: ollama note -->
+<rect x="700" y="750" width="430" height="102" rx="10" fill="#fffaf2" stroke="#bc6c1a" stroke-width="1.5" stroke-dasharray="6,4"/>
+<text x="716" y="770" font-size="11.5" font-weight="700" fill="#bc6c1a">Ollama takes a shorter path</text>
+<text x="716" y="788" font-size="10.5" fill="#3a3f45">It yields a ToolCallEvent straight to the responder — no</text>
+<text x="716" y="804" font-size="10.5" fill="#3a3f45">Run, no Future, no mcp_bridge relay. The IDE's resent</text>
+<text x="716" y="820" font-size="10.5" fill="#3a3f45">history is the only state, so bridge.resolve() never sees</text>
+<text x="716" y="836" font-size="10.5" fill="#3a3f45">its ids. G1 still applies (tool_specs feeds both paths).</text>
+
+<!-- R4: supported tools -->
+<rect x="700" y="868" width="430" height="182" rx="10" fill="#ffffff" stroke="#d0d7de" stroke-width="1.5"/>
+<text x="716" y="889" font-size="12" font-weight="700" fill="#24292f">SUPPORTED — the 12 bridged JetBrains tools</text>
+<text x="716" y="909" font-size="10.5" font-weight="600" fill="#1a7f37">read / context</text>
+<text x="716" y="924" font-size="10.5" fill="#3a3f45">list_directory_tree · get_file_text_by_path ·</text>
+<text x="716" y="938" font-size="10.5" fill="#3a3f45">search_in_files_by_text</text>
+<text x="716" y="958" font-size="10.5" font-weight="600" fill="#bc6c1a">create / edit  (identifier varies by IDE version)</text>
+<text x="716" y="973" font-size="10.5" fill="#3a3f45">create_new_file · create_new_file_with_text ·</text>
+<text x="716" y="987" font-size="10.5" fill="#3a3f45">replace_file_text_by_path · replace_specific_text ·</text>
+<text x="716" y="1001" font-size="10.5" fill="#3a3f45">replace_text_in_file · apply_patch</text>
+<text x="716" y="1021" font-size="10.5" font-weight="600" fill="#8250df">refactor / tidy / self-check</text>
+<text x="716" y="1036" font-size="10.5" fill="#3a3f45">rename_refactoring · reformat_file · get_file_problems</text>
+
+<!-- R5: events -->
+<rect x="700" y="1066" width="430" height="90" rx="10" fill="#ffffff" stroke="#d0d7de" stroke-width="1.5"/>
+<text x="716" y="1087" font-size="12" font-weight="700" fill="#24292f">Neutral events (mcp_bridge/models.py)</text>
+<text x="716" y="1106" font-size="10.5" fill="#3a3f45">TextEvent · ToolCallEvent · ErrorEvent · DoneEvent</text>
+<text x="716" y="1123" font-size="10.5" fill="#3a3f45">Every provider and agent yields the same four, so</text>
+<text x="716" y="1140" font-size="10.5" fill="#3a3f45">drain_events() serializes both paths identically.</text>
+</svg>

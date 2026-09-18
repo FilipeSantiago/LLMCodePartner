@@ -1,0 +1,157 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="670" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13">
+<rect width="1100" height="670" fill="#ffffff"/>
+<defs>
+  <marker id="arrb" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#1f6feb"/></marker>
+  <marker id="arrp" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#8250df"/></marker>
+  <marker id="arro" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#bc6c1a"/></marker>
+</defs>
+
+<text x="30" y="32" font-size="18" font-weight="700" fill="#24292f">How the MCP bridge works</text>
+<text x="30" y="54" font-size="12" fill="#57606a">The IDE holds the project. The model holds the reasoning. The bridge translates between them — and is the only place either side is constrained.</text>
+
+<!-- ============ left panel: IDE ============ -->
+<rect x="30" y="110" width="230" height="460" rx="8" fill="#e3f0ff" stroke="#1f6feb" stroke-width="1.5"/>
+<text x="145" y="136" text-anchor="middle" font-size="13.5" font-weight="700" fill="#1f6feb">JetBrains IDE</text>
+<text x="145" y="154" text-anchor="middle" font-size="10" fill="#3a3f45">the chat client + the project</text>
+<line x1="42" y1="166" x2="248" y2="166" stroke="#1f6feb" stroke-width="1" opacity="0.4"/>
+
+<text x="42" y="190" font-size="10" fill="#3a3f45">·  advertises its tools[] on every</text>
+<text x="42" y="204" font-size="10" fill="#3a3f45">   request</text>
+<text x="42" y="228" font-size="10" fill="#3a3f45">·  EXECUTES every tool against</text>
+<text x="42" y="242" font-size="10" fill="#3a3f45">   the active project</text>
+<text x="42" y="266" font-size="10" fill="#3a3f45">·  re-sends the whole history</text>
+<text x="42" y="280" font-size="10" fill="#3a3f45">   each turn — the backend keeps</text>
+<text x="42" y="294" font-size="10" fill="#3a3f45">   no session of its own</text>
+<text x="42" y="318" font-size="10" fill="#3a3f45">·  IDE undo + VCS still cover</text>
+<text x="42" y="332" font-size="10" fill="#3a3f45">   every write the model makes</text>
+
+<rect x="42" y="496" width="206" height="56" rx="6" fill="#fff0f0" stroke="#cf222e" stroke-width="1.5"/>
+<text x="145" y="516" text-anchor="middle" font-size="10.5" font-weight="700" fill="#cf222e">filesystem authority</text>
+<text x="145" y="532" text-anchor="middle" font-size="10" fill="#3a3f45">every path in a tool call is</text>
+<text x="145" y="545" text-anchor="middle" font-size="10" fill="#3a3f45">resolved here, never upstream</text>
+
+<!-- ============ centre panel: the bridge ============ -->
+<rect x="430" y="90" width="240" height="500" rx="10" fill="#fbf9ff" stroke="#8250df" stroke-width="2.2"/>
+<text x="550" y="118" text-anchor="middle" font-size="15" font-weight="700" fill="#8250df">THE BRIDGE</text>
+<text x="550" y="136" text-anchor="middle" font-size="10" fill="#3a3f45">mcp_bridge/  +  providers/</text>
+<line x1="442" y1="148" x2="658" y2="148" stroke="#8250df" stroke-width="1" opacity="0.4"/>
+
+<text x="442" y="170" font-size="10" fill="#3a3f45">·  translates OpenAI ⇄ MCP, both</text>
+<text x="442" y="184" font-size="10" fill="#3a3f45">   directions</text>
+<text x="442" y="206" font-size="10" fill="#3a3f45">·  registers the allowed tools once</text>
+<text x="442" y="220" font-size="10" fill="#3a3f45">   per request</text>
+<text x="442" y="242" font-size="10" fill="#3a3f45">·  parks a Future per tool call and</text>
+<text x="442" y="256" font-size="10" fill="#3a3f45">   resumes it when the result lands</text>
+<text x="442" y="278" font-size="10" fill="#3a3f45">·  no filesystem · no subprocess ·</text>
+<text x="442" y="292" font-size="10" fill="#3a3f45">   no project path, ever</text>
+
+<rect x="442" y="316" width="216" height="56" rx="6" fill="#fff5f5" stroke="#cf222e" stroke-width="1.5"/>
+<text x="550" y="335" text-anchor="middle" font-size="10.5" font-weight="700" fill="#cf222e">120 s timeout per tool call</text>
+<text x="550" y="351" text-anchor="middle" font-size="10" fill="#3a3f45">MCP_TOOL_TIMEOUT — a late</text>
+<text x="550" y="364" text-anchor="middle" font-size="10" fill="#3a3f45">result is refused, not applied</text>
+
+<rect x="442" y="386" width="216" height="56" rx="6" fill="#fff0f0" stroke="#cf222e" stroke-width="2"/>
+<text x="550" y="405" text-anchor="middle" font-size="10.5" font-weight="700" fill="#cf222e">optional human accept gate</text>
+<text x="550" y="421" text-anchor="middle" font-size="10" fill="#3a3f45">nothing reaches the writing</text>
+<text x="550" y="434" text-anchor="middle" font-size="10" fill="#3a3f45">model until you reply "accept"</text>
+<text x="550" y="456" text-anchor="middle" font-size="9.5" fill="#57606a">OPTIMIZER_ENABLED · agent/pipeline.py</text>
+
+<line x1="442" y1="476" x2="658" y2="476" stroke="#8250df" stroke-width="1" opacity="0.4"/>
+<text x="550" y="498" text-anchor="middle" font-size="11" font-weight="700" fill="#8250df">The bridge is a relay.</text>
+<text x="550" y="516" text-anchor="middle" font-size="10" fill="#3a3f45">It decides WHICH tools exist and</text>
+<text x="550" y="530" text-anchor="middle" font-size="10" fill="#3a3f45">HOW LONG a call may take.</text>
+<text x="550" y="548" text-anchor="middle" font-size="10" font-weight="600" fill="#3a3f45">It never decides WHERE one lands.</text>
+
+<!-- ============ right panel: the model ============ -->
+<rect x="840" y="110" width="230" height="460" rx="8" fill="#fff4e5" stroke="#bc6c1a" stroke-width="1.5"/>
+<text x="955" y="136" text-anchor="middle" font-size="13.5" font-weight="700" fill="#bc6c1a">Claude / Ollama</text>
+<text x="955" y="154" text-anchor="middle" font-size="10" fill="#3a3f45">the model — also no filesystem</text>
+
+<rect x="852" y="176" width="206" height="120" rx="7" fill="#ffffff" stroke="#bc6c1a" stroke-width="1.2"/>
+<text x="955" y="196" text-anchor="middle" font-size="11.5" font-weight="600" fill="#bc6c1a">ClaudeProvider</text>
+<text x="955" y="214" text-anchor="middle" font-size="10" fill="#3a3f45">stateful · suspend / resume</text>
+<text x="955" y="230" text-anchor="middle" font-size="10" fill="#3a3f45">the tools live in an in-process</text>
+<text x="955" y="244" text-anchor="middle" font-size="10" fill="#3a3f45">MCP server named "jetbrains"</text>
+<text x="955" y="266" text-anchor="middle" font-size="10" fill="#cf222e">tools=[] → no native</text>
+<text x="955" y="280" text-anchor="middle" font-size="10" fill="#cf222e">Read / Write / Bash</text>
+
+<rect x="852" y="312" width="206" height="120" rx="7" fill="#ffffff" stroke="#bc6c1a" stroke-width="1.2"/>
+<text x="955" y="332" text-anchor="middle" font-size="11.5" font-weight="600" fill="#bc6c1a">OllamaProvider</text>
+<text x="955" y="350" text-anchor="middle" font-size="10" fill="#3a3f45">stateless · one decision turn</text>
+<text x="955" y="364" text-anchor="middle" font-size="10" fill="#3a3f45">per request</text>
+<text x="955" y="386" text-anchor="middle" font-size="10" fill="#cf222e">the choice is grammar-bound</text>
+<text x="955" y="400" text-anchor="middle" font-size="10" fill="#cf222e">(format= schema, temp 0) and</text>
+<text x="955" y="414" text-anchor="middle" font-size="10" fill="#cf222e">the name re-checked after</text>
+
+<text x="955" y="464" text-anchor="middle" font-size="10" fill="#57606a">Either way the model can only</text>
+<text x="955" y="478" text-anchor="middle" font-size="10" fill="#57606a">ask. It never performs the read</text>
+<text x="955" y="492" text-anchor="middle" font-size="10" fill="#57606a">or the write itself.</text>
+
+<!-- ============ arrows: IDE <-> bridge ============ -->
+<text x="345" y="150" text-anchor="middle" font-size="9.5" fill="#3a3f45">request: messages + tools[]</text>
+<text x="345" y="162" text-anchor="middle" font-size="9.5" fill="#3a3f45">(plus any prior tool results)</text>
+<line x1="280" y1="176" x2="426" y2="176" stroke="#1f6feb" stroke-width="1.6" marker-end="url(#arrb)"/>
+<circle cx="270" cy="176" r="8.5" fill="#ffffff" stroke="#1f6feb" stroke-width="1.5"/>
+<text x="270" y="180" text-anchor="middle" font-size="9.5" font-weight="700" fill="#1f6feb">1</text>
+
+<rect x="272" y="186" width="146" height="44" rx="6" fill="#fff5f5" stroke="#cf222e" stroke-width="1.3"/>
+<text x="345" y="201" text-anchor="middle" font-size="9.5" font-weight="700" fill="#cf222e">ALLOWLIST</text>
+<text x="345" y="213" text-anchor="middle" font-size="9" fill="#3a3f45">SUPPORTED ∩ advertised</text>
+<text x="345" y="224" text-anchor="middle" font-size="9" fill="#3a3f45">(12 names) — rest dropped</text>
+
+<text x="345" y="288" text-anchor="middle" font-size="9.5" fill="#3a3f45">SSE: delta.tool_calls +</text>
+<text x="345" y="300" text-anchor="middle" font-size="9.5" fill="#3a3f45">finish_reason:"tool_calls"</text>
+<line x1="412" y1="314" x2="264" y2="314" stroke="#8250df" stroke-width="1.6" marker-end="url(#arrp)"/>
+<circle cx="420" cy="314" r="8.5" fill="#ffffff" stroke="#8250df" stroke-width="1.5"/>
+<text x="420" y="318" text-anchor="middle" font-size="9.5" font-weight="700" fill="#8250df">4</text>
+
+<rect x="272" y="326" width="146" height="36" rx="6" fill="#f0f7ff" stroke="#1f6feb" stroke-width="1.2" stroke-dasharray="5,3"/>
+<text x="345" y="341" text-anchor="middle" font-size="9.5" font-weight="600" fill="#1f6feb">the IDE executes it</text>
+<text x="345" y="354" text-anchor="middle" font-size="9" fill="#3a3f45">read / write / refactor</text>
+
+<text x="345" y="370" text-anchor="middle" font-size="9.5" fill="#3a3f45">next request: {role:"tool",</text>
+<text x="345" y="382" text-anchor="middle" font-size="9.5" fill="#3a3f45">tool_call_id, content}</text>
+<line x1="280" y1="396" x2="426" y2="396" stroke="#1f6feb" stroke-width="1.6" marker-end="url(#arrb)"/>
+<circle cx="270" cy="396" r="8.5" fill="#ffffff" stroke="#1f6feb" stroke-width="1.5"/>
+<text x="270" y="400" text-anchor="middle" font-size="9.5" font-weight="700" fill="#1f6feb">5</text>
+
+<text x="345" y="508" text-anchor="middle" font-size="9.5" fill="#3a3f45">SSE: content deltas +</text>
+<text x="345" y="520" text-anchor="middle" font-size="9.5" fill="#3a3f45">finish_reason:"stop" + [DONE]</text>
+<line x1="412" y1="534" x2="264" y2="534" stroke="#8250df" stroke-width="1.6" marker-end="url(#arrp)"/>
+<circle cx="420" cy="534" r="8.5" fill="#ffffff" stroke="#8250df" stroke-width="1.5"/>
+<text x="420" y="538" text-anchor="middle" font-size="9.5" font-weight="700" fill="#8250df">8</text>
+
+<!-- ============ arrows: bridge <-> model ============ -->
+<rect x="682" y="308" width="146" height="44" rx="6" fill="#fff5f5" stroke="#cf222e" stroke-width="1.3"/>
+<text x="755" y="323" text-anchor="middle" font-size="9.5" font-weight="700" fill="#cf222e">TOOL SURFACE LOCKED</text>
+<text x="755" y="335" text-anchor="middle" font-size="9" fill="#3a3f45">allowed_tools / decision</text>
+<text x="755" y="346" text-anchor="middle" font-size="9" fill="#3a3f45">schema — nothing else exists</text>
+
+<text x="755" y="196" text-anchor="middle" font-size="9.5" fill="#3a3f45">prompt + ONLY the tools that</text>
+<text x="755" y="208" text-anchor="middle" font-size="9.5" fill="#3a3f45">survived the allowlist</text>
+<line x1="690" y1="222" x2="836" y2="222" stroke="#8250df" stroke-width="1.6" marker-end="url(#arrp)"/>
+<circle cx="680" cy="222" r="8.5" fill="#ffffff" stroke="#8250df" stroke-width="1.5"/>
+<text x="680" y="226" text-anchor="middle" font-size="9.5" font-weight="700" fill="#8250df">2</text>
+
+<text x="755" y="242" text-anchor="middle" font-size="9.5" fill="#3a3f45">"call get_file_text_by_path(…)"</text>
+<text x="755" y="254" text-anchor="middle" font-size="9.5" fill="#3a3f45">→ the bridge parks a Future</text>
+<line x1="822" y1="268" x2="674" y2="268" stroke="#bc6c1a" stroke-width="1.6" marker-end="url(#arro)"/>
+<circle cx="830" cy="268" r="8.5" fill="#ffffff" stroke="#bc6c1a" stroke-width="1.5"/>
+<text x="830" y="272" text-anchor="middle" font-size="9.5" font-weight="700" fill="#bc6c1a">3</text>
+
+<text x="755" y="416" text-anchor="middle" font-size="9.5" fill="#3a3f45">the result text — the parked</text>
+<text x="755" y="428" text-anchor="middle" font-size="9.5" fill="#3a3f45">Future resolves, model resumes</text>
+<line x1="690" y1="442" x2="836" y2="442" stroke="#8250df" stroke-width="1.6" marker-end="url(#arrp)"/>
+<circle cx="680" cy="442" r="8.5" fill="#ffffff" stroke="#8250df" stroke-width="1.5"/>
+<text x="680" y="446" text-anchor="middle" font-size="9.5" font-weight="700" fill="#8250df">6</text>
+
+<text x="755" y="462" text-anchor="middle" font-size="9.5" fill="#3a3f45">answer tokens</text>
+<text x="755" y="474" text-anchor="middle" font-size="9.5" fill="#3a3f45">(no further tool needed)</text>
+<line x1="822" y1="488" x2="674" y2="488" stroke="#bc6c1a" stroke-width="1.6" marker-end="url(#arro)"/>
+<circle cx="830" cy="488" r="8.5" fill="#ffffff" stroke="#bc6c1a" stroke-width="1.5"/>
+<text x="830" y="492" text-anchor="middle" font-size="9.5" font-weight="700" fill="#bc6c1a">7</text>
+
+<!-- ============ closing caption ============ -->
+<text x="550" y="622" text-anchor="middle" font-size="11.5" font-weight="600" fill="#24292f">The backend never touches disk: a read or a write is a tool call the IDE performs.</text>
+<text x="550" y="642" text-anchor="middle" font-size="10.5" fill="#57606a">So there is no path validation or sandbox in the bridge — every path is resolved by the IDE, against the project you have open.</text>
+</svg>
