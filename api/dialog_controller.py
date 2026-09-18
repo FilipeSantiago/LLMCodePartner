@@ -17,6 +17,7 @@ from agent import pipeline
 from conversation import openai_request as oreq
 from conversation.non_streaming_responder import NonStreamingResponder
 from conversation.streaming_responder import StreamingResponder
+from mcp_bridge.registry import ROLE_CODER
 from model.chat import ChatCompletionRequest, ChatCompletionResponse
 
 log = logging.getLogger("mcp_bridge")
@@ -42,10 +43,12 @@ async def chat_completions(request: ChatCompletionRequest):
     # TOOL TURN: hand the full resent history to the active provider's uniform
     # `tools()` and drain its neutral events. Every stateful/stateless detail —
     # start vs. resume, background run vs. one-shot — is private to the provider,
-    # so this controller (and the engine) stay provider-agnostic.
+    # so this controller (and the engine) stay provider-agnostic. With the pipeline
+    # off this is a coding agent talking straight to the IDE, so it runs as
+    # ROLE_CODER — stated explicitly rather than inheriting the un-roled ceiling.
     if request.stream and (request.tools or oreq.tool_results(request)):
         messages = oreq.to_messages(request)
-        events = provider.tools(messages, oreq.tool_specs(request))
+        events = provider.tools(messages, oreq.tool_specs(request), role=ROLE_CODER)
         return StreamingResponder().drain_events(events, request.model, created)
 
     # PLAIN CHAT: no tools advertised and no tool results → straight completion.

@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from typing import ClassVar
 
-from mcp_bridge.models import Event
+from mcp_bridge.models import DoneEvent, Event, Run, ToolCallEvent
 from mcp_bridge.registry import ToolSpec
 
 
@@ -45,7 +45,49 @@ class Provider(ABC):
         return text, terminal
 
     @abstractmethod
-    def tools(self, messages: list[dict], specs: list[ToolSpec]) -> AsyncIterator[Event]:
+    def tools(self, messages: list[dict], specs: list[ToolSpec],
+              model: str | None = None, role: str | None = None) -> AsyncIterator[Event]:
         """One tool turn → neutral events (TextEvent/ToolCallEvent/ErrorEvent/
-        DoneEvent). Stateful vs. stateless is entirely private to the subclass."""
+        DoneEvent). Stateful vs. stateless is entirely private to the subclass.
+        `model` optionally selects the backend model/tier for this turn (None =
+        provider default); providers that can't honor it ignore it. `role` selects
+        the bridge's per-role tool allowlist (`registry.allowed_for`) — None = the
+        full ceiling; every provider MUST honor it, since it is a permission bound."""
         ...
+
+    # --- shared helpers for run-backed providers -----------------------------
+    #
+    # Concrete and provider-agnostic: every provider that drives a background Run
+    # (Claude, Codex) needs exactly this history-shaping and queue-draining logic.
+    # A stateless one-shot provider (Ollama) simply never calls them.
+
+    def _flatten(self, messages: list[dict]) -> tuple[str, str | None]:
+        """Neutral history → (prompt, system) for a fresh turn. Tool-plumbing turns
+        (assistant `tool_calls`, `role:"tool"` results) are dropped — the model gets
+        tool results through its own resumed tool call, not the prompt."""
+        system = "\n\n".join(
+            m["content"] for m in messages if m.get("role") == "system" and m.get("content")
+        ) or None
+        convo = [
+            m for m in messages
+            if m.get("role") in ("user", "assistant") and m.get("content") and not m.get("tool_calls")
+        ]
+        if len(convo) == 1:
+            prompt = convo[0]["content"]
+        else:
+            prompt = "\n\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in convo)
+        return prompt, system
+
+    def _trailing_tool_results(self, messages: list[dict]) -> list[dict]:
+        """`role:"tool"` messages carrying a tool_call_id (client tool results)."""
+        return [m for m in messages if m.get("role") == "tool" and m.get("tool_call_id")]
+
+    async def _drain_queue(self, run: Run) -> AsyncIterator[Event]:
+        """Yield a Run's neutral events until it stops for this request: a ToolCallEvent
+        (background task now blocked on the future — resumed by a later request) or a
+        DoneEvent (turn finished)."""
+        while True:
+            event = await run.next_event()
+            yield event
+            if isinstance(event, (ToolCallEvent, DoneEvent)):
+                return

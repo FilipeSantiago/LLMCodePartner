@@ -56,6 +56,7 @@ class StreamingResponder(ChatResponder):
         async def event_stream():
             first = True
             terminal = "endTurn"
+            usage = None
             try:
                 async for event in events:
                     if isinstance(event, TextEvent):
@@ -78,6 +79,7 @@ class StreamingResponder(ChatResponder):
                         return
                     elif isinstance(event, DoneEvent):
                         terminal = event.terminal
+                        usage = event.usage
                         break
             except Exception as exc:
                 msg = f"[error: {exc}]"
@@ -85,6 +87,8 @@ class StreamingResponder(ChatResponder):
                 yield self._chunk(delta, model, created, None)
 
             yield self._chunk({}, model, created, self._finish_reason(terminal))
+            if usage:
+                yield self._usage_chunk(usage, model, created)
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -106,6 +110,29 @@ class StreamingResponder(ChatResponder):
         if first:
             delta["role"] = "assistant"
         return self._chunk(delta, model, created, None)
+
+    def _usage_chunk(self, usage: dict, model: str, created: int) -> str:
+        """A data-only terminal chunk carrying token usage (OpenAI's `include_usage`
+        shape: `choices: []` plus a `usage` object). Best-effort normalization across
+        providers — Anthropic (`input_tokens`/`output_tokens`) and Ollama
+        (`inputTokens`/`outputTokens`) — with the raw provider usage kept under `raw`."""
+        prompt = usage.get("input_tokens") or usage.get("inputTokens")
+        completion = usage.get("output_tokens") or usage.get("outputTokens")
+        total = (prompt or 0) + (completion or 0) if (prompt or completion) else None
+        payload = {
+            "id": "chatcmpl-dumb-router",
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": total,
+                "raw": usage,
+            },
+        }
+        return f"data: {json.dumps(payload)}\n\n"
 
     def reply(self, text: str, model: str, created: int) -> StreamingResponse:
         async def event_stream():

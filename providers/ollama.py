@@ -17,7 +17,7 @@ from uuid import uuid4
 import httpx
 
 from mcp_bridge.models import DoneEvent, Event, TextEvent, ToolCallEvent
-from mcp_bridge.registry import ToolSpec
+from mcp_bridge.registry import ToolSpec, allowed_for
 from providers.base import Provider
 
 log = logging.getLogger("mcp_bridge")
@@ -40,8 +40,12 @@ class OllamaProvider(Provider):
                 yield "", self._terminal(obj.get("done_reason"))
                 return
 
-    async def tools(self, messages: list[dict], specs: list[ToolSpec]) -> AsyncIterator[Event]:
-        """One stateless tool turn → neutral events.
+    async def tools(self, messages: list[dict], specs: list[ToolSpec],
+                    model: str | None = None, role: str | None = None) -> AsyncIterator[Event]:
+        """One stateless tool turn → neutral events. `model` is accepted for the uniform
+        provider surface but ignored here — the Ollama model is fixed via OLLAMA_MODEL.
+        `role` IS honored: there is no per-run `ToolRegistry` to enforce it (this
+        provider keeps no Run), so the specs are narrowed to the role's allowlist here.
 
         Stateless: JetBrains resends the whole history (including prior tool results)
         each request, so there is no run/future/resume — every call is independent.
@@ -53,12 +57,57 @@ class OllamaProvider(Provider):
         2. If "none", a free-text streamed answer (the tool results are already in the
            history), yielded as `TextEvent`s and terminated by a `DoneEvent`.
         """
-        hist = self._to_ollama_messages(messages)
-        valid = {s.name for s in specs}
+        # Narrowing here propagates into everything `decide_tool` does with the specs:
+        # what the model is told exists (`_tool_system`), the grammar `enum` it must
+        # pick from (`_decision_schema`), and the post-hoc name re-check.
+        allowed = allowed_for(role)
+        specs = [s for s in specs if s.name in allowed]
 
+        hist = self._to_ollama_messages(messages)
+
+        # Step 1 is shared with the optimizer's context-gathering turn — see decide_tool.
+        # No `model` is passed: this method's contract is that the Ollama model is fixed.
+        chosen = await self.decide_tool(messages, specs)
+        if chosen:
+            name, args = chosen
+            yield ToolCallEvent("call_" + uuid4().hex[:24], name, args)
+            return
+
+        # No tool needed → stream a natural-language answer (no tools, no schema).
+        terminal = "endTurn"
+        usage: dict | None = None
+        async for obj in self._chat({"model": MODEL, "messages": hist, "stream": True}):
+            chunk = (obj.get("message") or {}).get("content", "")
+            if chunk:
+                yield TextEvent(chunk)
+            if obj.get("done"):
+                terminal = self._terminal(obj.get("done_reason"))
+                usage = self._usage(obj)
+        yield DoneEvent(terminal, usage=usage, model_usage=({usage["model"]: usage} if usage else None))
+
+    async def decide_tool(self, messages: list[dict], specs: list[ToolSpec],
+                          model: str | None = None) -> tuple[str, dict[str, Any]] | None:
+        """One grammar-constrained `/api/chat` turn answering a single question: which tool
+        should be called next, or none at all. Returns `(name, arguments)` for a chosen tool,
+        or None when the model wants no tool (or emitted something unusable).
+
+        The model can only pick from `specs`: `_decision_schema` puts the names in a JSON
+        Schema `enum`, and the answer is re-checked against `specs` afterwards — so a
+        hallucinated name yields None rather than an unknown tool call. Callers that narrow
+        `specs` by role therefore get that narrowing enforced here too.
+
+        `model` defaults to the module-level `MODEL`. `tools()` deliberately passes nothing
+        (its contract is that the Ollama model is fixed via OLLAMA_MODEL); the optimizer
+        passes its cheapest ladder rung.
+        """
+        if not specs:
+            return None
         raw = await self._chat_once({
-            "model": MODEL,
-            "messages": [{"role": "system", "content": self._tool_system(specs)}, *hist],
+            "model": model or MODEL,
+            "messages": [
+                {"role": "system", "content": self._tool_system(specs)},
+                *self._to_ollama_messages(messages),
+            ],
             "format": self._decision_schema(specs),
             "stream": False,
             "options": {"temperature": 0},
@@ -66,24 +115,12 @@ class OllamaProvider(Provider):
         try:
             decision = json.loads(raw)
         except Exception:
-            decision = {}
-        tool = decision.get("tool")
-
-        if tool in valid:
-            args = decision.get("arguments") or {}
-            log.info("ollama tool_calls: %s", [tool])
-            yield ToolCallEvent("call_" + uuid4().hex[:24], tool, args)
-            return
-
-        # No tool needed → stream a natural-language answer (no tools, no schema).
-        terminal = "endTurn"
-        async for obj in self._chat({"model": MODEL, "messages": hist, "stream": True}):
-            chunk = (obj.get("message") or {}).get("content", "")
-            if chunk:
-                yield TextEvent(chunk)
-            if obj.get("done"):
-                terminal = self._terminal(obj.get("done_reason"))
-        yield DoneEvent(terminal)
+            return None
+        name = decision.get("tool")
+        if name not in {s.name for s in specs}:
+            return None
+        log.info("ollama tool_calls: %s", [name])
+        return name, decision.get("arguments") or {}
 
     async def emit_json(self, messages: list[dict], schema: dict[str, Any],
                         model: str | None = None) -> dict:
@@ -110,6 +147,21 @@ class OllamaProvider(Provider):
     def _terminal(self, done_reason: str | None) -> str:
         return "maxTurnsReached" if done_reason == "length" else "endTurn"
 
+    def _usage(self, obj: dict[str, Any]) -> dict[str, Any]:
+        """Extract token/model usage from a final /api/chat object (the one with
+        `done: true`). Ollama reports `prompt_eval_count` (input) and `eval_count`
+        (output). Logs a one-line summary for per-stage attribution."""
+        u = {
+            "model": obj.get("model") or MODEL,
+            "inputTokens": obj.get("prompt_eval_count"),
+            "outputTokens": obj.get("eval_count"),
+        }
+        log.info(
+            "ollama usage: model=%s input=%s output=%s",
+            u["model"], u["inputTokens"], u["outputTokens"],
+        )
+        return u
+
     async def _chat(self, payload: dict[str, Any]):
         """Yield decoded NDJSON objects from a streaming /api/chat call."""
         # No read timeout: local generation (14B) can be slow.
@@ -121,11 +173,15 @@ class OllamaProvider(Provider):
                         yield json.loads(line)
 
     async def _chat_once(self, payload: dict[str, Any]) -> str:
-        """Non-streaming /api/chat call → the assistant message content."""
+        """Non-streaming /api/chat call → the assistant message content. Logs token usage
+        so every non-streaming Ollama call (the tool decision AND the optimizer's
+        emit_json rewrite) reports its per-stage spend."""
         async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as client:
             resp = await client.post(f"{HOST}/api/chat", json=payload)
             resp.raise_for_status()
-            return (resp.json().get("message") or {}).get("content", "")
+            obj = resp.json()
+        self._usage(obj)
+        return (obj.get("message") or {}).get("content", "")
 
     def _messages(self, prompt: str, system: str | None) -> list[dict[str, Any]]:
         msgs: list[dict[str, Any]] = []

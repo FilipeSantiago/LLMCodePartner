@@ -8,6 +8,7 @@
 
 This is the only module that imports `claude_agent_sdk`.
 """
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -23,9 +24,11 @@ from claude_agent_sdk import (
 
 from mcp_bridge import bridge
 from mcp_bridge import server as engine
-from mcp_bridge.models import DoneEvent, Event, Run, TextEvent, ToolCallEvent
-from mcp_bridge.registry import ToolSpec
+from mcp_bridge.models import Event, Run, TextEvent
+from mcp_bridge.registry import ToolSpec, allowed_for
 from providers.base import Provider
+
+log = logging.getLogger("mcp_bridge")
 
 SERVER_NAME = "jetbrains"
 
@@ -43,11 +46,15 @@ class ClaudeProvider(Provider):
             elif isinstance(message, ResultMessage):
                 yield "", message.terminal_reason
 
-    async def tools(self, messages: list[dict], specs: list[ToolSpec]) -> AsyncIterator[Event]:
+    async def tools(self, messages: list[dict], specs: list[ToolSpec],
+                    model: str | None = None, role: str | None = None) -> AsyncIterator[Event]:
         """Stateful, but the start-vs-resume decision is private: a history carrying
         tool results resolves the pending futures and continues the SAME background
         run; otherwise a fresh run is started. Either way, yields the same neutral
-        events every provider's `tools()` emits."""
+        events every provider's `tools()` emits. `model` selects the Claude tier
+        ("haiku"/"sonnet"/"opus"/full id) for a fresh run; None = CLI default. `role`
+        selects the tool allowlist for a fresh run; a resume inherits the role already
+        baked into the Run."""
         results = self._trailing_tool_results(messages)
         if results:
             run: Run | None = None
@@ -58,7 +65,13 @@ class ClaudeProvider(Provider):
                 return
         else:
             prompt, system = self._flatten(messages)
-            run = engine.start_run(prompt, system, specs, strategy=self._run_strategy)
+
+            async def strategy(run: Run, prompt: str, system: str | None,
+                               specs: list[ToolSpec]) -> str:
+                return await self._run_strategy(run, prompt, system, specs, model)
+
+            run = engine.start_run(prompt, system, specs, strategy=strategy,
+                                   allowed=allowed_for(role))
 
         async for event in self._drain_queue(run):
             yield event
@@ -87,10 +100,12 @@ class ClaudeProvider(Provider):
         return _handler
 
     async def _run_strategy(self, run: Run, prompt: str, system: str | None,
-                            specs: list[ToolSpec]) -> str:
+                            specs: list[ToolSpec], model: str | None = None) -> str:
         """The engine `Strategy`: drive the model in-process, pushing TextEvents onto
         the Run and (via `_make_tool` → `bridge.call_tool`) parking a future per tool
-        call. Returns the terminal reason. Runs as the Run's background task."""
+        call. Returns the terminal reason. Runs as the Run's background task. `model`
+        selects the Claude tier (None = CLI default). Captures token/cost usage from the
+        terminal `ResultMessage` onto the Run for the engine's DoneEvent."""
         server = create_sdk_mcp_server(
             name=SERVER_NAME, version="1.0.0",
             tools=[self._make_tool(run, s) for s in specs],
@@ -98,7 +113,7 @@ class ClaudeProvider(Provider):
         allowed = [f"mcp__{SERVER_NAME}__{s.name}" for s in specs]
         options = ClaudeAgentOptions(
             system_prompt=system, tools=[], allowed_tools=allowed,
-            mcp_servers={SERVER_NAME: server},
+            mcp_servers={SERVER_NAME: server}, model=model,
         )
         terminal = "endTurn"
         async for message in query(prompt=prompt, options=options):
@@ -108,35 +123,10 @@ class ClaudeProvider(Provider):
                         await run.put(TextEvent(b.text))
             elif isinstance(message, ResultMessage):
                 terminal = message.terminal_reason
+                run.usage = message.usage
+                run.model_usage = message.model_usage
+                log.info(
+                    "claude coder usage: model=%s cost_usd=%s model_usage=%s",
+                    model or "default", message.total_cost_usd, message.model_usage,
+                )
         return terminal
-
-    def _flatten(self, messages: list[dict]) -> tuple[str, str | None]:
-        """Neutral history → (prompt, system) for a fresh turn. Tool-plumbing turns
-        (assistant `tool_calls`, `role:"tool"` results) are dropped — the model gets
-        tool results via the resumed MCP handler, not the prompt."""
-        system = "\n\n".join(
-            m["content"] for m in messages if m.get("role") == "system" and m.get("content")
-        ) or None
-        convo = [
-            m for m in messages
-            if m.get("role") in ("user", "assistant") and m.get("content") and not m.get("tool_calls")
-        ]
-        if len(convo) == 1:
-            prompt = convo[0]["content"]
-        else:
-            prompt = "\n\n".join(f"{m['role'].capitalize()}: {m['content']}" for m in convo)
-        return prompt, system
-
-    def _trailing_tool_results(self, messages: list[dict]) -> list[dict]:
-        """`role:"tool"` messages carrying a tool_call_id (client tool results)."""
-        return [m for m in messages if m.get("role") == "tool" and m.get("tool_call_id")]
-
-    async def _drain_queue(self, run: Run):
-        """Yield a Run's neutral events until it stops for this request: a ToolCallEvent
-        (background task now blocked on the future — resumed by a later request) or a
-        DoneEvent (turn finished)."""
-        while True:
-            event = await run.next_event()
-            yield event
-            if isinstance(event, (ToolCallEvent, DoneEvent)):
-                return
