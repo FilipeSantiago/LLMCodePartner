@@ -22,7 +22,7 @@ import os
 from collections.abc import AsyncIterator
 
 from agent.coder import Coder
-from agent.prompt_optimizer import PromptOptimizer
+from agent.prompt_optimizer import MODEL_CHOICES, MODEL_SUGGESTION_SEP, PromptOptimizer
 from conversation import openai_request as oreq
 from mcp_bridge.models import DoneEvent, Event, TextEvent, ToolCallEvent
 from model.chat import ChatCompletionRequest
@@ -74,15 +74,34 @@ def _accepted(history: list[dict], proposal_idx: int) -> bool:
 
 
 def _extract_prompt(content: str) -> str:
-    """Recover the enhanced prompt from a proposal assistant message (strip the
-    leading sentinel and the trailing footer)."""
+    """Recover the enhanced prompt from a proposal assistant message (strip the leading
+    sentinel, the trailing footer, and the suggested-model-config block). The Coder must
+    receive only the optimized prompt, never the suggestion text."""
     body = content.strip()
     if body.startswith(ENHANCED_PROMPT_MARKER):
         body = body[len(ENHANCED_PROMPT_MARKER):].lstrip("\n")
     idx = body.rfind(_FOOTER_SEP)
     if idx != -1:
         body = body[:idx]
+    sep = body.find(MODEL_SUGGESTION_SEP)
+    if sep != -1:
+        body = body[:sep]
     return body.strip()
+
+
+def _extract_model(content: str) -> str | None:
+    """Recover the suggested coder model tier from a proposal's suggested-config block.
+    Returns a valid `MODEL_CHOICES` tier, or None if absent/unrecognized (→ CLI default)."""
+    sep = content.find(MODEL_SUGGESTION_SEP)
+    if sep == -1:
+        return None
+    block = content[sep + len(MODEL_SUGGESTION_SEP):]
+    for line in block.splitlines():
+        line = line.strip()
+        if line.lower().startswith("model:"):
+            token = line[len("model:"):].strip().split()[0].lower() if line[len("model:"):].strip() else ""
+            return token if token in MODEL_CHOICES else None
+    return None
 
 
 async def _optimize(history: list[dict], specs) -> AsyncIterator[Event]:
@@ -116,7 +135,9 @@ async def run(request: ChatCompletionRequest) -> AsyncIterator[Event]:
     # A tool result came back — resume whoever is running.
     if last.get("role") == "tool":
         if prop_idx != -1 and _accepted(history, prop_idx):
-            async for ev in Coder(history).run(specs):   # Code resume
+            # Re-derive the tier from the still-present proposal (stateless backend).
+            model = _extract_model(history[prop_idx]["content"])
+            async for ev in Coder(history, model=model).run(specs):   # Code resume
                 yield ev
         else:
             async for ev in _optimize(history, specs):    # Optimizer still gathering
@@ -127,7 +148,8 @@ async def run(request: ChatCompletionRequest) -> AsyncIterator[Event]:
     if prop_idx != -1 and prop_idx == _last_assistant_idx(history):
         if (last.get("content") or "").strip().lower() == "accept":
             enhanced = _extract_prompt(history[prop_idx]["content"])
-            async for ev in Coder([{"role": "user", "content": enhanced}]).run(specs):  # Code start
+            model = _extract_model(history[prop_idx]["content"])
+            async for ev in Coder([{"role": "user", "content": enhanced}], model=model).run(specs):  # Code start
                 yield ev
         else:
             async for ev in _optimize(history, specs):    # Refine on feedback
