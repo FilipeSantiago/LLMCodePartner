@@ -12,6 +12,72 @@ Run it:
 uv run main.py          # serves on http://0.0.0.0:7777
 ```
 
+### Docker Compose
+
+The Compose image includes Python 3.13, Node.js 22, and pinned OpenSpec, Codex,
+and Claude Code CLIs. Copy `.env.example` to `.env`, adjust the provider settings,
+then build and start the service:
+
+```bash
+cp .env.example .env
+docker compose build
+docker compose up -d
+docker compose ps
+```
+
+The API is available at `http://localhost:7777`; its health check calls
+`GET /v1/models`. Verify the packaged tools with:
+
+```bash
+docker compose exec codepartner openspec --version
+docker compose exec codepartner codex --version
+docker compose exec codepartner claude --version
+```
+
+Claude and Codex credentials live in the named `agent-home` volume mounted at
+`/home/codepartner`. Authenticate each provider once inside the container. Device
+authentication is the recommended Codex flow for remote or headless machines:
+
+```bash
+docker compose run --rm codepartner claude auth login
+docker compose run --rm codepartner codex login --device-auth
+```
+
+Verify both logins before starting the service:
+
+```bash
+docker compose run --rm codepartner claude auth status
+docker compose run --rm codepartner codex login status
+```
+
+If Codex reports `Permission denied` while logging in after upgrading from an
+older image, repair the existing credential directory once, then retry:
+
+```bash
+docker compose run --rm --user root codepartner \
+  chown -R codepartner:codepartner /home/codepartner/.codex
+```
+
+Codex device authentication may need to be enabled in your ChatGPT security
+settings or by your workspace administrator. Open the displayed URL in a browser
+and enter the one-time code; do not share that code. The named volume remains after
+container replacement and `docker compose down`, so refreshed credentials and CLI
+settings survive rebuilds. `docker compose down -v` intentionally deletes that
+volume and requires signing in again. The service runs as the non-root
+`codepartner` user so the credential store remains writable.
+
+Compose uses host networking because PyCharm's MCP server listens only on host
+loopback. The API therefore listens directly on host port 7777 even though
+`docker compose ps` does not display a published-port mapping. `OLLAMA_HOST`,
+`MCP_PUBLIC_BASE`, and `JETBRAINS_MCP_URL` can all use `127.0.0.1` from the
+container. No source project is mounted: the backend writes complete
+`openspec/changes/` artifacts plus the `.codepartner/` catalog and dashboard
+through PyCharm's MCP server in the configured active project.
+
+For unattended deployments, provide `ANTHROPIC_API_KEY` or the applicable Codex
+access token through a secret manager or runtime environment. Never copy credentials
+into the image. `.dockerignore` excludes the local `.env` file.
+
 - Raw request logging: `.env` toggle `RAW_LOG_ENABLED=true`.
 - Tool-call timeout: `.env` `MCP_TOOL_TIMEOUT=120` (seconds).
 - LLM provider: `.env` `LLM_PROVIDER=claude|codex|ollama` (see Providers).
@@ -21,6 +87,55 @@ uv run main.py          # serves on http://0.0.0.0:7777
 - Prompt-optimizer pipeline (opt-in): `.env` `OPTIMIZER_ENABLED=true`; the
   optimizer may run on a sturdier instruction-follower via `OPTIMIZER_MODEL`
   (defaults to `OLLAMA_MODEL`). See **Prompt-optimizer pipeline**.
+
+## OpenSpec planning commands
+
+Send `/spec <request>` through the chat endpoint to create a new, additive
+OpenSpec change without starting implementation:
+
+```text
+/spec "implement authentication"
+```
+
+Each invocation creates a separate directory under `openspec/changes/` containing
+`.openspec.yaml`, `proposal.md`, `design.md`, one or more capability delta
+specifications, and `tasks.md`. A later `/spec` creates another change and never
+replaces an earlier one.
+
+The provider groups related work into one or more purpose-oriented work packages.
+The backend assigns globally stable IDs such as `WP1`, `WP1-T1`, and
+`WP1-T2`; IDs come from the backend catalog rather than model output. Work
+packages may be user stories, technical outcomes, migrations, refactorings,
+research, or operational work. Every task retains its title, description,
+complexity, reasoning, context, and preferred capability.
+
+`.codepartner/spec-index.json` stores the machine-readable catalog and
+`.codepartner/tasks.md` is regenerated as a dashboard of every active work
+package. The OpenSpec change files remain the planning artifacts.
+
+Refine selected tasks with `/update`:
+
+```text
+/update WP1-T1 WP1-T2: replace polling with event callbacks
+```
+
+The natural form `/update about US1-TASK1 and WP1-T2, ...` is also accepted and
+normalized to canonical `WPn-Tn` IDs. An update loads the complete owning change
+for context but may replace only the selected tasks. It preserves other tasks,
+work packages, requirements, proposal, design, IDs, and completion states. One
+update may currently target tasks from only one OpenSpec change.
+
+For native runs, the backend host must have the `openspec` CLI on `PATH` (or set
+`OPENSPEC_BIN` to its executable); the Compose image already includes it. Set
+`JETBRAINS_MCP_URL` and `JETBRAINS_MCP_PROJECT_PATH` from PyCharm's **Copy HTTP
+Stream Config** output. The generated port can change after an IDE restart. The
+client sends the project path as the `IJ_MCP_SERVER_PROJECT_PATH` header, uses
+`create_new_file` for saving, `read_file` for loading, and `search_file` for
+catalog discovery, while delegating parent directory creation to the IDE.
+`/spec` and `/update` bypass the optimizer/coder pipeline and never execute
+generated tasks. If PyCharm is closed, the port or project is stale, or file
+creation is disabled, the endpoint returns HTTP 502 with a focused persistence
+error. The incoming chat request does not need to advertise IDE file tools.
 
 Optimizer tuning — all optional, and every default reproduces the pre-existing
 behaviour (one rewrite call, no reads):

@@ -14,6 +14,16 @@ from fastapi import APIRouter, HTTPException
 
 import providers
 from agent import pipeline
+from agent.spec import (
+    ArtifactStoreError,
+    CliOpenSpecAdapter,
+    OpenSpecArtifactStore,
+    OpenSpecError,
+    SpecCommandError,
+    SpecCommandHandler,
+    is_spec_command,
+    is_update_command,
+)
 from conversation import openai_request as oreq
 from conversation.non_streaming_responder import NonStreamingResponder
 from conversation.streaming_responder import StreamingResponder
@@ -23,16 +33,34 @@ from model.chat import ChatCompletionRequest, ChatCompletionResponse
 log = logging.getLogger("mcp_bridge")
 
 router = APIRouter()
+spec_handler = SpecCommandHandler(CliOpenSpecAdapter(), OpenSpecArtifactStore())
 
 
 @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(request: ChatCompletionRequest):
     created = int(time.time())
 
-    provider = providers.active()
-
+    messages = oreq.to_messages(request)
+    last = messages[-1] if messages else {}
     if request.tools:
         log.info("tools received from JetBrains: %s", oreq.advertised_names(request))
+    is_planning = last.get("role") == "user" and (
+            is_spec_command(last.get("content"))
+            or is_update_command(last.get("content"))
+    )
+    if is_planning:
+        responder = StreamingResponder() if request.stream else NonStreamingResponder()
+        try:
+            result = await spec_handler.handle(messages)
+        except SpecCommandError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ArtifactStoreError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except OpenSpecError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return responder.reply(result.content, request.model, created)
+
+    provider = providers.active()
 
     # OPTIMIZER PIPELINE (opt-in): when enabled, tool-advertising streams are driven
     # by the workflow (Optimizer → human accept → Coder) instead of a single provider.
@@ -47,7 +75,6 @@ async def chat_completions(request: ChatCompletionRequest):
     # off this is a coding agent talking straight to the IDE, so it runs as
     # ROLE_CODER — stated explicitly rather than inheriting the un-roled ceiling.
     if request.stream and (request.tools or oreq.tool_results(request)):
-        messages = oreq.to_messages(request)
         events = provider.tools(messages, oreq.tool_specs(request), role=ROLE_CODER)
         return StreamingResponder().drain_events(events, request.model, created)
 
