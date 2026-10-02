@@ -22,6 +22,7 @@ def register(tool_call_id: str, run: Run, name: str, arguments: dict) -> asyncio
     _futures[tool_call_id] = fut
     _runs[tool_call_id] = run
     run.pending[tool_call_id] = fut
+    run.tool_names[tool_call_id] = name
     log.info("tool call emitted id=%s name=%s args=%s", tool_call_id, name, arguments)
     return fut
 
@@ -56,8 +57,21 @@ def resolve(tool_call_id: str, content: str) -> Run | None:
     if fut is None or fut.done():
         log.warning("unknown/late tool result id=%s", tool_call_id)
         return None
+    run = _runs.get(tool_call_id)
+    # A failed IDE write is normally returned as an error-shaped tool result. Do
+    # not declare a project mutation in that case: fallback is only unsafe after
+    # a write actually succeeded.
+    tool_name = (run.tool_names.get(tool_call_id, "") if run else "").lower()
+    is_write = any(token in tool_name for token in ("create", "write", "edit", "replace", "rename", "delete"))
+    if run is not None and is_write and "error" not in (content or "").lower():
+        run.mutating_tool_succeeded = True
     fut.set_result(content)
     log.info("tool result received id=%s len=%d", tool_call_id, len(content or ""))
+    return run
+
+
+def run_for(tool_call_id: str) -> Run | None:
+    """Return the active run for a pending IDE tool call without resolving it."""
     return _runs.get(tool_call_id)
 
 

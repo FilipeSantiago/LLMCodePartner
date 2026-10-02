@@ -46,7 +46,8 @@ class Provider(ABC):
 
     @abstractmethod
     def tools(self, messages: list[dict], specs: list[ToolSpec],
-              model: str | None = None, role: str | None = None) -> AsyncIterator[Event]:
+              model: str | None = None, role: str | None = None,
+              run_metadata: dict | None = None, **kwargs) -> AsyncIterator[Event]:
         """One tool turn → neutral events (TextEvent/ToolCallEvent/ErrorEvent/
         DoneEvent). Stateful vs. stateless is entirely private to the subclass.
         `model` optionally selects the backend model/tier for this turn (None =

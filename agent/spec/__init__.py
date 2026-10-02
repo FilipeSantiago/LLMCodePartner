@@ -12,8 +12,12 @@ from agent.spec.command import (
     SpecResult,
     create_change_id,
     extract_spec_request,
+    extract_run_task_id,
+    extract_implementation_selectors,
+    is_implementation_command,
     extract_update_request,
     is_spec_command,
+    is_run_command,
     is_update_command,
 )
 from agent.spec.jetbrains_mcp import JetBrainsMcpClient, JetBrainsMcpError
@@ -34,7 +38,11 @@ __all__ = [
     "SpecResult",
     "create_change_id",
     "extract_spec_request",
+    "extract_implementation_selectors",
+    "extract_run_task_id",
     "extract_update_request",
     "is_spec_command",
+    "is_implementation_command",
+    "is_run_command",
     "is_update_command",
 ]

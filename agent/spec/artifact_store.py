@@ -54,6 +54,18 @@ class ArtifactStore(abc.ABC):
     ) -> OpenSpecChange:
         ...
 
+    @abc.abstractmethod
+    async def task_by_id(self, task_id: str) -> tuple[OpenSpecChange, Task]:
+        ...
+
+    @abc.abstractmethod
+    async def tasks_for_selectors(self, selectors: list[str]) -> list[tuple[OpenSpecChange, Task]]:
+        ...
+
+    @abc.abstractmethod
+    async def mark_task_completed(self, task_id: str) -> None:
+        ...
+
 
 class OpenSpecArtifactStore(ArtifactStore):
     """MCP-backed multi-file store with globally stable work-package IDs."""
@@ -137,6 +149,88 @@ class OpenSpecArtifactStore(ArtifactStore):
         if len(owners) != 1:
             raise ArtifactSelectionError("one /update may target tasks from only one change")
         return next(iter(owners.values()))
+
+    async def task_by_id(self, task_id: str) -> tuple[OpenSpecChange, Task]:
+        """Load one task with its owning OpenSpec change without mutating artifacts."""
+        catalog = await self._load_catalog()
+        for value in catalog.get("changes", []):
+            change = OpenSpecChange.from_dict(value)
+            for package in change.work_packages:
+                for task in package.tasks:
+                    if task.id == task_id:
+                        return change, task
+        raise ArtifactSelectionError(f"unknown task ID: {task_id}")
+
+    async def tasks_for_selectors(self, selectors: list[str]) -> list[tuple[OpenSpecChange, Task]]:
+        """Expand task and work-package selectors in user order, without repeats."""
+        catalog = await self._load_catalog()
+        changes = [OpenSpecChange.from_dict(value) for value in catalog.get("changes", [])]
+        packages = {
+            package.id: (change, package)
+            for change in changes for package in change.work_packages
+        }
+        tasks = {
+            task.id: (change, task)
+            for change in changes for package in change.work_packages for task in package.tasks
+        }
+        selected: list[tuple[OpenSpecChange, Task]] = []
+        selected_ids: set[str] = set()
+        for selector in selectors:
+            if selector in tasks:
+                candidates = [tasks[selector]]
+            elif selector in packages:
+                change, package = packages[selector]
+                candidates = [(change, task) for task in package.tasks]
+            else:
+                raise ArtifactSelectionError(f"unknown task or work package ID: {selector}")
+            for change, task in candidates:
+                if task.completed or task.id in selected_ids:
+                    continue
+                selected.append((change, task))
+                selected_ids.add(task.id)
+        if not selected:
+            raise ArtifactSelectionError("the selected tasks are already completed")
+        return selected
+
+    async def mark_task_completed(self, task_id: str) -> None:
+        catalog = await self._load_catalog()
+        changes = [OpenSpecChange.from_dict(value) for value in catalog.get("changes", [])]
+        owner: OpenSpecChange | None = None
+        updated_changes: list[OpenSpecChange] = []
+        found = False
+        for change in changes:
+            packages = []
+            for package in change.work_packages:
+                tasks = []
+                for task in package.tasks:
+                    if task.id == task_id:
+                        task = replace(task, completed=True)
+                        found = True
+                    tasks.append(task)
+                packages.append(replace(package, tasks=tasks))
+            updated = replace(change, work_packages=packages)
+            if found and owner is None:
+                owner = updated
+            updated_changes.append(updated)
+        if not found or owner is None:
+            raise ArtifactSelectionError(f"unknown task ID: {task_id}")
+        catalog["changes"] = [change.to_dict() for change in updated_changes]
+        try:
+            await self._client.create_file(
+                f"{owner.path}/tasks.md", render_tasks(owner), overwrite=True
+            )
+            await self._client.create_file(
+                DASHBOARD_PATH, render_dashboard(updated_changes), overwrite=True
+            )
+            await self._client.create_file(
+                CATALOG_PATH,
+                json.dumps(catalog, indent=2, ensure_ascii=False) + "\n",
+                overwrite=True,
+            )
+        except JetBrainsMcpError as exc:
+            raise ArtifactStoreError(
+                f"could not mark {task_id} complete through JetBrains MCP: {exc}"
+            ) from exc
 
     async def replace_tasks(
             self, change: OpenSpecChange, replacements: dict[str, Task]

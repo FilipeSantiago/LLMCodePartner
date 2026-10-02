@@ -9,6 +9,7 @@
 This is the only module that imports `claude_agent_sdk`.
 """
 import logging
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -47,7 +48,9 @@ class ClaudeProvider(Provider):
                 yield "", message.terminal_reason
 
     async def tools(self, messages: list[dict], specs: list[ToolSpec],
-                    model: str | None = None, role: str | None = None) -> AsyncIterator[Event]:
+                    model: str | None = None, role: str | None = None,
+                    run_metadata: dict | None = None,
+                    execution_env: dict[str, str] | None = None, **kwargs) -> AsyncIterator[Event]:
         """Stateful, but the start-vs-resume decision is private: a history carrying
         tool results resolves the pending futures and continues the SAME background
         run; otherwise a fresh run is started. Either way, yields the same neutral
@@ -68,10 +71,11 @@ class ClaudeProvider(Provider):
 
             async def strategy(run: Run, prompt: str, system: str | None,
                                specs: list[ToolSpec]) -> str:
-                return await self._run_strategy(run, prompt, system, specs, model)
+                return await self._run_strategy(run, prompt, system, specs, model, execution_env)
 
             run = engine.start_run(prompt, system, specs, strategy=strategy,
                                    allowed=allowed_for(role))
+            run.metadata.update(run_metadata or {})
 
         async for event in self._drain_queue(run):
             yield event
@@ -100,7 +104,8 @@ class ClaudeProvider(Provider):
         return _handler
 
     async def _run_strategy(self, run: Run, prompt: str, system: str | None,
-                            specs: list[ToolSpec], model: str | None = None) -> str:
+                            specs: list[ToolSpec], model: str | None = None,
+                            execution_env: dict[str, str] | None = None) -> str:
         """The engine `Strategy`: drive the model in-process, pushing TextEvents onto
         the Run and (via `_make_tool` → `bridge.call_tool`) parking a future per tool
         call. Returns the terminal reason. Runs as the Run's background task. `model`
@@ -114,6 +119,10 @@ class ClaudeProvider(Provider):
         options = ClaudeAgentOptions(
             system_prompt=system, tools=[], allowed_tools=allowed,
             mcp_servers={SERVER_NAME: server}, model=model,
+            # The Agent SDK may treat ``env`` as the complete subprocess
+            # environment. Preserve the authenticated CLI session while adding
+            # a gateway override.
+            env={**os.environ, **(execution_env or {})},
         )
         terminal = "endTurn"
         async for message in query(prompt=prompt, options=options):

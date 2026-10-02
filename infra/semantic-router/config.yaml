@@ -1,0 +1,76 @@
+# vLLM Semantic Router policy mirror. `codepartner/<tier>` entrypoints are used
+# only by the management route-preview API; Code Partner launches the selected
+# provider CLI itself.
+version: v0.3
+listeners:
+  - name: codepartner-preview
+    address: 127.0.0.1
+    port: 8899
+providers:
+  defaults:
+    model: claude-low
+  models:
+    - name: claude-low
+      provider_model_id: claude-low
+      backend_refs: [{name: agentgateway, endpoint: 127.0.0.1:4000, protocol: http}]
+    - name: codex-low
+      provider_model_id: codex-low
+      backend_refs: [{name: agentgateway, endpoint: 127.0.0.1:4000, protocol: http}]
+    - name: claude-medium
+      provider_model_id: claude-medium
+      backend_refs: [{name: agentgateway, endpoint: 127.0.0.1:4000, protocol: http}]
+    - name: codex-medium
+      provider_model_id: codex-medium
+      backend_refs: [{name: agentgateway, endpoint: 127.0.0.1:4000, protocol: http}]
+    - name: claude-high
+      provider_model_id: claude-high
+      backend_refs: [{name: agentgateway, endpoint: 127.0.0.1:4000, protocol: http}]
+    - name: codex-high
+      provider_model_id: codex-high
+      backend_refs: [{name: agentgateway, endpoint: 127.0.0.1:4000, protocol: http}]
+routing:
+  modelCards:
+    - name: claude-low
+      description: Fast implementation of localized coding changes.
+    - name: codex-low
+      description: Fast implementation of localized coding changes.
+    - name: claude-medium
+      description: Multi-file feature work and moderate reasoning.
+    - name: codex-medium
+      description: Multi-file feature work and moderate reasoning.
+    - name: claude-high
+      description: Cross-cutting and ambiguous architecture work.
+    - name: codex-high
+      description: Cross-cutting and ambiguous architecture work.
+entrypoints:
+  - model_names: [codepartner/simple]
+    recipe: codepartner-simple
+  - model_names: [codepartner/medium]
+    recipe: codepartner-medium
+  - model_names: [codepartner/complex]
+    recipe: codepartner-complex
+recipes:
+  - name: codepartner-simple
+    routing:
+      decisions:
+        - name: simple-candidate-selection
+          priority: 100
+          rules: {operator: AND, conditions: []}
+          modelRefs: [{model: claude-low}, {model: codex-low}]
+          algorithm: {type: multi_factor}
+  - name: codepartner-medium
+    routing:
+      decisions:
+        - name: medium-candidate-selection
+          priority: 100
+          rules: {operator: AND, conditions: []}
+          modelRefs: [{model: claude-medium}, {model: codex-medium}]
+          algorithm: {type: multi_factor}
+  - name: codepartner-complex
+    routing:
+      decisions:
+        - name: complex-candidate-selection
+          priority: 100
+          rules: {operator: AND, conditions: []}
+          modelRefs: [{model: claude-high}, {model: codex-high}]
+          algorithm: {type: multi_factor}

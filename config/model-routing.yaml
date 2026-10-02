@@ -1,0 +1,51 @@
+# Application-owned routing policy.  Model aliases are stable; CLI model IDs are
+# intentionally environment-configurable so a subscription/account can choose its
+# available models without code changes.
+runtime:
+  semantic_router_url: http://semantic-router:8080
+  agentgateway_url: http://agentgateway:4000
+  router_timeout_seconds: 10
+
+health:
+  failure_threshold: 2
+
+routing:
+  tiers:
+    simple:
+      candidates: [claude-low, codex-low]
+    medium:
+      candidates: [claude-medium, codex-medium]
+    complex:
+      candidates: [claude-high, codex-high]
+
+models:
+  claude-low:
+    provider: claude
+    executor: claude-cli
+    cli_model: ${CLAUDE_MODEL_SIMPLE:-haiku}
+    gateway_mode: preferred
+  codex-low:
+    provider: codex
+    executor: codex-cli
+    cli_model: ${CODEX_MODEL_SIMPLE:-}
+    gateway_mode: preferred
+  claude-medium:
+    provider: claude
+    executor: claude-cli
+    cli_model: ${CLAUDE_MODEL_MEDIUM:-sonnet}
+    gateway_mode: preferred
+  codex-medium:
+    provider: codex
+    executor: codex-cli
+    cli_model: ${CODEX_MODEL_MEDIUM:-}
+    gateway_mode: preferred
+  claude-high:
+    provider: claude
+    executor: claude-cli
+    cli_model: ${CLAUDE_MODEL_COMPLEX:-opus}
+    gateway_mode: preferred
+  codex-high:
+    provider: codex
+    executor: codex-cli
+    cli_model: ${CODEX_MODEL_COMPLEX:-}
+    gateway_mode: preferred

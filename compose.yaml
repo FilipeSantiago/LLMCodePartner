@@ -1,6 +1,37 @@
 name: llmcodepartner
 
 services:
+  semantic-router:
+    # Pin this through SEMANTIC_ROUTER_IMAGE after validating the chosen vLLM
+    # Semantic Router release against infra/semantic-router/config.yaml.
+    image: ${SEMANTIC_ROUTER_IMAGE:-ghcr.io/vllm-project/semantic-router/extproc:latest}
+    network_mode: host
+    command: ["--secure=false"]
+    volumes:
+      - ./infra/semantic-router/config.yaml:/app/config/config.yaml:ro
+      - semantic-router-models:/app/models
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/health"]
+      interval: 20s
+      timeout: 5s
+      start_period: 120s
+      retries: 10
+
+  agentgateway:
+    image: ${AGENTGATEWAY_IMAGE:-cr.agentgateway.dev/agentgateway:v1.5.0}
+    network_mode: host
+    volumes:
+      - ./infra/agentgateway/config.yaml:/config/config.yaml:ro
+      - agentgateway-data:/config/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:4000/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
   codepartner:
     build:
       context: .
@@ -18,10 +49,21 @@ services:
       DISABLE_AUTOUPDATER: "1"
       MCP_PUBLIC_BASE: ${DOCKER_MCP_PUBLIC_BASE:-http://127.0.0.1:7777}
       OLLAMA_HOST: ${DOCKER_OLLAMA_HOST:-http://127.0.0.1:11434}
+      SEMANTIC_ROUTER_URL: ${SEMANTIC_ROUTER_URL:-http://semantic-router:8080}
+      AGENTGATEWAY_URL: ${AGENTGATEWAY_URL:-http://agentgateway:4000}
+      ROUTING_DB_PATH: ${ROUTING_DB_PATH:-/home/codepartner/.codepartner/routing.sqlite3}
     network_mode: host
+    extra_hosts:
+      - semantic-router:127.0.0.1
+      - agentgateway:127.0.0.1
     volumes:
       - agent-home:/home/codepartner
     restart: unless-stopped
+    depends_on:
+      semantic-router:
+        condition: service_healthy
+      agentgateway:
+        condition: service_healthy
     healthcheck:
       test:
         - CMD
@@ -35,3 +77,5 @@ services:
 
 volumes:
   agent-home:
+  semantic-router-models:
+  agentgateway-data:

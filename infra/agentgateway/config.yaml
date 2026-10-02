@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+# Provider credentials intentionally stay outside this repository. Subscription
+# OAuth is forwarded by the respective CLI when the gateway path supports it.
+gateways:
+  default:
+    port: 4000
+    protocol: HTTP
+routes:
+  - matches:
+      - path:
+          exact: /health
+    directResponse:
+      status: 200
+      body: '{"status":"healthy"}'
+llm:
+  models:
+    - name: "claude-*"
+      provider: anthropic
+    - name: "*"
+      provider: openAI

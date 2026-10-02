@@ -15,25 +15,35 @@ from fastapi import APIRouter, HTTPException
 import providers
 from agent import pipeline
 from agent.spec import (
+    ArtifactSelectionError,
     ArtifactStoreError,
     CliOpenSpecAdapter,
     OpenSpecArtifactStore,
     OpenSpecError,
     SpecCommandError,
     SpecCommandHandler,
+    extract_implementation_selectors,
+    extract_run_task_id,
+    is_implementation_command,
+    is_run_command,
     is_spec_command,
     is_update_command,
 )
+from agent.routing import ImplementationService, TaskExecutionService
 from conversation import openai_request as oreq
 from conversation.non_streaming_responder import NonStreamingResponder
 from conversation.streaming_responder import StreamingResponder
 from mcp_bridge.registry import ROLE_CODER
+from mcp_bridge import bridge
 from model.chat import ChatCompletionRequest, ChatCompletionResponse
 
 log = logging.getLogger("mcp_bridge")
 
 router = APIRouter()
-spec_handler = SpecCommandHandler(CliOpenSpecAdapter(), OpenSpecArtifactStore())
+artifact_store = OpenSpecArtifactStore()
+spec_handler = SpecCommandHandler(CliOpenSpecAdapter(), artifact_store)
+task_execution = TaskExecutionService()
+implementation = ImplementationService(artifact_store, task_execution)
 
 
 @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
@@ -59,6 +69,54 @@ async def chat_completions(request: ChatCompletionRequest):
         except OpenSpecError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return responder.reply(result.content, request.model, created)
+
+    is_implementation = last.get("role") == "user" and is_implementation_command(last.get("content"))
+    if is_implementation:
+        if not request.stream:
+            raise HTTPException(status_code=400, detail="/implement requires a streaming request")
+        try:
+            selectors = extract_implementation_selectors(last.get("content") or "")
+            job = await implementation.create_job(selectors)
+        except SpecCommandError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ArtifactSelectionError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ArtifactStoreError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        events = implementation.start(job, messages, oreq.tool_specs(request))
+        return StreamingResponder().drain_events(events, request.model, created)
+
+    is_task_run = last.get("role") == "user" and is_run_command(last.get("content"))
+    if is_task_run:
+        if not request.stream:
+            raise HTTPException(status_code=400, detail="/run requires a streaming request")
+        try:
+            task_id = extract_run_task_id(last.get("content") or "")
+            change, task = await artifact_store.task_by_id(task_id)
+        except SpecCommandError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ArtifactSelectionError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ArtifactStoreError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        events = task_execution.execute(task, change.id, messages, oreq.tool_specs(request))
+        return StreamingResponder().drain_events(events, request.model, created)
+
+    # An implementation tool round-trip resumes its persisted sequential job.
+    if request.stream and oreq.tool_results(request):
+        run = bridge.run_for(oreq.tool_results(request)[-1].tool_call_id)
+        if run is not None and run.metadata.get("implementation_job_id"):
+            events = implementation.resume(run, messages, oreq.tool_specs(request))
+            return StreamingResponder().drain_events(events, request.model, created)
+
+    # A /run tool round-trip is resumed by the executor that started it, rather
+    # than by LLM_PROVIDER/CODER_PROVIDER. This keeps a recorded Codex decision
+    # from silently continuing under Claude (or the reverse).
+    if request.stream and oreq.tool_results(request):
+        run = bridge.run_for(oreq.tool_results(request)[-1].tool_call_id)
+        if run is not None and run.metadata.get("task_execution"):
+            events = task_execution.resume(run, messages, oreq.tool_specs(request))
+            return StreamingResponder().drain_events(events, request.model, created)
 
     provider = providers.active()
 

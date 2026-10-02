@@ -34,6 +34,15 @@ docker compose exec codepartner codex --version
 docker compose exec codepartner claude --version
 ```
 
+### Task model routing
+
+OpenSpec tasks can be executed explicitly with `/run WP1-T1`. The task's
+complexity selects a configured candidate pool, vLLM Semantic Router recommends
+one allowed model, and Code Partner starts Claude Code or Codex with the existing
+JetBrains MCP tool bridge. agentgateway is attempted where the authenticated CLI
+flow supports it, with direct CLI fallback retained. See
+[model routing](docs/model-routing.md) for configuration and fallback behavior.
+
 Claude and Codex credentials live in the named `agent-home` volume mounted at
 `/home/codepartner`. Authenticate each provider once inside the container. Device
 authentication is the recommended Codex flow for remote or headless machines:
@@ -118,6 +127,21 @@ Refine selected tasks with `/update`:
 ```text
 /update WP1-T1 WP1-T2: replace polling with event callbacks
 ```
+
+Implement persisted tasks with the model-routing pipeline:
+
+```text
+/implement WP1-T1
+/implement WP1
+/execute WP1 WP3-T2
+```
+
+`/implement` is the canonical command; `/execute` is an alias. A work-package
+selector expands to its incomplete tasks in order. The backend creates a durable
+implementation job, routes each task only when it starts, and executes tasks
+sequentially. A failed task stops the job; completed tasks are checked off in the
+OpenSpec change and dashboard. IDE tool calls pause the current task and resume
+that same routed provider before the job advances.
 
 The natural form `/update about US1-TASK1 and WP1-T2, ...` is also accepted and
 normalized to canonical `WPn-Tn` IDs. An update loads the complete owning change

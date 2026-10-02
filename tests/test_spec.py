@@ -230,6 +230,20 @@ class CommandParsing(unittest.TestCase):
             extract_update_request("/update WP1-T1")
 
 
+class ArtifactSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_work_package_selection_skips_completed_tasks_and_completion_rewrites_artifacts(self):
+        client = FakeMcpClient()
+        store = OpenSpecArtifactStore(client)
+        change = await store.create_change(draft(), "authentication")
+        selected = await store.tasks_for_selectors(["WP1", "WP1-T2"])
+        self.assertEqual([task.id for _, task in selected], ["WP1-T1", "WP1-T2"])
+
+        await store.mark_task_completed("WP1-T1")
+        selected_after_completion = await store.tasks_for_selectors(["WP1"])
+        self.assertEqual([task.id for _, task in selected_after_completion], ["WP1-T2"])
+        self.assertIn("- [x] WP1-T1", client.files[f"{change.path}/tasks.md"])
+
+
 class JetBrainsClient(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _transport(result):

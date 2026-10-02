@@ -102,7 +102,10 @@ class CodexProvider(Provider):
         yield "", "endTurn"
 
     async def tools(self, messages: list[dict], specs: list[ToolSpec],
-                    model: str | None = None, role: str | None = None) -> AsyncIterator[Event]:
+                    model: str | None = None, role: str | None = None,
+                    run_metadata: dict | None = None,
+                    gateway_url: str | None = None, concrete_model: bool = False,
+                    **kwargs) -> AsyncIterator[Event]:
         """Stateful like Claude's, and for the same reason: the `codex` process stays
         alive across HTTP requests, blocked inside its MCP tool call, while JetBrains
         executes the tool. A history carrying tool results resolves the pending futures
@@ -121,10 +124,11 @@ class CodexProvider(Provider):
 
             async def strategy(run: Run, prompt: str, system: str | None,
                                specs: list[ToolSpec]) -> str:
-                return await self._run_strategy(run, prompt, system, model)
+                return await self._run_strategy(run, prompt, system, model, gateway_url, concrete_model)
 
             run = engine.start_run(prompt, system, specs, strategy=strategy,
                                    allowed=allowed_for(role))
+            run.metadata.update(run_metadata or {})
 
         async for event in self._drain_queue(run):
             yield event
@@ -132,13 +136,14 @@ class CodexProvider(Provider):
     # --- internals -----------------------------------------------------------
 
     async def _run_strategy(self, run: Run, prompt: str, system: str | None,
-                            model: str | None = None) -> str:
+                            model: str | None = None, gateway_url: str | None = None,
+                            concrete_model: bool = False) -> str:
         """The engine `Strategy`: publish this Run's bridged tools, run `codex exec`
         against them, and push its output onto the Run as neutral events. Returns the
         terminal reason. The MCP endpoint is opened and closed with the process, so a
         finished (or cancelled) run leaves nothing callable behind."""
         async with mcp_http.serve_run(run) as url:
-            args = self._base_args(model) + [
+            args = self._base_args(model, gateway_url, concrete_model) + [
                 "-c", f'mcp_servers.{mcp_http.SERVER_NAME}.url="{url}"',
             ]
             async for obj in self._exec(args, self._join(prompt, system)):
@@ -152,7 +157,8 @@ class CodexProvider(Provider):
                              model_for(model) or "default", usage)
         return "endTurn"
 
-    def _base_args(self, model: str | None = None) -> list[str]:
+    def _base_args(self, model: str | None = None, gateway_url: str | None = None,
+                   concrete_model: bool = False) -> list[str]:
         """`codex exec` flags shared by both surfaces. `read-only` is the locked tool
         surface: codex may reason, but every write has to go through the IDE tools."""
         args = [BIN, "exec", "--json", "--skip-git-repo-check", "--ephemeral",
@@ -160,9 +166,20 @@ class CodexProvider(Provider):
         cwd = os.getenv("CODEX_CWD")
         if cwd:
             args += ["--cd", cwd]
-        resolved = model_for(model)
+        resolved = model if concrete_model else model_for(model)
         if resolved:
             args += ["-m", resolved]
+        if gateway_url:
+            base_url = gateway_url.rstrip("/") + "/v1"
+            args += [
+                "-c", 'model_provider="agentgateway"',
+                "-c", 'model_providers.agentgateway.name="OpenAI via agentgateway"',
+                "-c", f'model_providers.agentgateway.base_url="{base_url}"',
+                "-c", 'model_providers.agentgateway.wire_api="responses"',
+                # Keep the existing ChatGPT/OpenAI login; no gateway key or
+                # persistent config mutation is required for this attempt.
+                "-c", "model_providers.agentgateway.requires_openai_auth=true",
+            ]
         # Escape hatch for CLI-level choices we don't model (`--oss`, `--profile`,
         # extra `-c` overrides).
         args += shlex.split(os.getenv("CODEX_ARGS", ""))

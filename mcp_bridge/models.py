@@ -62,6 +62,12 @@ class Run:
     # the engine's DoneEvent. None until the strategy sets them.
     usage: dict | None = None
     model_usage: dict | None = None
+    # Optional owner metadata for specialised run entrypoints.  The generic bridge
+    # never interprets it; the HTTP controller uses it only to resume the same
+    # executor after JetBrains returns a tool result.
+    metadata: dict[str, Any] = field(default_factory=dict)
+    tool_names: dict[str, str] = field(default_factory=dict)
+    mutating_tool_succeeded: bool = False
 
     async def put(self, event: Any) -> None:
         await self.queue.put(event)

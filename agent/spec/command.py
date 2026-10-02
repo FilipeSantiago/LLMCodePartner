@@ -13,10 +13,13 @@ from agent.spec.openspec_adapter import OpenSpecAdapter
 
 _SPEC_COMMAND = re.compile(r"^\s*/spec(?:\s+|$)", re.IGNORECASE)
 _UPDATE_COMMAND = re.compile(r"^\s*/update(?:\s+|$)", re.IGNORECASE)
+_RUN_COMMAND = re.compile(r"^\s*/run(?:\s+|$)", re.IGNORECASE)
+_IMPLEMENT_COMMAND = re.compile(r"^\s*/(?:implement|execute)(?:\s+|$)", re.IGNORECASE)
 _TASK_TARGET = re.compile(
     r"\b(?:WP|US)\s*(\d+)\s*-\s*T(?:ASK)?\s*(\d+)\b",
     re.IGNORECASE,
 )
+_PACKAGE_TARGET = re.compile(r"(?:WP|US)\s*(\d+)", re.IGNORECASE)
 
 
 class SpecCommandError(ValueError):
@@ -37,6 +40,14 @@ def is_spec_command(content: str | None) -> bool:
 
 def is_update_command(content: str | None) -> bool:
     return bool(content and _UPDATE_COMMAND.match(content))
+
+
+def is_run_command(content: str | None) -> bool:
+    return bool(content and _RUN_COMMAND.match(content))
+
+
+def is_implementation_command(content: str | None) -> bool:
+    return bool(content and _IMPLEMENT_COMMAND.match(content))
 
 
 def extract_spec_request(content: str) -> str:
@@ -71,6 +82,41 @@ def extract_update_request(content: str) -> tuple[list[str], str]:
     if not instruction:
         raise SpecCommandError("/update requires a refinement instruction")
     return task_ids, instruction
+
+
+def extract_run_task_id(content: str) -> str:
+    command = _RUN_COMMAND.match(content)
+    if not command:
+        raise SpecCommandError("message is not a /run command")
+    body = content[command.end():].strip()
+    match = _TASK_TARGET.fullmatch(body)
+    if not match:
+        raise SpecCommandError("/run requires exactly one task ID such as WP1-T1")
+    return f"WP{match.group(1)}-T{match.group(2)}"
+
+
+def extract_implementation_selectors(content: str) -> list[str]:
+    """Parse ordered task/work-package selectors for /implement and /execute."""
+    command = _IMPLEMENT_COMMAND.match(content)
+    if not command:
+        raise SpecCommandError("message is not an /implement or /execute command")
+    body = content[command.end():].strip()
+    if not body:
+        raise SpecCommandError("/implement requires task IDs such as WP1-T1 or work packages such as WP1")
+    selectors: list[str] = []
+    for token in re.split(r"[\s,]+", body):
+        task = _TASK_TARGET.fullmatch(token)
+        if task:
+            selectors.append(f"WP{task.group(1)}-T{task.group(2)}")
+            continue
+        package = _PACKAGE_TARGET.fullmatch(token)
+        if package:
+            selectors.append(f"WP{package.group(1)}")
+            continue
+        raise SpecCommandError(
+            f"invalid implementation selector {token!r}; use WP1-T1 or WP1"
+        )
+    return list(dict.fromkeys(selectors))
 
 
 def create_change_id(request: str, max_length: int = 48) -> str:

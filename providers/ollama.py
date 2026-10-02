@@ -41,7 +41,8 @@ class OllamaProvider(Provider):
                 return
 
     async def tools(self, messages: list[dict], specs: list[ToolSpec],
-                    model: str | None = None, role: str | None = None) -> AsyncIterator[Event]:
+                    model: str | None = None, role: str | None = None,
+                    run_metadata: dict | None = None, **kwargs) -> AsyncIterator[Event]:
         """One stateless tool turn → neutral events. `model` is accepted for the uniform
         provider surface but ignored here — the Ollama model is fixed via OLLAMA_MODEL.
         `role` IS honored: there is no per-run `ToolRegistry` to enforce it (this
