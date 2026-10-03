@@ -69,11 +69,13 @@ class ImplementationJob:
     job_id: str
     selectors: tuple[str, ...]
     task_ids: tuple[str, ...]
+    instruction: str = ""
     status: str = "queued"
 
     @classmethod
-    def create(cls, selectors: list[str], task_ids: list[str]) -> "ImplementationJob":
-        return cls(str(uuid4()), tuple(selectors), tuple(task_ids))
+    def create(cls, selectors: list[str], task_ids: list[str],
+               instruction: str = "") -> "ImplementationJob":
+        return cls(str(uuid4()), tuple(selectors), tuple(task_ids), instruction=instruction)
 
 
 @dataclass(frozen=True)

@@ -21,9 +21,9 @@ class ImplementationService:
         self.task_execution = task_execution or TaskExecutionService()
         self.persistence = persistence or self.task_execution.persistence
 
-    async def create_job(self, selectors: list[str]) -> ImplementationJob:
+    async def create_job(self, selectors: list[str], instruction: str = "") -> ImplementationJob:
         targets = await self.artifacts.tasks_for_selectors(selectors)
-        job = ImplementationJob.create(selectors, [task.id for _, task in targets])
+        job = ImplementationJob.create(selectors, [task.id for _, task in targets], instruction)
         queued = [
             ImplementationJobTask(job.job_id, position, change.id, task.id)
             for position, (change, task) in enumerate(targets)
@@ -37,7 +37,7 @@ class ImplementationService:
             f"Implementation job {job.job_id} queued {len(job.task_ids)} task(s): "
             f"{', '.join(job.task_ids)}."
         )
-        async for event in self._advance(job.job_id, messages, specs):
+        async for event in self._advance(job.job_id, messages, specs, job.instruction):
             yield event
 
     async def resume(self, run: Run, messages: list[dict],
@@ -48,24 +48,41 @@ class ImplementationService:
             raise RuntimeError("routed run is not attached to an implementation job")
         failed: str | None = None
         paused = False
+        terminal: DoneEvent | None = None
         async for event in self.task_execution.resume(run, messages, specs):
             if isinstance(event, ErrorEvent):
                 failed = event.message
             if isinstance(event, ToolCallEvent):
                 paused = True
-            yield event
+            if isinstance(event, DoneEvent):
+                terminal = event
+            else:
+                yield event
         if paused:
             return
         if failed:
             await self._fail(job_id, position, failed)
             yield TextEvent(f"Implementation job {job_id} stopped: {failed}")
+            if terminal is not None:
+                yield terminal
+            return
+        if not run.mutating_tool_succeeded:
+            failure = self._missing_mutation_error(run.metadata["implementation_task_id"])
+            await self._fail(job_id, position, failure)
+            yield ErrorEvent(failure)
+            yield TextEvent(f"Implementation job {job_id} stopped: {failure}")
+            if terminal is not None:
+                yield terminal
             return
         await self._complete(job_id, position, run.metadata["implementation_task_id"])
-        async for event in self._advance(job_id, messages, specs):
+        async for event in self._advance(
+                job_id, messages, specs, run.metadata.get("implementation_instruction", "")):
             yield event
+        if terminal is not None:
+            yield terminal
 
-    async def _advance(self, job_id: str, messages: list[dict],
-                       specs: list[ToolSpec]) -> AsyncIterator[Event]:
+    async def _advance(self, job_id: str, messages: list[dict], specs: list[ToolSpec],
+                       instruction: str = "") -> AsyncIterator[Event]:
         item = await self.persistence.next_implementation_task(job_id)
         if item is None:
             await self.persistence.finish_implementation_job(job_id)
@@ -76,13 +93,15 @@ class ImplementationService:
         yield TextEvent(f"Starting {task.id} ({task.complexity}) from {change.id}.")
         failure: str | None = None
         paused = False
+        terminal: DoneEvent | None = None
         async def record_decision(decision) -> None:
             await self.persistence.update_implementation_task(
                 job_id, item.position, "running", decision_id=decision.decision_id
             )
 
         async for event in self.task_execution.execute(
-                task, change.id, messages, specs, on_decision=record_decision):
+                task, change.id, messages, specs, on_decision=record_decision,
+                execution_instruction=instruction):
             if isinstance(event, ToolCallEvent):
                 paused = True
                 run = bridge.run_for(event.tool_call_id)
@@ -91,20 +110,30 @@ class ImplementationService:
                         "implementation_job_id": job_id,
                         "implementation_position": item.position,
                         "implementation_task_id": task.id,
+                        "implementation_instruction": instruction,
+                        "implementation_service": self,
                     })
                 await self.persistence.update_implementation_task(job_id, item.position, "waiting")
             if isinstance(event, ErrorEvent):
                 failure = event.message
-            yield event
+            if isinstance(event, DoneEvent):
+                terminal = event
+            else:
+                yield event
         if paused:
             return
         if failure:
             await self._fail(job_id, item.position, failure)
             yield TextEvent(f"Implementation job {job_id} stopped: {failure}")
+            if terminal is not None:
+                yield terminal
             return
-        await self._complete(job_id, item.position, task.id)
-        async for event in self._advance(job_id, messages, specs):
-            yield event
+        failure = self._missing_mutation_error(task.id)
+        await self._fail(job_id, item.position, failure)
+        yield ErrorEvent(failure)
+        yield TextEvent(f"Implementation job {job_id} stopped: {failure}")
+        if terminal is not None:
+            yield terminal
 
     async def _complete(self, job_id: str, position: int, task_id: str) -> None:
         await self.artifacts.mark_task_completed(task_id)
@@ -113,3 +142,10 @@ class ImplementationService:
     async def _fail(self, job_id: str, position: int, error: str) -> None:
         await self.persistence.update_implementation_task(job_id, position, "failed", error=error)
         await self.persistence.finish_implementation_job(job_id, "failed", error)
+
+    @staticmethod
+    def _missing_mutation_error(task_id: str) -> str:
+        return (
+            f"{task_id} ended without a successful source-file write MCP tool call; "
+            "the task remains incomplete."
+        )

@@ -51,6 +51,7 @@ class RoutingPersistence:
                 );
                 CREATE TABLE IF NOT EXISTS implementation_jobs (
                   job_id TEXT PRIMARY KEY, selectors_json TEXT NOT NULL,
+                  instruction TEXT NOT NULL DEFAULT '',
                   status TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL,
                   error TEXT
                 );
@@ -60,7 +61,14 @@ class RoutingPersistence:
                   PRIMARY KEY(job_id, position),
                   FOREIGN KEY(job_id) REFERENCES implementation_jobs(job_id)
                 );
+                CREATE TABLE IF NOT EXISTS blocked_operations (
+                  operation_id TEXT PRIMARY KEY, operation TEXT NOT NULL,
+                  status TEXT NOT NULL, reason TEXT NOT NULL, created_at REAL NOT NULL
+                );
             """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(implementation_jobs)")}
+            if "instruction" not in columns:
+                db.execute("ALTER TABLE implementation_jobs ADD COLUMN instruction TEXT NOT NULL DEFAULT ''")
 
     async def record_decision(self, decision: ExecutionDecision) -> None:
         await asyncio.to_thread(self._record_decision, decision)
@@ -137,9 +145,9 @@ class RoutingPersistence:
         now = time.time()
         with self._database() as db:
             db.execute("""INSERT INTO implementation_jobs
-              (job_id, selectors_json, status, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?)""", (
-                job.job_id, json.dumps(job.selectors), job.status, now, now,
+              (job_id, selectors_json, instruction, status, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?)""", (
+                job.job_id, json.dumps(job.selectors), job.instruction, job.status, now, now,
             ))
             db.executemany("""INSERT INTO implementation_job_tasks
               (job_id, position, change_id, task_id, status, decision_id, error)
@@ -183,4 +191,14 @@ class RoutingPersistence:
         with self._database() as db:
             db.execute("UPDATE implementation_jobs SET status=?, updated_at=?, error=? WHERE job_id=?", (
                 status, time.time(), error, job_id,
+            ))
+
+    async def record_blocked_operation(self, operation_id: str, operation: str, reason: str) -> None:
+        await asyncio.to_thread(self._record_blocked_operation, operation_id, operation, reason)
+
+    def _record_blocked_operation(self, operation_id, operation, reason):
+        with self._database() as db:
+            db.execute("""INSERT OR REPLACE INTO blocked_operations
+              (operation_id, operation, status, reason, created_at) VALUES (?, ?, 'blocked', ?, ?)""", (
+                operation_id, operation, reason, time.time(),
             ))

@@ -29,7 +29,7 @@ from mcp_bridge.models import DoneEvent, Event, TextEvent, ToolCallEvent
 from mcp_bridge.registry import ROLE_OPTIMIZER, ToolSpec, allowed_for
 from providers.ollama import OllamaProvider
 
-log = logging.getLogger("mcp_bridge")
+log = logging.getLogger("codepartner.agent.optimizer")
 
 
 def _optimizer_model() -> str | None:

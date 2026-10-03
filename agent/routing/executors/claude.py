@@ -30,6 +30,7 @@ class ClaudeCLIExecutor:
                 "model": model.name,
                 "gateway_used": context.use_gateway,
                 "attempt_started_at": context.started_at,
+                "required_operations": task.required_operations,
             },
             execution_env=env,
         ):

@@ -27,6 +27,7 @@ class CodexCLIExecutor:
                 "model": model.name,
                 "gateway_used": context.use_gateway,
                 "attempt_started_at": context.started_at,
+                "required_operations": task.required_operations,
             },
             gateway_url=context.gateway_url if context.use_gateway else None,
             concrete_model=True,

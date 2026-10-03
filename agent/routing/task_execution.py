@@ -1,6 +1,5 @@
 """OpenSpec task execution with persisted, same-tier fallback decisions."""
 
-import os
 import time
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable, Callable
@@ -30,24 +29,35 @@ class TaskExecutionService:
     async def execute(self, task: Task, change_id: str, messages: list[dict],
                       specs: list[ToolSpec],
                       on_decision: Callable[[ExecutionDecision], Awaitable[None]] | None = None,
+                      execution_instruction: str = "",
                       ) -> AsyncIterator[Event]:
-        project_path = os.getenv("JETBRAINS_MCP_PROJECT_PATH", "unknown-project")
-        decision = await self.router.route(task, change_id, project_path)
+        # The active project belongs to the IDE request that advertised `specs`.
+        # Never route through a process-wide IDE/project setting.
+        decision = await self.router.route(task, change_id, "bridge-request")
         await self.persistence.record_decision(decision)
         if on_decision is not None:
             await on_decision(decision)
-        async for event in self._run(task, decision, self._execution_messages(task, messages), specs):
+        async for event in self._run(
+                task, decision, self._execution_messages(task, messages, execution_instruction),
+                specs):
             yield event
 
     @staticmethod
-    def _execution_messages(task: Task, messages: list[dict]) -> list[dict]:
+    def _execution_messages(task: Task, messages: list[dict],
+                            execution_instruction: str = "") -> list[dict]:
         """Replace the transport command with the actual OpenSpec task objective."""
         task_prompt = "\n".join(filter(None, [
             f"Implement OpenSpec task {task.id}: {task.title}",
             f"Description: {task.description}",
             f"Context: {task.context}",
             f"Preferred capability: {task.preferred_capability}",
-            "Use the IDE tools to inspect relevant code, apply the change, and summarize it.",
+            f"Required operations: {', '.join(task.required_operations)}",
+            (f"Additional execution instruction: {execution_instruction}"
+             if execution_instruction else ""),
+            "Use the IDE MCP tools to inspect relevant code and apply the requested source changes.",
+            "You must call an available source-write or refactor MCP tool; do not only propose code in chat.",
+            "Verify the applied change with an available read, diff, or test tool before summarizing it.",
+            "Do not claim this task is complete unless the MCP write/refactor call succeeded.",
         ]))
         prefix = [message for message in messages[:-1] if message.get("role") == "system"]
         return [*prefix, {"role": "user", "content": task_prompt}]
@@ -60,11 +70,11 @@ class TaskExecutionService:
         async for event in provider.tools(messages, specs):
             if isinstance(event, ErrorEvent):
                 failure = event.message
-            yield event
             if isinstance(event, DoneEvent):
                 # The initial execution already created the audit record. Resume
                 # rows are represented as attempts only when a terminal turn ends.
                 await self._finalize_metadata(run, event, started, failure)
+            yield event
 
     async def _run(self, task, decision, messages, specs) -> AsyncIterator[Event]:
         attempts = (decision.recommended_model, *decision.fallback_models)
@@ -94,7 +104,9 @@ class TaskExecutionService:
                     # Do not close a stream with a provisional failure when the
                     # executor has produced nothing observable yet: the next
                     # gateway/direct attempt is safe and can become the response.
-                    if not (failed_before_write and not emitted_material):
+                    # Terminal events are emitted only after operational state is
+                    # durable; SSE stops consuming at DoneEvent.
+                    if not isinstance(event, DoneEvent) and not (failed_before_write and not emitted_material):
                         yield event
                     if isinstance(event, DoneEvent):
                         latency = int((time.monotonic() - started) * 1000)
@@ -111,10 +123,12 @@ class TaskExecutionService:
                         self.router.health.record(model.name, model.executor, gateway_used,
                                                   status == "completed")
                         if status == "completed":
+                            yield event
                             return
                         # Once text or a tool call has reached the client, another
                         # model would risk duplicated work or conflicting output.
                         if emitted_material:
+                            yield event
                             return
                 # An executor with a tool call remains alive; fallback must wait for
                 # the resumed terminal event, never start a competing run.

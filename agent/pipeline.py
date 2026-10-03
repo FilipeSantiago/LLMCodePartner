@@ -19,6 +19,7 @@ turn, assistant messages included), stage is a pure function of that history:
     start-vs-resume continues the run.
 """
 import os
+import logging
 from collections.abc import AsyncIterator
 
 from agent.coder import Coder
@@ -26,6 +27,8 @@ from agent.prompt_optimizer import MODEL_CHOICES, MODEL_SUGGESTION_SEP, PromptOp
 from conversation import openai_request as oreq
 from mcp_bridge.models import DoneEvent, Event, TextEvent, ToolCallEvent
 from model.chat import ChatCompletionRequest
+
+log = logging.getLogger("codepartner.agent.pipeline")
 
 def is_enabled() -> bool:
     """Whether the optimizer pipeline is active. Read at call time (not import) so it
@@ -35,7 +38,7 @@ def is_enabled() -> bool:
     enabled = os.getenv("OPTIMIZER_ENABLED", "false").lower() == "true"
 
     if enabled:
-        print("RUNNING PIPELINE")
+        log.info("pipeline_enabled")
 
     return os.getenv("OPTIMIZER_ENABLED", "false").lower() == "true"
 
