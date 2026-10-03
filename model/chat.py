@@ -19,6 +19,9 @@ class ChatCompletionRequest(BaseModel):
     # Preserved as received from JetBrains; the supported tool is exposed to Claude via MCP.
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = None
+    # A client may supply an opaque request identifier.  Code Partner uses it only
+    # for diagnostic correlation; it is never treated as a project selector.
+    user: str | None = None
 
 
 class ChatCompletionChoice(BaseModel):

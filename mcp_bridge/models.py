@@ -4,7 +4,9 @@ Events are wire-format-agnostic; the OpenAI SSE translation lives in
 `conversation/streaming_responder.py`, not here.
 """
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from uuid import uuid4
 from typing import Any
 
 from mcp_bridge.registry import ToolRegistry
@@ -25,6 +27,14 @@ class ToolCallEvent:
 
 
 @dataclass
+class MutationEvent:
+    """A direct standalone-IDE mutation that succeeded inside the backend."""
+
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass
 class ErrorEvent:
     message: str
 
@@ -40,7 +50,7 @@ class DoneEvent:
 
 
 # The neutral events a provider's `tools()` may yield, as one name.
-Event = TextEvent | ToolCallEvent | ErrorEvent | DoneEvent
+Event = TextEvent | ToolCallEvent | MutationEvent | ErrorEvent | DoneEvent
 
 
 @dataclass
@@ -55,6 +65,8 @@ class Run:
     """
 
     registry: ToolRegistry = field(default_factory=ToolRegistry)
+    # ##DELETE AFTER CORRECTION## Correlates temporary DEBUG protocol traces.
+    run_id: str = field(default_factory=lambda: "run_" + uuid4().hex)
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     task: asyncio.Task | None = None
     pending: dict[str, asyncio.Future] = field(default_factory=dict)
@@ -68,6 +80,10 @@ class Run:
     metadata: dict[str, Any] = field(default_factory=dict)
     tool_names: dict[str, str] = field(default_factory=dict)
     mutating_tool_succeeded: bool = False
+    # Direct tools are only attached to implementation runs. Unlike ordinary
+    # bridge tools, they execute against PyCharm's standalone MCP endpoint and
+    # therefore do not require an AI Chat OpenAI tool-call round trip.
+    direct_tool_handlers: dict[str, Callable[[dict], Awaitable[str]]] = field(default_factory=dict)
 
     async def put(self, event: Any) -> None:
         await self.queue.put(event)

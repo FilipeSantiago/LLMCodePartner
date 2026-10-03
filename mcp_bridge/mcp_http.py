@@ -30,8 +30,9 @@ from starlette.responses import PlainTextResponse
 
 from mcp_bridge import bridge
 from mcp_bridge.models import Run
+from logger.diagnostic import debug
 
-log = logging.getLogger("mcp_bridge")
+log = logging.getLogger("codepartner.bridge.http")
 
 SERVER_NAME = "jetbrains"
 
@@ -63,6 +64,9 @@ def _build_server(run: Run) -> Server:
     async def _list_tools() -> list[types.Tool]:
         # run.registry is the enforcement point: only what this run's role allows.
         log.info("mcp http tool list served: %s", run.registry.names())
+        # ##DELETE AFTER CORRECTION## Full provider-facing registry schema.
+        debug(log, "mcp_http.tools_listed", trace_id=run.metadata.get("trace_id"),
+              run_id=run.run_id, tools=[vars(tool) for tool in run.registry.tools()])
         return [
             types.Tool(name=s.name, description=s.description, inputSchema=s.schema)
             for s in run.registry.tools()
@@ -70,6 +74,9 @@ def _build_server(run: Run) -> Server:
 
     @server.call_tool()
     async def _call_tool(name: str, arguments: dict) -> types.CallToolResult:
+        # ##DELETE AFTER CORRECTION## Complete out-of-process provider tool request.
+        debug(log, "mcp_http.tool_called", trace_id=run.metadata.get("trace_id"),
+              run_id=run.run_id, tool_name=name, arguments=arguments)
         if name not in run.registry.names():
             return _error(f"Error: tool '{name}' is not available to this agent")
         try:
@@ -100,6 +107,8 @@ async def serve_run(run: Run) -> AsyncIterator[str]:
     async with manager.run():
         _endpoints[token] = manager
         log.info("mcp http endpoint open token=%s tools=%s", token[:8], run.registry.names())
+        debug(log, "mcp_http.endpoint_opened", trace_id=run.metadata.get("trace_id"),
+              run_id=run.run_id, token=token, tools=run.registry.names())
         try:
             yield f"{PUBLIC_BASE}/mcp/{token}"
         finally:

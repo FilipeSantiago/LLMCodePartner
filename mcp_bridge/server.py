@@ -13,8 +13,9 @@ from collections.abc import Awaitable, Callable
 from mcp_bridge import bridge
 from mcp_bridge.models import DoneEvent, ErrorEvent, Run
 from mcp_bridge.registry import ToolRegistry, ToolSpec
+from logger.diagnostic import debug
 
-log = logging.getLogger("mcp_bridge")
+log = logging.getLogger("codepartner.bridge.run")
 
 # A provider run strategy: drive the model with these tool specs, pushing events
 # onto run.queue (and calling bridge.call_tool per tool call); return the
@@ -26,28 +27,41 @@ async def _run(run: Run, prompt: str, system: str | None,
                specs: list[ToolSpec], strategy: Strategy) -> None:
     terminal = "endTurn"
     try:
+        debug(log, "run.strategy_started", trace_id=run.metadata.get("trace_id"),
+              run_id=run.run_id, prompt=prompt, system=system,
+              registered_tools=[vars(spec) for spec in specs])
         terminal = await strategy(run, prompt, system, specs)
     except asyncio.CancelledError:
         bridge.discard(run)
         raise
     except Exception as exc:  # surface provider/model failures into the stream
+        log.exception("run strategy failed run_id=%s", run.run_id)
         await run.put(ErrorEvent(str(exc)))
     finally:
+        debug(log, "run.strategy_finished", trace_id=run.metadata.get("trace_id"),
+              run_id=run.run_id, terminal=terminal)
         await run.put(DoneEvent(terminal, usage=run.usage, model_usage=run.model_usage))
         bridge.discard(run)
 
 
 def start_run(prompt: str, system: str | None, specs: list[ToolSpec],
-              strategy: Strategy, allowed: frozenset[str] | None = None) -> Run:
+              strategy: Strategy, allowed: frozenset[str] | None = None,
+              allowed_operations: frozenset[str] | None = None,
+              direct_tool_handlers: dict[str, Callable[[dict], Awaitable[str]]] | None = None) -> Run:
     """Begin a bridged execution: register the tools this run's role allows and run
     the injected provider strategy in the background.
 
     `allowed` is the caller's role allowlist (`registry.allowed_for`); None = the full
     ceiling. It is baked into the Run, so later resumes stay inside the same role.
     """
-    run = Run(registry=ToolRegistry(allowed))
+    run = Run(registry=ToolRegistry(allowed, allowed_operations))
+    run.direct_tool_handlers = dict(direct_tool_handlers or {})
     registered = run.registry.register(specs)
     log.info("mcp tool registration: %s", [s.name for s in registered])
+    debug(log, "run.started", run_id=run.run_id, allowed_tools=sorted(allowed) if allowed else None,
+          allowed_operations=sorted(allowed_operations) if allowed_operations else None,
+          advertised_tools=[vars(spec) for spec in specs], registered_tools=[vars(spec) for spec in registered],
+          direct_tool_names=sorted(run.direct_tool_handlers))
     run.task = asyncio.create_task(_run(run, prompt, system, run.registry.tools(), strategy))
     return run
 

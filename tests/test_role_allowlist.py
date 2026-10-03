@@ -13,7 +13,9 @@ import unittest
 
 from mcp_bridge.registry import (
     READ,
+    SEARCH,
     REFACTOR,
+    MUTATING,
     ROLE_CODER,
     ROLE_OPTIMIZER,
     SUPPORTED,
@@ -21,7 +23,14 @@ from mcp_bridge.registry import (
     ToolRegistry,
     ToolSpec,
     allowed_for,
+    classify_tool,
+    is_mutating_tool,
+    mutating_tools,
+    OP_FILE_READ,
+    OP_FILE_SEARCH,
+    OP_FILE_CREATE,
 )
+from mcp_bridge.adapters import prepare_dispatcher_read
 
 
 def _spec(name: str) -> ToolSpec:
@@ -31,7 +40,7 @@ def _spec(name: str) -> ToolSpec:
 class AllowedFor(unittest.TestCase):
     def test_optimizer_is_read_only(self):
         allowed = allowed_for(ROLE_OPTIMIZER)
-        self.assertEqual(allowed, READ)
+        self.assertEqual(allowed, READ | SEARCH)
         self.assertFalse(allowed & WRITE, "optimizer must not hold any write tool")
         self.assertFalse(allowed & REFACTOR, "optimizer must not hold any refactor tool")
 
@@ -47,7 +56,7 @@ class AllowedFor(unittest.TestCase):
 
     def test_unknown_role_fails_closed(self):
         # A typo'd role should cost capability, not safety.
-        self.assertEqual(allowed_for("codre"), READ)
+        self.assertEqual(allowed_for("codre"), READ | SEARCH)
         self.assertFalse(allowed_for("codre") & WRITE)
 
 
@@ -85,6 +94,47 @@ class RegistryEnforcesTheRole(unittest.TestCase):
         registry = ToolRegistry(allowed_for(ROLE_CODER))
         registry.register([_spec("run_terminal_command")])
         self.assertTrue(registry.is_empty())
+
+    def test_mutating_tool_helpers_only_accept_supported_writes_or_refactors(self):
+        self.assertIn("create_new_file", MUTATING)
+        self.assertTrue(is_mutating_tool("apply_patch"))
+        self.assertTrue(is_mutating_tool("rename_refactoring"))
+        self.assertFalse(is_mutating_tool("read_file"))
+        self.assertEqual(
+            mutating_tools([_spec("read_file"), _spec("apply_patch"), _spec("rename_refactoring")]),
+            ("apply_patch", "rename_refactoring"),
+        )
+
+    def test_invalid_schema_is_not_registered_as_a_mutating_capability(self):
+        malformed = ToolSpec("apply_patch", "patch", {"type": "array"})
+        self.assertFalse(classify_tool(malformed).accepted)
+        registry = ToolRegistry(allowed_for(ROLE_CODER))
+        registry.register([malformed])
+        self.assertTrue(registry.is_empty())
+
+    def test_artifact_operation_policy_keeps_exact_lookup_not_regex_fallback(self):
+        registry = ToolRegistry(allowed_operations=frozenset({
+            OP_FILE_READ, OP_FILE_SEARCH, OP_FILE_CREATE,
+        }))
+        registry.register([_spec("search_file"), _spec("search_regex"), _spec("read_file")])
+        self.assertEqual(registry.candidates(OP_FILE_SEARCH)[0].name, "search_file")
+        self.assertNotIn("search_regex", registry.names())
+
+    def test_artifact_read_uses_advertised_dispatcher_without_default_limit(self):
+        registry = ToolRegistry(allowed_operations=frozenset({OP_FILE_READ}))
+        registry.register([_spec("execute_tool")])
+        name, arguments = registry.prepare_call(OP_FILE_READ, {"file_path": ".codepartner/spec-index.json"})
+        self.assertEqual(name, "execute_tool")
+        self.assertEqual(arguments, {"command": "read_file --file_path .codepartner/spec-index.json"})
+        self.assertNotIn("--limit", arguments["command"])
+
+    def test_dispatcher_read_quotes_paths_and_validates_page_bounds(self):
+        self.assertEqual(
+            prepare_dispatcher_read({"file_path": "openspec/a b.json", "limit": 5000, "offset": 3}),
+            {"command": "read_file --file_path 'openspec/a b.json' --limit 5000 --offset 3"},
+        )
+        with self.assertRaises(ValueError):
+            prepare_dispatcher_read({"file_path": "openspec/x", "limit": 5001})
 
 
 if __name__ == "__main__":

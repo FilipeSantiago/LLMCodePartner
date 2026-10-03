@@ -20,7 +20,7 @@ from mcp_bridge.models import DoneEvent, Event, TextEvent, ToolCallEvent
 from mcp_bridge.registry import ToolSpec, allowed_for
 from providers.base import Provider
 
-log = logging.getLogger("mcp_bridge")
+log = logging.getLogger("codepartner.providers.ollama")
 
 HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:14b")

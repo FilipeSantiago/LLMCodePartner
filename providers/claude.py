@@ -29,7 +29,7 @@ from mcp_bridge.models import Event, Run, TextEvent
 from mcp_bridge.registry import ToolSpec, allowed_for
 from providers.base import Provider
 
-log = logging.getLogger("mcp_bridge")
+log = logging.getLogger("codepartner.providers.claude")
 
 SERVER_NAME = "jetbrains"
 
@@ -50,7 +50,8 @@ class ClaudeProvider(Provider):
     async def tools(self, messages: list[dict], specs: list[ToolSpec],
                     model: str | None = None, role: str | None = None,
                     run_metadata: dict | None = None,
-                    execution_env: dict[str, str] | None = None, **kwargs) -> AsyncIterator[Event]:
+                    execution_env: dict[str, str] | None = None,
+                    direct_tool_handlers: dict | None = None, **kwargs) -> AsyncIterator[Event]:
         """Stateful, but the start-vs-resume decision is private: a history carrying
         tool results resolves the pending futures and continues the SAME background
         run; otherwise a fresh run is started. Either way, yields the same neutral
@@ -74,7 +75,8 @@ class ClaudeProvider(Provider):
                 return await self._run_strategy(run, prompt, system, specs, model, execution_env)
 
             run = engine.start_run(prompt, system, specs, strategy=strategy,
-                                   allowed=allowed_for(role))
+                                   allowed=allowed_for(role),
+                                   direct_tool_handlers=direct_tool_handlers)
             run.metadata.update(run_metadata or {})
 
         async for event in self._drain_queue(run):

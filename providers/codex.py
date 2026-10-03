@@ -30,7 +30,7 @@ from mcp_bridge.models import ErrorEvent, Event, Run, TextEvent
 from mcp_bridge.registry import ToolSpec, allowed_for
 from providers.base import Provider
 
-log = logging.getLogger("mcp_bridge")
+log = logging.getLogger("codepartner.providers.codex")
 
 BIN = os.getenv("CODEX_BIN", "codex")
 
@@ -105,6 +105,7 @@ class CodexProvider(Provider):
                     model: str | None = None, role: str | None = None,
                     run_metadata: dict | None = None,
                     gateway_url: str | None = None, concrete_model: bool = False,
+                    direct_tool_handlers: dict | None = None,
                     **kwargs) -> AsyncIterator[Event]:
         """Stateful like Claude's, and for the same reason: the `codex` process stays
         alive across HTTP requests, blocked inside its MCP tool call, while JetBrains
@@ -127,7 +128,8 @@ class CodexProvider(Provider):
                 return await self._run_strategy(run, prompt, system, model, gateway_url, concrete_model)
 
             run = engine.start_run(prompt, system, specs, strategy=strategy,
-                                   allowed=allowed_for(role))
+                                   allowed=allowed_for(role),
+                                   direct_tool_handlers=direct_tool_handlers)
             run.metadata.update(run_metadata or {})
 
         async for event in self._drain_queue(run):
