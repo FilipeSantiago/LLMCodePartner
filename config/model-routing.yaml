@@ -1,8 +1,5 @@
-# Application-owned routing policy.  Model aliases are stable; CLI model IDs are
-# intentionally environment-configurable so a subscription/account can choose its
-# available models without code changes.
 runtime:
-  semantic_router_url: http://semantic-router:8080
+  semantic_router_url: http://semantic-router:18080
   agentgateway_url: http://agentgateway:4000
   router_timeout_seconds: 10
 
@@ -12,40 +9,64 @@ health:
 routing:
   tiers:
     simple:
-      candidates: [claude-low, codex-low]
+      candidates:
+        - claude-haiku
+        - codex-luna-low
+
     medium:
-      candidates: [claude-medium, codex-medium]
+      candidates:
+        - claude-sonnet
+        - codex-luna-medium
+        - codex-sol-medium
+
     complex:
-      candidates: [claude-high, codex-high]
+      candidates:
+        - claude-opus
+        - codex-sol-high
 
 models:
-  claude-low:
+  claude-haiku:
     provider: claude
     executor: claude-cli
-    cli_model: ${CLAUDE_MODEL_SIMPLE:-haiku}
+    cli_model: haiku
     gateway_mode: preferred
-  codex-low:
+
+  codex-luna-low:
     provider: codex
     executor: codex-cli
-    cli_model: ${CODEX_MODEL_SIMPLE:-}
+    cli_model: gpt-5.6-luna
+    reasoning_effort: low
     gateway_mode: preferred
-  claude-medium:
+
+  claude-sonnet:
     provider: claude
     executor: claude-cli
-    cli_model: ${CLAUDE_MODEL_MEDIUM:-sonnet}
+    cli_model: sonnet
     gateway_mode: preferred
-  codex-medium:
+
+  codex-luna-medium:
     provider: codex
     executor: codex-cli
-    cli_model: ${CODEX_MODEL_MEDIUM:-}
+    cli_model: gpt-5.6-luna
+    reasoning_effort: medium
     gateway_mode: preferred
-  claude-high:
+
+  codex-sol-medium:
+    provider: codex
+    executor: codex-cli
+    cli_model: gpt-6.1-sol
+    reasoning_effort: medium
+    gateway_mode: preferred
+
+  claude-opus:
     provider: claude
     executor: claude-cli
-    cli_model: ${CLAUDE_MODEL_COMPLEX:-opus}
+    cli_model: opus
     gateway_mode: preferred
-  codex-high:
+
+  codex-sol-high:
     provider: codex
     executor: codex-cli
-    cli_model: ${CODEX_MODEL_COMPLEX:-}
+    cli_model: gpt-6.1-sol
+    reasoning_effort: high
     gateway_mode: preferred

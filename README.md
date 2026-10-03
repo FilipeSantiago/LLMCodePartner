@@ -87,7 +87,8 @@ For unattended deployments, provide `ANTHROPIC_API_KEY` or the applicable Codex
 access token through a secret manager or runtime environment. Never copy credentials
 into the image. `.dockerignore` excludes the local `.env` file.
 
-- Raw request logging: `.env` toggle `RAW_LOG_ENABLED=true`.
+- Capability diagnostics log tool names, schema-shape decisions, and call IDs only.
+  Request bodies, prompts, credentials, and tool arguments are never logged.
 - Tool-call timeout: `.env` `MCP_TOOL_TIMEOUT=120` (seconds).
 - LLM provider: `.env` `LLM_PROVIDER=claude|codex|ollama` (see Providers).
 - Coder provider: `.env` `CODER_PROVIDER=claude|codex` — who executes the accepted
@@ -134,14 +135,48 @@ Implement persisted tasks with the model-routing pipeline:
 /implement WP1-T1
 /implement WP1
 /execute WP1 WP3-T2
+/implement WP1-T1: add MLflow tracking and keep the configuration injectable
 ```
 
 `/implement` is the canonical command; `/execute` is an alias. A work-package
-selector expands to its incomplete tasks in order. The backend creates a durable
+selector expands to its incomplete tasks in order. Optional execution guidance
+must follow a colon, so task selection remains unambiguous. The backend creates a durable
 implementation job, routes each task only when it starts, and executes tasks
 sequentially. A failed task stops the job; completed tasks are checked off in the
 OpenSpec change and dashboard. IDE tool calls pause the current task and resume
 that same routed provider before the job advances.
+
+`/implement` and `/run` use only source-write tools advertised by the calling IDE
+through the bridge. Code Partner never stores a PyCharm MCP URL or a project path,
+so one container can serve multiple projects without a fixed-project fallback. A
+task is never marked complete from a chat-only response: it must receive a
+successful IDE mutation result. `/review` remains read-only, while `/spec`,
+`/update`, and `/rework` only persist their own OpenSpec artifacts and never grant
+an LLM source-write tools.
+
+Review implemented work without granting write tools:
+
+```text
+/review WP1
+/review WP1-T1: verify error handling and test coverage
+```
+
+Create corrective follow-up work when the implementation needs to change:
+
+```text
+/rework WP1-T1: credentials must be encrypted at rest
+```
+
+`/rework` creates a new additive OpenSpec change linked to its source tasks; it
+does not erase completed-task history or automatically revert source files.
+
+Use `/help` for the command list and `/man <command>` for detailed syntax:
+
+```text
+/help
+/man implement
+/man rework
+```
 
 The natural form `/update about US1-TASK1 and WP1-T2, ...` is also accepted and
 normalized to canonical `WPn-Tn` IDs. An update loads the complete owning change
@@ -150,16 +185,14 @@ work packages, requirements, proposal, design, IDs, and completion states. One
 update may currently target tasks from only one OpenSpec change.
 
 For native runs, the backend host must have the `openspec` CLI on `PATH` (or set
-`OPENSPEC_BIN` to its executable); the Compose image already includes it. Set
-`JETBRAINS_MCP_URL` and `JETBRAINS_MCP_PROJECT_PATH` from PyCharm's **Copy HTTP
-Stream Config** output. The generated port can change after an IDE restart. The
-client sends the project path as the `IJ_MCP_SERVER_PROJECT_PATH` header, uses
-`create_new_file` for saving, `read_file` for loading, and `search_file` for
-catalog discovery, while delegating parent directory creation to the IDE.
-`/spec` and `/update` bypass the optimizer/coder pipeline and never execute
-generated tasks. If PyCharm is closed, the port or project is stale, or file
-creation is disabled, the endpoint returns HTTP 502 with a focused persistence
-error. The incoming chat request does not need to advertise IDE file tools.
+`OPENSPEC_BIN` to its executable); the Compose image already includes it.
+`/spec`, `/update`, `/run`, and `/implement` use only the tools advertised in
+the current AI Assistant request. They do not require `JETBRAINS_MCP_URL` or
+`JETBRAINS_MCP_PROJECT_PATH`, and they do not select a global IDE project.
+If a source-write/refactor capability is absent or unsupported, `/run` and
+`/implement` return a normal assistant diagnostic and record the operation as
+blocked without changing source files. `/spec` and `/update` bypass the
+optimizer/coder pipeline and never execute generated tasks.
 
 Optimizer tuning — all optional, and every default reproduces the pre-existing
 behaviour (one rewrite call, no reads):
@@ -294,8 +327,9 @@ gather context before rewriting (see **Prompt-optimizer pipeline**), and the wri
 are filtered out before it is ever asked which tool to call.
 
 > The exact write-tool identifiers your IDE advertises are version-specific.
-> Flip `RAW_LOG_ENABLED=true` and inspect the `tools received from JetBrains: […]`
-> log to confirm which names are on the wire.
+> During the temporary bridge investigation, inspect `codepartner.*` DEBUG logs to
+> confirm which names and schemas arrive from JetBrains. Remove the marked
+> `##DELETE AFTER CORRECTION##` diagnostics after the correction is verified.
 
 ### Final flow
 

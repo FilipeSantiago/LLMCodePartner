@@ -2,31 +2,37 @@ name: llmcodepartner
 
 services:
   semantic-router:
-    # Pin this through SEMANTIC_ROUTER_IMAGE after validating the chosen vLLM
-    # Semantic Router release against infra/semantic-router/config.yaml.
-    image: ${SEMANTIC_ROUTER_IMAGE:-ghcr.io/vllm-project/semantic-router/extproc:latest}
+    # Pinned after validation against infra/semantic-router/config.yaml.
+    image: ${SEMANTIC_ROUTER_IMAGE:-ghcr.io/vllm-project/semantic-router/extproc@sha256:5c5de6867bf5529c747ff38f5a2593a26cdc7c99e906d682ffc55fcc2705f62a}
     network_mode: host
-    command: ["--secure=false"]
+    # Host networking shares the host's port namespace; 8080 is commonly used
+    # by local services, so reserve an application-specific management port.
+    command: ["--secure=false", "--api-port=18080"]
     volumes:
       - ./infra/semantic-router/config.yaml:/app/config/config.yaml:ro
       - semantic-router-models:/app/models
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/health"]
+      # The pinned image has no HTTP client. Its download-only mode validates
+      # the mounted runtime config without changing service state.
+      test: ["CMD", "/app/router-candle", "-config", "/app/config/config.yaml", "-secure=false", "-api-port=18081", "-download-only"]
       interval: 20s
       timeout: 5s
       start_period: 120s
       retries: 10
 
   agentgateway:
-    image: ${AGENTGATEWAY_IMAGE:-cr.agentgateway.dev/agentgateway:v1.5.0}
+    image: ${AGENTGATEWAY_IMAGE:-cr.agentgateway.dev/agentgateway@sha256:bf2f339ef326d32def2aaeb44b1b4549801293c19b89e764a4228667d97d9896}
     network_mode: host
+    command: ["--file", "/config/config.yaml"]
     volumes:
       - ./infra/agentgateway/config.yaml:/config/config.yaml:ro
       - agentgateway-data:/config/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:4000/health"]
+      # The pinned distroless image has no shell or HTTP client. Re-validating
+      # its loaded configuration is the supported in-container readiness probe.
+      test: ["CMD", "/app/agentgateway", "--file", "/config/config.yaml", "--validate-only"]
       interval: 15s
       timeout: 5s
       start_period: 30s
@@ -49,7 +55,7 @@ services:
       DISABLE_AUTOUPDATER: "1"
       MCP_PUBLIC_BASE: ${DOCKER_MCP_PUBLIC_BASE:-http://127.0.0.1:7777}
       OLLAMA_HOST: ${DOCKER_OLLAMA_HOST:-http://127.0.0.1:11434}
-      SEMANTIC_ROUTER_URL: ${SEMANTIC_ROUTER_URL:-http://semantic-router:8080}
+      SEMANTIC_ROUTER_URL: ${SEMANTIC_ROUTER_URL:-http://semantic-router:18080}
       AGENTGATEWAY_URL: ${AGENTGATEWAY_URL:-http://agentgateway:4000}
       ROUTING_DB_PATH: ${ROUTING_DB_PATH:-/home/codepartner/.codepartner/routing.sqlite3}
     network_mode: host

@@ -9,9 +9,10 @@ routes:
   - matches:
       - path:
           exact: /health
-    directResponse:
-      status: 200
-      body: '{"status":"healthy"}'
+    policies:
+      directResponse:
+        status: 200
+        body: '{"status":"healthy"}'
 llm:
   models:
     - name: "claude-*"

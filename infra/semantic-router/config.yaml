@@ -8,39 +8,44 @@ listeners:
     port: 8899
 providers:
   defaults:
-    model: claude-low
+    model: claude-haiku
   models:
-    - name: claude-low
-      provider_model_id: claude-low
+    - name: claude-haiku
+      provider_model_id: claude-haiku
       backend_refs: [{name: agentgateway, endpoint: 127.0.0.1:4000, protocol: http}]
-    - name: codex-low
-      provider_model_id: codex-low
+    - name: codex-luna-low
+      provider_model_id: codex-luna-low
       backend_refs: [{name: agentgateway, endpoint: 127.0.0.1:4000, protocol: http}]
-    - name: claude-medium
-      provider_model_id: claude-medium
+    - name: claude-sonnet
+      provider_model_id: claude-sonnet
       backend_refs: [{name: agentgateway, endpoint: 127.0.0.1:4000, protocol: http}]
-    - name: codex-medium
-      provider_model_id: codex-medium
+    - name: codex-luna-medium
+      provider_model_id: codex-luna-medium
       backend_refs: [{name: agentgateway, endpoint: 127.0.0.1:4000, protocol: http}]
-    - name: claude-high
-      provider_model_id: claude-high
+    - name: codex-sol-medium
+      provider_model_id: codex-sol-medium
       backend_refs: [{name: agentgateway, endpoint: 127.0.0.1:4000, protocol: http}]
-    - name: codex-high
-      provider_model_id: codex-high
+    - name: claude-opus
+      provider_model_id: claude-opus
+      backend_refs: [{name: agentgateway, endpoint: 127.0.0.1:4000, protocol: http}]
+    - name: codex-sol-high
+      provider_model_id: codex-sol-high
       backend_refs: [{name: agentgateway, endpoint: 127.0.0.1:4000, protocol: http}]
 routing:
   modelCards:
-    - name: claude-low
+    - name: claude-haiku
       description: Fast implementation of localized coding changes.
-    - name: codex-low
+    - name: codex-luna-low
       description: Fast implementation of localized coding changes.
-    - name: claude-medium
+    - name: claude-sonnet
       description: Multi-file feature work and moderate reasoning.
-    - name: codex-medium
+    - name: codex-luna-medium
       description: Multi-file feature work and moderate reasoning.
-    - name: claude-high
+    - name: codex-sol-medium
+      description: Multi-file feature work requiring stronger reasoning.
+    - name: claude-opus
       description: Cross-cutting and ambiguous architecture work.
-    - name: codex-high
+    - name: codex-sol-high
       description: Cross-cutting and ambiguous architecture work.
 entrypoints:
   - model_names: [codepartner/simple]
@@ -56,21 +61,24 @@ recipes:
         - name: simple-candidate-selection
           priority: 100
           rules: {operator: AND, conditions: []}
-          modelRefs: [{model: claude-low}, {model: codex-low}]
-          algorithm: {type: multi_factor}
+          modelRefs: [{model: claude-haiku}, {model: codex-luna-low}]
+          # Code Partner already scopes candidates by OpenSpec complexity. Use a
+          # deterministic first candidate until multi-factor signals are
+          # explicitly configured and calibrated.
+          algorithm: {type: static}
   - name: codepartner-medium
     routing:
       decisions:
         - name: medium-candidate-selection
           priority: 100
           rules: {operator: AND, conditions: []}
-          modelRefs: [{model: claude-medium}, {model: codex-medium}]
-          algorithm: {type: multi_factor}
+          modelRefs: [{model: claude-sonnet}, {model: codex-luna-medium}, {model: codex-sol-medium}]
+          algorithm: {type: static}
   - name: codepartner-complex
     routing:
       decisions:
         - name: complex-candidate-selection
           priority: 100
           rules: {operator: AND, conditions: []}
-          modelRefs: [{model: claude-high}, {model: codex-high}]
-          algorithm: {type: multi_factor}
+          modelRefs: [{model: claude-opus}, {model: codex-sol-high}]
+          algorithm: {type: static}
