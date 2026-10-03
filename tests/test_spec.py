@@ -14,11 +14,16 @@ from agent.spec.artifact_store import (
     CATALOG_PATH,
     DASHBOARD_PATH,
     ArtifactStoreError,
+    BridgeRequiredMcpClient,
+    ArtifactLookupIndeterminate,
     OpenSpecArtifactStore,
 )
+from agent.spec.bridge_client import BridgeMcpFileClient
 from agent.spec.command import (
     SpecCommandError,
     SpecCommandHandler,
+    extract_help_response,
+    extract_scoped_request,
     extract_spec_request,
     extract_update_request,
     is_spec_command,
@@ -184,6 +189,11 @@ class FailingMcpClient(FakeMcpClient):
         raise JetBrainsMcpError("PyCharm is closed")
 
 
+class IndeterminateLookupMcpClient(FakeMcpClient):
+    async def file_exists(self, path: str) -> bool:
+        raise ArtifactLookupIndeterminate("deterministic function was already called with this args")
+
+
 class AsyncContext:
     def __init__(self, value=None, error: Exception | None = None):
         self.value = value
@@ -228,6 +238,24 @@ class CommandParsing(unittest.TestCase):
             extract_update_request("/update make it better")
         with self.assertRaises(SpecCommandError):
             extract_update_request("/update WP1-T1")
+
+    def test_help_and_manual_are_registry_backed(self):
+        self.assertIn("/implement", extract_help_response("/help"))
+        self.assertIn("sequential", extract_help_response("/man implement"))
+        with self.assertRaises(SpecCommandError):
+            extract_help_response("/man unknown")
+
+    def test_review_and_rework_parse_work_packages_and_feedback(self):
+        self.assertEqual(
+            extract_scoped_request("/review US1 WP2-TASK3: verify errors", "review"),
+            (["WP1", "WP2-T3"], "verify errors"),
+        )
+        self.assertEqual(
+            extract_scoped_request("/rework WP1-T1: add encryption", "rework", True),
+            (["WP1-T1"], "add encryption"),
+        )
+        with self.assertRaises(SpecCommandError):
+            extract_scoped_request("/rework WP1-T1", "rework", True)
 
 
 class ArtifactSelectionTests(unittest.IsolatedAsyncioTestCase):
@@ -393,6 +421,47 @@ class ArtifactPersistence(unittest.IsolatedAsyncioTestCase):
                 draft(), "authentication"
             )
 
+    async def test_read_response_decode_error_does_not_claim_the_index_is_invalid(self):
+        client = FakeMcpClient()
+        client.files[CATALOG_PATH] = "not a transport response"
+        with self.assertRaisesRegex(ArtifactStoreError, "could not parse the read response"):
+            await OpenSpecArtifactStore(client)._load_catalog()
+
+    async def test_indeterminate_lookup_attempts_the_bridge_reader(self):
+        client = IndeterminateLookupMcpClient()
+        client.files[CATALOG_PATH] = json.dumps({
+            "version": 1, "next_change": 2, "next_work_package": 2, "changes": [],
+        })
+        catalog = await OpenSpecArtifactStore(client)._load_catalog(required=True)
+        self.assertEqual(catalog["next_change"], 2)
+
+
+class BridgeResponseExtraction(unittest.TestCase):
+    def test_unwraps_openai_text_blocks_then_numbered_lines(self):
+        raw = json.dumps({"content": [{"type": "text", "text": 'L1: {"version": 1}'}]})
+        text, wrapper = BridgeMcpFileClient._text_from_tool_response(raw)
+        self.assertEqual(wrapper, "content_blocks")
+        self.assertEqual(text, 'L1: {"version": 1}')
+
+    def test_leaves_a_raw_json_catalog_untouched(self):
+        raw = '{"version": 1, "changes": []}'
+        text, wrapper = BridgeMcpFileClient._text_from_tool_response(raw)
+        self.assertEqual((text, wrapper), (raw, "raw_json"))
+
+    def test_strips_numbered_body_after_client_status_preamble(self):
+        text, numbered, preamble = BridgeMcpFileClient._strip_numbered_lines(
+            "Read result:\nL1: {\nL2:   \"version\": 1\nL3: }"
+        )
+        self.assertEqual(text, '{\n  "version": 1\n}')
+        self.assertTrue(numbered)
+        self.assertEqual(preamble, 1)
+
+    def test_does_not_treat_mixed_plain_text_as_numbered_file_content(self):
+        raw = "Read result:\nL1: {\nnot a numbered record"
+        self.assertEqual(
+            BridgeMcpFileClient._strip_numbered_lines(raw), (raw, False, 0)
+        )
+
 
 class AdapterValidation(unittest.IsolatedAsyncioTestCase):
     @staticmethod
@@ -512,6 +581,19 @@ class AdapterValidation(unittest.IsolatedAsyncioTestCase):
 
 
 class HandlerAndController(unittest.IsolatedAsyncioTestCase):
+    async def test_default_artifact_store_refuses_unbridged_target_project_access(self):
+        store = OpenSpecArtifactStore()
+        self.assertIsInstance(store._client, BridgeRequiredMcpClient)
+        with self.assertRaises(ArtifactStoreError) as raised:
+            await store._load_catalog()
+        self.assertIn("request-scoped IDE MCP bridge", str(raised.exception))
+
+    async def test_missing_catalog_is_bridge_context_error_for_task_selection(self):
+        store = OpenSpecArtifactStore(FakeMcpClient())
+        with self.assertRaises(ArtifactStoreError) as raised:
+            await store.tasks_for_selectors(["WP1-T2"])
+        self.assertIn("not found through the current IDE MCP bridge", str(raised.exception))
+
     async def test_handler_creates_then_updates_selected_tasks(self):
         adapter = FakeAdapter()
         client = FakeMcpClient()
@@ -533,23 +615,28 @@ class HandlerAndController(unittest.IsolatedAsyncioTestCase):
             ("CHG1", ["WP1-T1", "WP1-T2"], "make validation explicit"),
         )
 
-    async def test_controller_returns_planning_response_without_tool_round_trip(self):
-        old_handler = dialog_controller.spec_handler
-        client = FakeMcpClient()
-        dialog_controller.spec_handler = SpecCommandHandler(
-            FakeAdapter(), OpenSpecArtifactStore(client)
-        )
-        try:
-            response = await dialog_controller.chat_completions(
+    async def test_rework_creates_new_change_with_source_task_traceability(self):
+        adapter = FakeAdapter()
+        store = OpenSpecArtifactStore(FakeMcpClient())
+        handler = SpecCommandHandler(adapter, store)
+        created = await handler.handle([{"role": "user", "content": "/spec add authentication"}])
+        source = await store.task_by_id("WP1-T1")
+        follow_up = await handler.rework([source], "Store credentials securely")
+        self.assertEqual(follow_up.change_id, "CHG2")
+        self.assertIn("corrective follow-up CHG2", follow_up.content)
+        catalog = await store._load_catalog()
+        self.assertEqual(catalog["changes"][1]["follow_up_for"], ["WP1-T1"])
+
+    async def test_controller_requires_streaming_for_bridge_backed_planning(self):
+        with self.assertRaises(HTTPException) as raised:
+            await dialog_controller.chat_completions(
                 ChatCompletionRequest(
                     model="test",
                     messages=[ChatMessage(role="user", content="/spec add authentication")],
                 )
             )
-        finally:
-            dialog_controller.spec_handler = old_handler
-        self.assertIn("Created CHG1", response.choices[0].message.content)
-        self.assertFalse(response.choices[0].message.tool_calls)
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("require a streaming request", raised.exception.detail)
 
     async def test_unknown_update_returns_400(self):
         old_handler = dialog_controller.spec_handler
@@ -572,6 +659,37 @@ class HandlerAndController(unittest.IsolatedAsyncioTestCase):
         finally:
             dialog_controller.spec_handler = old_handler
         self.assertEqual(raised.exception.status_code, 400)
+
+    async def test_implementation_without_advertised_write_tool_returns_blocked_sse(self):
+        response = await dialog_controller.chat_completions(
+            ChatCompletionRequest(
+                model="test", stream=True,
+                messages=[ChatMessage(role="user", content="/implement WP1-T1")],
+                tools=[{
+                    "type": "function",
+                    "function": {"name": "read_file", "parameters": {"type": "object"}},
+                }],
+            )
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+        body = b"".join(chunk if isinstance(chunk, bytes) else chunk.encode() for chunk in chunks).decode()
+        self.assertIn("No supported source-write", body)
+        self.assertIn('"finish_reason": "stop"', body)
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    async def test_implementation_respects_tool_choice_none(self):
+        response = await dialog_controller.chat_completions(
+            ChatCompletionRequest(
+                model="test", stream=True, tool_choice="none",
+                messages=[ChatMessage(role="user", content="/implement WP1-T1")],
+                tools=[{"type": "function", "function": {
+                    "name": "apply_patch", "parameters": {"type": "object"},
+                }}],
+            )
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+        body = b"".join(chunk if isinstance(chunk, bytes) else chunk.encode() for chunk in chunks).decode()
+        self.assertIn("No supported source-write", body)
 
     async def test_normal_request_keeps_existing_provider_flow(self):
         provider = mock.AsyncMock()

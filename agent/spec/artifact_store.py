@@ -2,10 +2,11 @@
 
 import abc
 import json
+import logging
 from dataclasses import replace
 from typing import Protocol
 
-from agent.spec.jetbrains_mcp import JetBrainsMcpClient, JetBrainsMcpError
+from agent.spec.jetbrains_mcp import JetBrainsMcpError
 from agent.spec.models import (
     OpenSpecChange,
     Task,
@@ -16,6 +17,9 @@ from agent.spec.models import (
     render_proposal,
     render_tasks,
 )
+from logger.diagnostic import debug
+
+log = logging.getLogger("codepartner.spec.artifact")
 
 CATALOG_PATH = ".codepartner/spec-index.json"
 DASHBOARD_PATH = ".codepartner/tasks.md"
@@ -27,6 +31,32 @@ class ArtifactStoreError(RuntimeError):
 
 class ArtifactSelectionError(ArtifactStoreError):
     """An update selected unknown or incompatible task IDs."""
+
+
+class ArtifactLookupIndeterminate(RuntimeError):
+    """The IDE declined a repeat lookup without asserting the file is absent."""
+
+
+class BridgeRequiredMcpClient:
+    """Fail closed when a target-project request escaped its request bridge.
+
+    This is intentionally not a filesystem or standalone-MCP fallback.  Target
+    project artifacts are valid only in the IDE request that advertised the
+    compatible tools, represented by ``BridgeMcpFileClient``.
+    """
+    _message = (
+        "target-project artifacts require the request-scoped IDE MCP bridge; "
+        "start this command from the intended IDE project with file read/search tools advertised"
+    )
+
+    async def create_file(self, path: str, content: str, overwrite: bool = True) -> None:
+        raise JetBrainsMcpError(self._message)
+
+    async def read_file(self, path: str) -> str:
+        raise JetBrainsMcpError(self._message)
+
+    async def file_exists(self, path: str) -> bool:
+        raise JetBrainsMcpError(self._message)
 
 
 class McpFileClient(Protocol):
@@ -59,7 +89,8 @@ class ArtifactStore(abc.ABC):
         ...
 
     @abc.abstractmethod
-    async def tasks_for_selectors(self, selectors: list[str]) -> list[tuple[OpenSpecChange, Task]]:
+    async def tasks_for_selectors(self, selectors: list[str],
+                                  include_completed: bool = False) -> list[tuple[OpenSpecChange, Task]]:
         ...
 
     @abc.abstractmethod
@@ -71,7 +102,9 @@ class OpenSpecArtifactStore(ArtifactStore):
     """MCP-backed multi-file store with globally stable work-package IDs."""
 
     def __init__(self, client: McpFileClient | None = None):
-        self._client = client or JetBrainsMcpClient()
+        # Do not infer a target project from server CWD or a process-level MCP
+        # configuration.  Only a request-scoped bridge may access target files.
+        self._client = client or BridgeRequiredMcpClient()
 
     async def create_change(self, draft: OpenSpecChange, slug: str) -> OpenSpecChange:
         catalog = await self._load_catalog()
@@ -121,7 +154,7 @@ class OpenSpecArtifactStore(ArtifactStore):
         return change
 
     async def change_for_tasks(self, task_ids: list[str]) -> OpenSpecChange:
-        catalog = await self._load_catalog()
+        catalog = await self._load_catalog(required=True)
         changes = [
             OpenSpecChange.from_dict(value) for value in catalog.get("changes", [])
         ]
@@ -152,7 +185,7 @@ class OpenSpecArtifactStore(ArtifactStore):
 
     async def task_by_id(self, task_id: str) -> tuple[OpenSpecChange, Task]:
         """Load one task with its owning OpenSpec change without mutating artifacts."""
-        catalog = await self._load_catalog()
+        catalog = await self._load_catalog(required=True)
         for value in catalog.get("changes", []):
             change = OpenSpecChange.from_dict(value)
             for package in change.work_packages:
@@ -161,9 +194,10 @@ class OpenSpecArtifactStore(ArtifactStore):
                         return change, task
         raise ArtifactSelectionError(f"unknown task ID: {task_id}")
 
-    async def tasks_for_selectors(self, selectors: list[str]) -> list[tuple[OpenSpecChange, Task]]:
+    async def tasks_for_selectors(self, selectors: list[str],
+                                  include_completed: bool = False) -> list[tuple[OpenSpecChange, Task]]:
         """Expand task and work-package selectors in user order, without repeats."""
-        catalog = await self._load_catalog()
+        catalog = await self._load_catalog(required=True)
         changes = [OpenSpecChange.from_dict(value) for value in catalog.get("changes", [])]
         packages = {
             package.id: (change, package)
@@ -184,7 +218,7 @@ class OpenSpecArtifactStore(ArtifactStore):
             else:
                 raise ArtifactSelectionError(f"unknown task or work package ID: {selector}")
             for change, task in candidates:
-                if task.completed or task.id in selected_ids:
+                if (task.completed and not include_completed) or task.id in selected_ids:
                     continue
                 selected.append((change, task))
                 selected_ids.add(task.id)
@@ -193,7 +227,7 @@ class OpenSpecArtifactStore(ArtifactStore):
         return selected
 
     async def mark_task_completed(self, task_id: str) -> None:
-        catalog = await self._load_catalog()
+        catalog = await self._load_catalog(required=True)
         changes = [OpenSpecChange.from_dict(value) for value in catalog.get("changes", [])]
         owner: OpenSpecChange | None = None
         updated_changes: list[OpenSpecChange] = []
@@ -235,7 +269,7 @@ class OpenSpecArtifactStore(ArtifactStore):
     async def replace_tasks(
             self, change: OpenSpecChange, replacements: dict[str, Task]
     ) -> OpenSpecChange:
-        catalog = await self._load_catalog()
+        catalog = await self._load_catalog(required=True)
         updated_packages = []
         for package in change.work_packages:
             updated_packages.append(replace(
@@ -266,25 +300,71 @@ class OpenSpecArtifactStore(ArtifactStore):
             ) from exc
         return updated
 
-    async def _load_catalog(self) -> dict:
+    async def _load_catalog(self, required: bool = False) -> dict:
         try:
-            if not await self._client.file_exists(CATALOG_PATH):
+            lookup_indeterminate = False
+            try:
+                exists = await self._client.file_exists(CATALOG_PATH)
+            except ArtifactLookupIndeterminate as exc:
+                # PyCharm's deterministic-call guard is not an absence result.
+                # Let the request-scoped reader establish whether the catalog is
+                # present, rather than converting the guard into a false negative.
+                lookup_indeterminate = True
+                exists = True
+                debug(log, "artifact.catalog_lookup_indeterminate", path=CATALOG_PATH,
+                      reason=str(exc))
+            if not exists:
+                if required:
+                    raise ArtifactStoreError(
+                        f"{CATALOG_PATH} was not found through the current IDE MCP bridge; "
+                        "the request may be attached to a different target project"
+                    )
                 return {
                     "version": 1,
                     "next_change": 1,
                     "next_work_package": 1,
                     "changes": [],
                 }
-            payload = json.loads(await self._client.read_file(CATALOG_PATH))
+            try:
+                raw_catalog = await self._client.read_file(CATALOG_PATH)
+            except JetBrainsMcpError as exc:
+                text = str(exc).lower()
+                if lookup_indeterminate and ("doesn't exist" in text or "not found" in text):
+                    if required:
+                        raise ArtifactStoreError(
+                            f"{CATALOG_PATH} was not found when the current IDE MCP bridge attempted to read it"
+                        ) from exc
+                    return {
+                        "version": 1,
+                        "next_change": 1,
+                        "next_work_package": 1,
+                        "changes": [],
+                    }
+                raise
+            # ##DELETE AFTER CORRECTION## Preserve the exact JSON parser input.
+            debug(log, "artifact.catalog_json_input", path=CATALOG_PATH, raw_content=raw_catalog)
+            payload = json.loads(raw_catalog)
+            # ##DELETE AFTER CORRECTION## Preserve decoded data before schema validation.
+            debug(log, "artifact.catalog_json_decoded", path=CATALOG_PATH, catalog=payload)
             if (
                     not isinstance(payload, dict)
                     or payload.get("version") != 1
                     or not isinstance(payload.get("changes"), list)
             ):
+                # ##DELETE AFTER CORRECTION## Keep schema failures distinct from JSON parsing.
+                debug(log, "artifact.catalog_schema_rejected", path=CATALOG_PATH, catalog=payload)
                 raise ArtifactStoreError(f"{CATALOG_PATH} has an unsupported format")
             return payload
         except json.JSONDecodeError as exc:
-            raise ArtifactStoreError(f"{CATALOG_PATH} is not valid JSON") from exc
+            # ##DELETE AFTER CORRECTION## JSON parser coordinates distinguish wrapper from schema failures.
+            debug(log, "artifact.catalog_json_decode_failed", path=CATALOG_PATH,
+                  error=exc.msg, position=exc.pos, line=exc.lineno, column=exc.colno)
+            # This can be an unrecognised tool-response envelope.  Do not claim
+            # the stored index itself is malformed when only the transport text
+            # failed to decode.
+            raise ArtifactStoreError(
+                f"could not parse the read response for {CATALOG_PATH} as JSON"
+            ) from exc
         except JetBrainsMcpError as exc:
             raise ArtifactStoreError(f"could not load {CATALOG_PATH}: {exc}") from exc
 

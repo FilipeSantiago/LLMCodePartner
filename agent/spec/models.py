@@ -1,6 +1,6 @@
 """Structured OpenSpec change model and deterministic Markdown renderers."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date
 
 
@@ -13,6 +13,9 @@ class Task:
     reasoning: str
     context: str
     preferred_capability: str
+    # Older persisted tasks omit this and therefore conservatively require an
+    # existing-source edit (replace or patch), not a create/format/rename.
+    required_operations: list[str] = field(default_factory=lambda: ["file_replace", "file_patch"])
     completed: bool = False
 
 
@@ -81,6 +84,7 @@ class OpenSpecChange:
     design: Design
     capabilities: list[Capability]
     work_packages: list[WorkPackage]
+    follow_up_for: list[str] = field(default_factory=list)
 
     @property
     def path(self) -> str:
@@ -130,6 +134,7 @@ class OpenSpecChange:
                 )
                 for package in value["work_packages"]
             ],
+            follow_up_for=value.get("follow_up_for", []),
         )
 
 
@@ -148,11 +153,16 @@ def render_proposal(change: OpenSpecChange) -> str:
         f"- **{package.id} — {package.title}** ({package.kind}): {package.objective}"
         for package in change.work_packages
     )
+    follow_up = (
+        "## Follow-up For\n\n" + "\n".join(f"- `{task_id}`" for task_id in change.follow_up_for) + "\n\n"
+        if change.follow_up_for else ""
+    )
     return (
         f"# Proposal: {change.title}\n\n"
         f"## Why\n\n{change.proposal.why}\n\n"
         f"## What Changes\n\n{changes}\n\n"
         f"## Work Packages\n\n{packages}\n\n"
+        f"{follow_up}"
         f"## Capabilities\n\n### New Capabilities\n\n{new_capabilities}\n\n"
         "### Modified Capabilities\n\n"
         "_None._\n\n"

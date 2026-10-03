@@ -5,12 +5,16 @@ consumes a provider's neutral tool-turn events and never touches the MCP engine'
 internals beyond them.
 """
 import json
+import logging
 
 from starlette.responses import StreamingResponse
 
 import providers
 from conversation.chat_responder import ChatResponder
 from mcp_bridge.models import DoneEvent, ErrorEvent, TextEvent, ToolCallEvent
+from logger.diagnostic import debug
+
+log = logging.getLogger("codepartner.openai.sse")
 
 
 class StreamingResponder(ChatResponder):
@@ -73,8 +77,16 @@ class StreamingResponder(ChatResponder):
                         first = False
                         yield self._chunk(delta, model, created, None)
                     elif isinstance(event, ToolCallEvent):
-                        yield self._tool_call_chunk(event, model, created, first)
-                        yield self._chunk({}, model, created, "tool_calls")
+                        # ##DELETE AFTER CORRECTION## Exact OpenAI SSE tool-call wire payload.
+                        chunk = self._tool_call_chunk(event, model, created, first)
+                        debug(log, "sse.tool_call_emitted", model=model,
+                              tool_call_id=event.tool_call_id, tool_name=event.name,
+                              arguments=event.arguments, chunk=chunk)
+                        yield chunk
+                        terminal_chunk = self._chunk({}, model, created, "tool_calls")
+                        debug(log, "sse.tool_call_terminated", tool_call_id=event.tool_call_id,
+                              chunk=terminal_chunk)
+                        yield terminal_chunk
                         yield "data: [DONE]\n\n"
                         return
                     elif isinstance(event, DoneEvent):
