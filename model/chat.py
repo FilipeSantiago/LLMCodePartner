@@ -22,6 +22,9 @@ class ChatCompletionRequest(BaseModel):
     # A client may supply an opaque request identifier.  Code Partner uses it only
     # for diagnostic correlation; it is never treated as a project selector.
     user: str | None = None
+    # Optional stable identifier supplied by the chat client. When absent, the
+    # backend recovers the generated conversation id from the bootstrap tool call.
+    conversation_id: str | None = None
 
 
 class ChatCompletionChoice(BaseModel):

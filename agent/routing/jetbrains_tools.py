@@ -4,7 +4,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from agent.spec.jetbrains_mcp import JetBrainsMcpClient, JetBrainsMcpError
-from mcp_bridge.registry import ToolSpec, is_mutating_tool
+from mcp_bridge.registry import ToolRegistry, ToolSpec
 
 DirectToolHandler = Callable[[dict], Awaitable[str]]
 
@@ -24,11 +24,14 @@ class DirectIdeTools:
     async def discover(cls, client: JetBrainsMcpClient | None = None) -> "DirectIdeTools":
         client = client or JetBrainsMcpClient()
         tools = await client.list_tools()
-        selected = [tool for tool in tools if is_mutating_tool(tool.name)]
-        if not selected:
+        advertised = [ToolSpec(tool.name, tool.description, tool.schema) for tool in tools]
+        registry = ToolRegistry()
+        selected_specs = registry.register(advertised)
+        selected = [tool for tool in tools if tool.name in {spec.name for spec in selected_specs}]
+        if not selected_specs:
             available = ", ".join(tool.name for tool in tools) or "none"
             raise JetBrainsWriteCapabilityError(
-                "PyCharm standalone MCP server exposes no supported source-file write tool "
+                "PyCharm standalone MCP server exposes no supported IDE tool "
                 f"(available: {available})"
             )
 
@@ -36,7 +39,7 @@ class DirectIdeTools:
             return await client.call_tool(name, arguments)
 
         return cls(
-            specs=tuple(ToolSpec(tool.name, tool.description, tool.schema) for tool in selected),
+            specs=tuple(selected_specs),
             handlers={tool.name: (lambda arguments, name=tool.name: call(name, arguments))
                       for tool in selected},
         )

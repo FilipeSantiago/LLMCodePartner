@@ -41,11 +41,13 @@ class Coder:
         self._messages = messages
         self._model = model
 
-    async def run(self, specs: list[ToolSpec]) -> AsyncIterator[Event]:
+    async def run(self, specs: list[ToolSpec],
+                  direct_tool_handlers: dict | None = None) -> AsyncIterator[Event]:
         augmented = [{"role": "system", "content": CODER_SYSTEM}, *self._messages]
         # Read at call time (not import), like `pipeline.is_enabled` — `.env` may load
         # after this module is imported.
         provider = providers.get(os.getenv("CODER_PROVIDER", "claude"))
         async for event in provider.tools(augmented, specs, model=self._model,
-                                          role=ROLE_CODER):
+                                          role=ROLE_CODER,
+                                          direct_tool_handlers=direct_tool_handlers):
             yield event

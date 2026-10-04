@@ -23,6 +23,7 @@ import logging
 from collections.abc import AsyncIterator
 
 from agent.coder import Coder
+from agent.spec.ide_mcp_sessions import strip_bootstrap_exchange
 from agent.prompt_optimizer import MODEL_CHOICES, MODEL_SUGGESTION_SEP, PromptOptimizer
 from conversation import openai_request as oreq
 from mcp_bridge.models import DoneEvent, Event, TextEvent, ToolCallEvent
@@ -107,12 +108,13 @@ def _extract_model(content: str) -> str | None:
     return None
 
 
-async def _optimize(history: list[dict], specs) -> AsyncIterator[Event]:
+async def _optimize(history: list[dict], specs,
+                    direct_tool_handlers: dict | None = None) -> AsyncIterator[Event]:
     """Run the Optimizer and, if this turn produces the enhanced prompt (a text
     turn), wrap it as the acceptance proposal. Tool turns pass through untouched."""
     started = False
     text_turn = False
-    async for ev in PromptOptimizer(history).run(specs):
+    async for ev in PromptOptimizer(history, direct_tool_handlers).run(specs):
         if not started:
             started = True
             if isinstance(ev, ToolCallEvent):
@@ -125,12 +127,13 @@ async def _optimize(history: list[dict], specs) -> AsyncIterator[Event]:
         yield ev
 
 
-async def run(request: ChatCompletionRequest) -> AsyncIterator[Event]:
+async def run(request: ChatCompletionRequest, specs=None,
+              direct_tool_handlers: dict | None = None) -> AsyncIterator[Event]:
     """The stage router — one async generator of neutral events per request. Stage is a
     pure function of the resent history (see module docstring). Scoped to one
     planning→code cycle; `accept` is the only path to the Coder."""
-    history = oreq.to_messages(request)
-    specs = oreq.tool_specs(request)
+    history = strip_bootstrap_exchange(oreq.to_messages(request))
+    specs = specs if specs is not None else oreq.tool_specs(request)
 
     last = history[-1] if history else {}
     prop_idx = _latest_proposal_idx(history)
@@ -140,10 +143,10 @@ async def run(request: ChatCompletionRequest) -> AsyncIterator[Event]:
         if prop_idx != -1 and _accepted(history, prop_idx):
             # Re-derive the tier from the still-present proposal (stateless backend).
             model = _extract_model(history[prop_idx]["content"])
-            async for ev in Coder(history, model=model).run(specs):   # Code resume
+            async for ev in Coder(history, model=model).run(specs, direct_tool_handlers):   # Code resume
                 yield ev
         else:
-            async for ev in _optimize(history, specs):    # Optimizer still gathering
+            async for ev in _optimize(history, specs, direct_tool_handlers):    # Optimizer still gathering
                 yield ev
         return
 
@@ -152,13 +155,14 @@ async def run(request: ChatCompletionRequest) -> AsyncIterator[Event]:
         if (last.get("content") or "").strip().lower() == "accept":
             enhanced = _extract_prompt(history[prop_idx]["content"])
             model = _extract_model(history[prop_idx]["content"])
-            async for ev in Coder([{"role": "user", "content": enhanced}], model=model).run(specs):  # Code start
+            async for ev in Coder([{"role": "user", "content": enhanced}], model=model).run(
+                    specs, direct_tool_handlers):  # Code start
                 yield ev
         else:
-            async for ev in _optimize(history, specs):    # Refine on feedback
+            async for ev in _optimize(history, specs, direct_tool_handlers):    # Refine on feedback
                 yield ev
         return
 
     # Fresh prompt (no proposal yet) — start optimizing.
-    async for ev in _optimize(history, specs):
+    async for ev in _optimize(history, specs, direct_tool_handlers):
         yield ev

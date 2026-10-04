@@ -28,8 +28,8 @@ def register(tool_call_id: str, run: Run, name: str, arguments: dict) -> asyncio
     debug(log, "bridge.tool_call_registered", trace_id=run.metadata.get("trace_id"),
           run_id=run.run_id, tool_call_id=tool_call_id, tool_name=name,
           arguments=arguments, pending_call_ids=sorted(run.pending))
-    log.info("tool_call_emitted id=%s name=%s argument_keys=%s", tool_call_id, name,
-             sorted(arguments) if isinstance(arguments, dict) else [])
+    log.info("mcp_tool_route route=ide_bridge trace_id=%s run_id=%s id=%s name=%s",
+             run.metadata.get("trace_id"), run.run_id, tool_call_id, name)
     return fut
 
 
@@ -60,18 +60,22 @@ async def call_tool(run: Run, name: str, arguments: dict) -> str:
         return f"Error: invalid MCP tool call: {exc}"
     handler = run.direct_tool_handlers.get(name)
     if handler is not None:
+        log.info("mcp_tool_route route=direct_ide_mcp trace_id=%s run_id=%s name=%s",
+                 run.metadata.get("trace_id"), run.run_id, name)
         try:
             debug(log, "bridge.direct_tool_started", trace_id=run.metadata.get("trace_id"),
                   run_id=run.run_id, tool_name=name, arguments=arguments)
             text = await handler(arguments)
         except Exception as exc:
-            log.warning("direct IDE MCP tool failed name=%s error=%s", name, exc)
+            log.warning("mcp_tool_failed route=direct_ide_mcp trace_id=%s run_id=%s name=%s error_type=%s",
+                        run.metadata.get("trace_id"), run.run_id, name, type(exc).__name__)
             return f"Error: direct PyCharm MCP tool '{name}' failed: {exc}"
         required = set(run.metadata.get("required_operations", ()))
         if is_mutating_tool(name) and (not required or required.intersection(operations_for(name))):
             run.mutating_tool_succeeded = True
             await run.put(MutationEvent(name, arguments))
-        log.info("direct IDE MCP mutation succeeded name=%s", name)
+        log.info("mcp_tool_succeeded route=direct_ide_mcp trace_id=%s run_id=%s name=%s",
+                 run.metadata.get("trace_id"), run.run_id, name)
         debug(log, "bridge.direct_tool_result", trace_id=run.metadata.get("trace_id"),
               run_id=run.run_id, tool_name=name, result=text)
         return text
@@ -88,13 +92,15 @@ def resolve(tool_call_id: str, content: str) -> Run | None:
     if fut is None or fut.done():
         log.warning("unknown/late tool result id=%s", tool_call_id)
         # ##DELETE AFTER CORRECTION## Full late-result diagnostics.
-        debug(log, "bridge.tool_result_unmatched", tool_call_id=tool_call_id, content=content,
+        debug(log, "bridge.tool_result_unmatched", tool_call_id=tool_call_id,
+              result_length=len(content or ""),
               known_call_ids=sorted(_futures))
         return None
     run = _runs.get(tool_call_id)
     debug(log, "bridge.tool_result_received", trace_id=run.metadata.get("trace_id") if run else None,
           run_id=run.run_id if run else None, tool_call_id=tool_call_id,
-          tool_name=run.tool_names.get(tool_call_id) if run else None, content=content)
+          tool_name=run.tool_names.get(tool_call_id) if run else None,
+          result_length=len(content or ""))
     # A failed IDE write is normally returned as an error-shaped tool result. Do
     # not declare a project mutation in that case: fallback is only unsafe after
     # a write actually succeeded.
@@ -104,7 +110,9 @@ def resolve(tool_call_id: str, content: str) -> Run | None:
             and (not required or required.intersection(operations_for(tool_name)))):
         run.mutating_tool_succeeded = True
     fut.set_result(content)
-    log.info("tool_result_received id=%s content_length=%d", tool_call_id, len(content or ""))
+    log.info("mcp_tool_result_received route=ide_bridge trace_id=%s run_id=%s id=%s name=%s",
+             run.metadata.get("trace_id") if run else None,
+             run.run_id if run else None, tool_call_id, tool_name)
     return run
 
 

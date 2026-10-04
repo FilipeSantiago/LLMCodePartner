@@ -33,5 +33,6 @@ class ClaudeCLIExecutor:
                 "required_operations": task.required_operations,
             },
             execution_env=env,
+            direct_tool_handlers=context.direct_tool_handlers,
         ):
             yield event

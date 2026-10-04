@@ -30,10 +30,14 @@ class JetBrainsMcpClient:
             self,
             url: str | None = None,
             project_path: str | None = None,
+            headers: dict[str, str] | None = None,
             timeout_seconds: float | None = None,
     ):
         self._url = url or os.getenv("JETBRAINS_MCP_URL", "")
         self._project_path = project_path or os.getenv("JETBRAINS_MCP_PROJECT_PATH", "")
+        self._headers = dict(headers or {})
+        if self._project_path:
+            self._headers.setdefault("IJ_MCP_SERVER_PROJECT_PATH", self._project_path)
         self._timeout_seconds = (
             timeout_seconds
             if timeout_seconds is not None
@@ -117,12 +121,11 @@ class JetBrainsMcpClient:
     async def _session(self):
         if not self._url:
             raise JetBrainsMcpError("JETBRAINS_MCP_URL is not configured")
-        if not self._project_path:
+        if not self._headers:
             raise JetBrainsMcpError("JETBRAINS_MCP_PROJECT_PATH is not configured")
-        headers = {"IJ_MCP_SERVER_PROJECT_PATH": self._project_path}
         timeout = httpx.Timeout(self._timeout_seconds, read=self._timeout_seconds)
         try:
-            async with httpx.AsyncClient(headers=headers, timeout=timeout) as http_client:
+            async with httpx.AsyncClient(headers=self._headers, timeout=timeout) as http_client:
                 async with streamable_http_client(
                         self._url, http_client=http_client
                 ) as (read_stream, write_stream, _):

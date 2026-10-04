@@ -197,15 +197,18 @@ class PromptOptimizer:
     """Constructed per request with the neutral message history (the conversation is the
     optimizer's context)."""
 
-    def __init__(self, messages: list[dict]):
-        self._messages = messages
+    def __init__(self, messages: list[dict], direct_tool_handlers: dict | None = None):
+        self._messages = list(messages)
+        self._direct_tool_handlers = direct_tool_handlers or {}
 
-    async def run(self, specs: list[ToolSpec]) -> AsyncIterator[Event]:
+    async def run(self, specs: list[ToolSpec],
+                  direct_tool_handlers: dict | None = None) -> AsyncIterator[Event]:
         # ROLE_OPTIMIZER is READ-only, so this agent physically cannot be handed a write
         # tool even if the IDE advertises one.
         specs = [s for s in specs if s.name in allowed_for(ROLE_OPTIMIZER)]
 
-        if self._may_gather(specs):
+        handlers = direct_tool_handlers or self._direct_tool_handlers
+        while self._may_gather(specs):
             # Rung 0 (the cheapest model) decides *what to read*; picking a file is a much
             # easier call than the rewrite, so escalation is reserved for the latter.
             chosen = await OllamaProvider().decide_tool(
@@ -214,11 +217,30 @@ class PromptOptimizer:
             )
             if chosen:
                 name, args = chosen
+                handler = handlers.get(name)
+                if handler is not None:
+                    try:
+                        result = await handler(args)
+                    except Exception as exc:
+                        log.warning("optimizer IDE MCP read failed tool=%s error=%s", name, exc)
+                        break
+                    call_id = "call_" + uuid4().hex[:24]
+                    self._messages.extend((
+                        {"role": "assistant", "content": "", "tool_calls": [{
+                            "id": call_id, "type": "function", "function": {
+                                "name": name, "arguments": args,
+                            },
+                        }]},
+                        {"role": "tool", "tool_call_id": call_id,
+                         "name": name, "content": result},
+                    ))
+                    continue
                 log.info("optimizer gathering context: tool=%s args=%s", name, args)
                 # One call per turn: the pipeline ships this to JetBrains and re-enters
                 # `run` with the result appended to the history.
                 yield ToolCallEvent("call_" + uuid4().hex[:24], name, args)
                 return
+            break
 
         structured, analyzed_by, escalations = await self._rewrite()
         yield TextEvent(_render(structured, analyzed_by, escalations))

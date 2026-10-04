@@ -16,7 +16,7 @@ from uuid import uuid4
 
 import httpx
 
-from mcp_bridge.models import DoneEvent, Event, TextEvent, ToolCallEvent
+from mcp_bridge.models import DoneEvent, ErrorEvent, Event, TextEvent, ToolCallEvent
 from mcp_bridge.registry import ToolSpec, allowed_for
 from providers.base import Provider
 
@@ -64,15 +64,35 @@ class OllamaProvider(Provider):
         allowed = allowed_for(role)
         specs = [s for s in specs if s.name in allowed]
 
-        hist = self._to_ollama_messages(messages)
-
-        # Step 1 is shared with the optimizer's context-gathering turn — see decide_tool.
-        # No `model` is passed: this method's contract is that the Ollama model is fixed.
-        chosen = await self.decide_tool(messages, specs)
-        if chosen:
+        direct_handlers = kwargs.get("direct_tool_handlers") or {}
+        working = list(messages)
+        for _ in range(8):
+            # Step 1 is shared with the optimizer's context-gathering turn.
+            chosen = await self.decide_tool(working, specs)
+            if not chosen:
+                break
             name, args = chosen
-            yield ToolCallEvent("call_" + uuid4().hex[:24], name, args)
-            return
+            handler = direct_handlers.get(name)
+            if handler is None:
+                yield ToolCallEvent("call_" + uuid4().hex[:24], name, args)
+                return
+            try:
+                result = await handler(args)
+            except Exception as exc:
+                yield ErrorEvent(f"IDE MCP tool {name!r} failed: {exc}")
+                yield DoneEvent("endTurn")
+                return
+            call_id = "call_" + uuid4().hex[:24]
+            working.extend((
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": call_id, "type": "function", "function": {
+                        "name": name, "arguments": json.dumps(args),
+                    },
+                }]},
+                {"role": "tool", "tool_call_id": call_id, "name": name,
+                 "content": result},
+            ))
+        hist = self._to_ollama_messages(working)
 
         # No tool needed → stream a natural-language answer (no tools, no schema).
         terminal = "endTurn"
