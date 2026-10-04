@@ -33,6 +33,7 @@ class RoutingConfig:
     tiers: dict[str, tuple[str, ...]]
     semantic_router_url: str
     agentgateway_url: str
+    reviewers: dict[str, str] | None = None
     router_timeout_seconds: float = 10.0
     failure_threshold: int = 2
 
@@ -63,6 +64,7 @@ def load_routing_config(path: Path | str | None = None) -> RoutingConfig:
         executor = str(value.get("executor") or "")
         cli_model = str(value.get("cli_model") or "").strip() or None
         gateway_mode = str(value.get("gateway_mode") or "preferred").lower()
+        reasoning_effort = value.get("reasoning_effort")
         if provider not in {"claude", "codex"}:
             raise RoutingConfigError(f"model {name!r} has unsupported provider")
         if executor not in {"claude-cli", "codex-cli"}:
@@ -71,7 +73,10 @@ def load_routing_config(path: Path | str | None = None) -> RoutingConfig:
             raise RoutingConfigError(f"model {name!r} provider and executor disagree")
         if gateway_mode not in {"preferred", "required", "disabled"}:
             raise RoutingConfigError(f"model {name!r} has invalid gateway_mode")
-        models[name] = ModelRef(name, provider, executor, cli_model, gateway_mode)
+        if reasoning_effort is not None and reasoning_effort not in {"low", "medium", "high", "xhigh"}:
+            raise RoutingConfigError(f"model {name!r} has invalid reasoning_effort")
+        models[name] = ModelRef(name, provider, executor, cli_model, gateway_mode,
+                                reasoning_effort)
 
     tiers: dict[str, tuple[str, ...]] = {}
     raw_tiers = ((raw.get("routing") or {}).get("tiers") or {})
@@ -87,9 +92,27 @@ def load_routing_config(path: Path | str | None = None) -> RoutingConfig:
         tiers[complexity] = tuple(candidates)
 
     runtime = raw.get("runtime") or {}
+    reviewers = raw.get("reviewers") or {}
+    if not isinstance(reviewers, dict):
+        raise RoutingConfigError("reviewers must be a mapping")
+    for coder_name, reviewer_name in reviewers.items():
+        if coder_name not in models or reviewer_name not in models:
+            raise RoutingConfigError(f"unknown reviewer pairing: {coder_name} -> {reviewer_name}")
+        coder_tiers = {tier for tier, names in tiers.items() if coder_name in names}
+        reviewer_tiers = {tier for tier, names in tiers.items() if reviewer_name in names}
+        if not coder_tiers.intersection(reviewer_tiers):
+            raise RoutingConfigError(f"reviewer pairing crosses complexity tiers: {coder_name} -> {reviewer_name}")
+        if models[coder_name].provider == models[reviewer_name].provider:
+            raise RoutingConfigError(f"reviewer pairing must cross providers: {coder_name} -> {reviewer_name}")
+    if {model.provider for model in models.values()} == {"claude", "codex"}:
+        routed_models = {name for candidates in tiers.values() for name in candidates}
+        missing_pairs = sorted(routed_models.difference(reviewers))
+        if missing_pairs:
+            raise RoutingConfigError(f"missing cross-provider reviewer pairs: {missing_pairs}")
     return RoutingConfig(
         models=models,
         tiers=tiers,
+        reviewers=dict(reviewers),
         semantic_router_url=str(os.getenv("SEMANTIC_ROUTER_URL") or runtime.get("semantic_router_url") or "http://semantic-router:8080").rstrip("/"),
         agentgateway_url=str(os.getenv("AGENTGATEWAY_URL") or runtime.get("agentgateway_url") or "http://agentgateway:4000").rstrip("/"),
         router_timeout_seconds=float(runtime.get("router_timeout_seconds", 10)),

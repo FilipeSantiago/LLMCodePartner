@@ -6,6 +6,15 @@ runtime:
 health:
   failure_threshold: 2
 
+reviewers:
+  claude-haiku: codex-luna-low
+  codex-luna-low: claude-haiku
+  claude-sonnet: codex-sol-medium
+  codex-luna-medium: claude-sonnet
+  codex-sol-medium: claude-sonnet
+  claude-opus: codex-sol-high
+  codex-sol-high: claude-opus
+
 routing:
   tiers:
     simple:

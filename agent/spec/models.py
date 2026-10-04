@@ -13,8 +13,7 @@ class Task:
     reasoning: str
     context: str
     preferred_capability: str
-    # Older persisted tasks omit this and therefore conservatively require an
-    # existing-source edit (replace or patch), not a create/format/rename.
+    # Legacy execution hint; review determines completion from the task outcome.
     required_operations: list[str] = field(default_factory=lambda: ["file_replace", "file_patch"])
     completed: bool = False
 

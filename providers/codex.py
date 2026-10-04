@@ -104,8 +104,9 @@ class CodexProvider(Provider):
     async def tools(self, messages: list[dict], specs: list[ToolSpec],
                     model: str | None = None, role: str | None = None,
                     run_metadata: dict | None = None,
-                    gateway_url: str | None = None, concrete_model: bool = False,
-                    direct_tool_handlers: dict | None = None,
+                     gateway_url: str | None = None, concrete_model: bool = False,
+                     reasoning_effort: str | None = None,
+                     direct_tool_handlers: dict | None = None,
                     **kwargs) -> AsyncIterator[Event]:
         """Stateful like Claude's, and for the same reason: the `codex` process stays
         alive across HTTP requests, blocked inside its MCP tool call, while JetBrains
@@ -124,8 +125,9 @@ class CodexProvider(Provider):
             prompt, system = self._flatten(messages)
 
             async def strategy(run: Run, prompt: str, system: str | None,
-                               specs: list[ToolSpec]) -> str:
-                return await self._run_strategy(run, prompt, system, model, gateway_url, concrete_model)
+                                specs: list[ToolSpec]) -> str:
+                return await self._run_strategy(run, prompt, system, model, gateway_url,
+                                                concrete_model, reasoning_effort)
 
             run = engine.start_run(prompt, system, specs, strategy=strategy,
                                    allowed=allowed_for(role),
@@ -139,13 +141,14 @@ class CodexProvider(Provider):
 
     async def _run_strategy(self, run: Run, prompt: str, system: str | None,
                             model: str | None = None, gateway_url: str | None = None,
-                            concrete_model: bool = False) -> str:
+                            concrete_model: bool = False,
+                            reasoning_effort: str | None = None) -> str:
         """The engine `Strategy`: publish this Run's bridged tools, run `codex exec`
         against them, and push its output onto the Run as neutral events. Returns the
         terminal reason. The MCP endpoint is opened and closed with the process, so a
         finished (or cancelled) run leaves nothing callable behind."""
         async with mcp_http.serve_run(run) as url:
-            args = self._base_args(model, gateway_url, concrete_model) + [
+            args = self._base_args(model, gateway_url, concrete_model, reasoning_effort) + [
                 "-c", f'mcp_servers.{mcp_http.SERVER_NAME}.url="{url}"',
             ]
             async for obj in self._exec(args, self._join(prompt, system)):
@@ -160,7 +163,8 @@ class CodexProvider(Provider):
         return "endTurn"
 
     def _base_args(self, model: str | None = None, gateway_url: str | None = None,
-                   concrete_model: bool = False) -> list[str]:
+                    concrete_model: bool = False,
+                    reasoning_effort: str | None = None) -> list[str]:
         """`codex exec` flags shared by both surfaces. `read-only` is the locked tool
         surface: codex may reason, but every write has to go through the IDE tools."""
         args = [BIN, "exec", "--json", "--skip-git-repo-check", "--ephemeral",
@@ -171,6 +175,8 @@ class CodexProvider(Provider):
         resolved = model if concrete_model else model_for(model)
         if resolved:
             args += ["-m", resolved]
+        if reasoning_effort:
+            args += ["-c", f'model_reasoning_effort="{reasoning_effort}"']
         if gateway_url:
             base_url = gateway_url.rstrip("/") + "/v1"
             args += [

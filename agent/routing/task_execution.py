@@ -12,7 +12,9 @@ from agent.routing.models import ExecutionContext, ExecutionDecision
 from agent.routing.persistence import RoutingPersistence
 from agent.routing.service import ModelRoutingService
 from agent.spec.models import Task
-from mcp_bridge.models import DoneEvent, ErrorEvent, Event, Run, TextEvent, ToolCallEvent
+from mcp_bridge.models import (
+    DoneEvent, ErrorEvent, Event, MutationEvent, Run, TextEvent, ToolCallEvent,
+)
 from mcp_bridge.registry import ToolSpec
 
 
@@ -30,6 +32,7 @@ class TaskExecutionService:
                       specs: list[ToolSpec],
                       on_decision: Callable[[ExecutionDecision], Awaitable[None]] | None = None,
                       execution_instruction: str = "",
+                      direct_tool_handlers: dict | None = None,
                       ) -> AsyncIterator[Event]:
         # The active project belongs to the IDE request that advertised `specs`.
         # Never route through a process-wide IDE/project setting.
@@ -39,7 +42,7 @@ class TaskExecutionService:
             await on_decision(decision)
         async for event in self._run(
                 task, decision, self._execution_messages(task, messages, execution_instruction),
-                specs):
+                specs, direct_tool_handlers or {}):
             yield event
 
     @staticmethod
@@ -51,13 +54,10 @@ class TaskExecutionService:
             f"Description: {task.description}",
             f"Context: {task.context}",
             f"Preferred capability: {task.preferred_capability}",
-            f"Required operations: {', '.join(task.required_operations)}",
             (f"Additional execution instruction: {execution_instruction}"
              if execution_instruction else ""),
-            "Use the IDE MCP tools to inspect relevant code and apply the requested source changes.",
-            "You must call an available source-write or refactor MCP tool; do not only propose code in chat.",
-            "Verify the applied change with an available read, diff, or test tool before summarizing it.",
-            "Do not claim this task is complete unless the MCP write/refactor call succeeded.",
+            "Use the IDE MCP tools as needed to complete the task's actual objective.",
+            "Finish with a concrete account of the result, remaining gaps, and relevant evidence.",
         ]))
         prefix = [message for message in messages[:-1] if message.get("role") == "system"]
         return [*prefix, {"role": "user", "content": task_prompt}]
@@ -76,7 +76,8 @@ class TaskExecutionService:
                 await self._finalize_metadata(run, event, started, failure)
             yield event
 
-    async def _run(self, task, decision, messages, specs) -> AsyncIterator[Event]:
+    async def _run(self, task, decision, messages, specs,
+                   direct_tool_handlers: dict) -> AsyncIterator[Event]:
         attempts = (decision.recommended_model, *decision.fallback_models)
         last_error = None
         for index, model_name in enumerate(attempts):
@@ -88,6 +89,7 @@ class TaskExecutionService:
                     messages=messages, specs=specs, decision=decision,
                     gateway_url=self.config.agentgateway_url, use_gateway=gateway_used,
                     started_at=started,
+                    direct_tool_handlers=direct_tool_handlers,
                 )
                 executor = self.executors.get(model.executor)
                 failed_before_write = False
@@ -97,7 +99,7 @@ class TaskExecutionService:
                     if isinstance(event, ErrorEvent):
                         failed_before_write = True
                         last_error = event.message
-                    if isinstance(event, (TextEvent, ToolCallEvent)):
+                    if isinstance(event, (TextEvent, ToolCallEvent, MutationEvent)):
                         emitted_material = True
                     if isinstance(event, ToolCallEvent):
                         paused_for_tool = True

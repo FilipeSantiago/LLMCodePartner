@@ -6,12 +6,15 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 from agent.routing.config import RoutingConfig, RoutingConfigError, load_routing_config
 from agent.routing.executors.registry import ExecutorRegistry
 from agent.routing.implementation import ImplementationService
 from agent.routing.models import ModelRef
 from agent.routing.persistence import RoutingPersistence
+from agent.routing.review import ReviewDecision, ReviewError, ReviewService
 from agent.routing.semantic_router import SemanticRouterError
 from agent.routing.service import ModelRoutingService
 from agent.routing.task_execution import TaskExecutionService
@@ -244,6 +247,7 @@ class _TaskExecution:
     async def execute(self, queued_task, change_id, messages, specs, **kwargs):
         self.started.append((queued_task.id, change_id))
         self.instructions.append(kwargs.get("execution_instruction"))
+        yield TextEvent("Task result with supporting evidence.")
         yield DoneEvent("endTurn")
 
     async def resume(self, run, messages, specs):
@@ -251,23 +255,26 @@ class _TaskExecution:
 
 
 class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_chat_only_execution_fails_and_keeps_tasks_incomplete(self):
+    async def test_review_can_complete_without_a_mutation_event(self):
         with tempfile.TemporaryDirectory() as directory:
             artifacts = _Artifacts()
             execution = _TaskExecution()
             persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
-            service = ImplementationService(artifacts, execution, persistence)
+            async def actual_model(_decision_id):
+                return "claude-haiku"
+            persistence.actual_model_for = actual_model
+            reviewer = _Reviewer(["done", "done"])
+            service = ImplementationService(artifacts, execution, persistence, reviewer)
             job = await service.create_job(["WP1", "WP1-T2"], "Add traceability")
             events = [event async for event in service.start(
                 job, [{"role": "user", "content": "/implement WP1"}], []
             )]
-            self.assertEqual(execution.started, [("WP1-T1", "CHG1")])
-            self.assertEqual(execution.instructions, ["Add traceability"])
-            self.assertEqual(artifacts.completed, [])
-            self.assertTrue(any(
-                isinstance(event, ErrorEvent) and "without a successful source-file write" in event.message
-                for event in events
-            ))
+            self.assertEqual(execution.started, [("WP1-T1", "CHG1"), ("WP1-T2", "CHG1")])
+            self.assertEqual(execution.instructions, ["Add traceability"] * 2)
+            self.assertEqual(artifacts.completed, ["WP1-T1", "WP1-T2"])
+            self.assertEqual(reviewer.reports, ["Task result with supporting evidence."] * 2)
+            self.assertTrue(any("completed after review" in event.text
+                                for event in events if isinstance(event, TextEvent)))
             db = sqlite3.connect(persistence.path)
             try:
                 row = db.execute(
@@ -275,26 +282,125 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
                 ).fetchone()
             finally:
                 db.close()
-            self.assertEqual(row, ("failed", "Add traceability"))
+            self.assertEqual(row, ("completed", "Add traceability"))
 
-    async def test_bridged_mutation_completes_task(self):
+    async def test_research_task_waits_for_user_confirmation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            artifacts.tasks["WP1-T1"] = replace(artifacts.tasks["WP1-T1"],
+                                                 preferred_capability="research")
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            async def actual_model(_decision_id):
+                return "claude-haiku"
+            persistence.actual_model_for = actual_model
+            reviewer = _Reviewer(["ask_user"])
+            service = ImplementationService(artifacts, execution, persistence, reviewer)
+            job = await service.create_job(["WP1-T1"], conversation_id="conv-test")
+            events = [event async for event in service.start(job, [], [])]
+            self.assertEqual(artifacts.completed, [])
+            self.assertTrue(any("Do you consider" in event.text
+                                for event in events if isinstance(event, TextEvent)))
+            self.assertEqual((await persistence.pending_confirmation("conv-test"))[0], job.job_id)
+            events = [event async for event in service.confirm(job.job_id, 0, True, "yes", [], [])]
+            self.assertEqual(artifacts.completed, ["WP1-T1"])
+            self.assertTrue(any("completed" in event.text for event in events if isinstance(event, TextEvent)))
+
+    async def test_unrelated_write_does_not_override_review_gaps(self):
         with tempfile.TemporaryDirectory() as directory:
             artifacts = _Artifacts()
             execution = _TaskExecution()
             persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
-            service = ImplementationService(artifacts, execution, persistence)
+            async def actual_model(_decision_id):
+                return "claude-haiku"
+            persistence.actual_model_for = actual_model
+            reviewer = _Reviewer(["needs_work"] * 3)
+            service = ImplementationService(artifacts, execution, persistence, reviewer)
             job = await service.create_job(["WP1-T1"])
-            await persistence.update_implementation_task(job.job_id, 0, "waiting")
-            run = Run()
-            run.mutating_tool_succeeded = True
-            run.metadata.update({
-                "implementation_job_id": job.job_id,
-                "implementation_position": 0,
-                "implementation_task_id": "WP1-T1",
-            })
-            events = [event async for event in service.resume(run, [], [])]
-            self.assertEqual(artifacts.completed, ["WP1-T1"])
-            self.assertTrue(any("completed" in event.text for event in events if isinstance(event, TextEvent)))
+            [event async for event in service.start(job, [], [])]
+            self.assertEqual(artifacts.completed, [])
+            self.assertEqual(len(execution.started), 3)
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "review_pending")
+
+
+class _Reviewer:
+    def __init__(self, verdicts):
+        self.verdicts = list(verdicts)
+        self.reports = []
+
+    async def review(self, change, queued_task, report, coder_model, specs, handlers):
+        self.reports.append(report)
+        verdict = self.verdicts.pop(0)
+        return ReviewDecision(verdict, "Reviewed task result", "codex-luna-low",
+                              f"Do you consider {queued_task.id} complete?" if verdict == "ask_user" else None,
+                              "Requested outcome missing" if verdict == "needs_work" else None)
+
+
+class _SelectingReviewer(ReviewService):
+    def __init__(self, config, unavailable=False, model_unavailable=False):
+        super().__init__(config)
+        self.selected = []
+        self.unavailable = unavailable
+        self.model_unavailable = model_unavailable
+
+    async def _run_review(self, change, queued_task, report, reviewer_name, specs, handlers):
+        self.selected.append(reviewer_name)
+        if self.unavailable and len(self.selected) == 1:
+            raise ReviewError("authentication required")
+        if self.model_unavailable and len(self.selected) == 1:
+            raise ReviewError("model not available")
+        return ReviewDecision("done", "Task outcome reviewed", reviewer_name)
+
+
+class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
+    def test_review_decision_parser_accepts_final_json_after_commentary(self):
+        value = ReviewService._parse_decision(
+            'I inspected the result.\n```json\n'
+            '{"verdict":"done","rationale":"The task outcome is complete."}\n```'
+        )
+        self.assertEqual(value["verdict"], "done")
+
+    async def test_cross_provider_pair_uses_actual_coder_model(self):
+        reviewer = _SelectingReviewer(load_routing_config())
+        await reviewer.review(None, task(), "result", "claude-haiku", [], {})
+        await reviewer.review(None, task(), "result", "codex-sol-high", [], {})
+        self.assertEqual(reviewer.selected, ["codex-luna-low", "claude-opus"])
+
+    async def test_single_provider_uses_same_provider(self):
+        model = ModelRef("claude-sonnet", "claude", "claude-cli", "sonnet")
+        config = RoutingConfig({model.name: model}, {"medium": (model.name,)},
+                               "http://router", "http://gateway", reviewers={})
+        reviewer = _SelectingReviewer(config)
+        await reviewer.review(None, task(), "result", model.name, [], {})
+        self.assertEqual(reviewer.selected, [model.name])
+
+    async def test_unavailable_opposite_provider_uses_same_provider(self):
+        reviewer = _SelectingReviewer(load_routing_config(), unavailable=True)
+        await reviewer.review(None, task(), "result", "claude-haiku", [], {})
+        self.assertEqual(reviewer.selected, ["codex-luna-low", "claude-haiku"])
+
+    async def test_unavailable_model_tries_other_opposite_model_in_same_tier(self):
+        reviewer = _SelectingReviewer(load_routing_config(), model_unavailable=True)
+        await reviewer.review(None, task(), "result", "claude-sonnet", [], {})
+        self.assertEqual(reviewer.selected, ["codex-sol-medium", "codex-luna-medium"])
+
+    async def test_reviewer_runs_with_read_only_role_and_structured_verdict(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                self.role = kwargs["role"]
+                yield TextEvent('{"verdict":"done","rationale":"Outcome meets the task",'
+                                '"feedback":"","question":""}')
+                yield DoneEvent("endTurn")
+
+        provider = FakeProvider()
+        change = SimpleNamespace(title="Routing change", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                change, task(), "Implemented routing", "claude-haiku", [], {})
+        self.assertEqual(provider.role, "optimizer")
+        self.assertEqual(decision.verdict, "done")
+        self.assertEqual(decision.reviewer_model, "codex-luna-low")
 
 
 async def _value(value):

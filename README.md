@@ -78,10 +78,26 @@ volume and requires signing in again. The service runs as the non-root
 Compose uses host networking because PyCharm's MCP server listens only on host
 loopback. The API therefore listens directly on host port 7777 even though
 `docker compose ps` does not display a published-port mapping. `OLLAMA_HOST`,
-`MCP_PUBLIC_BASE`, and `JETBRAINS_MCP_URL` can all use `127.0.0.1` from the
-container. No source project is mounted: the backend writes complete
-`openspec/changes/` artifacts plus the `.codepartner/` catalog and dashboard
-through PyCharm's MCP server in the configured active project.
+`MCP_PUBLIC_BASE` and the URL in `.codepartner/ide_mcp.json` can use
+`127.0.0.1` from the container. No source project is mounted. On the first
+request that needs MCP, the backend reads `.codepartner/ide_mcp.json` through
+the current AI Assistant bridge, then connects to the configured PyCharm MCP
+server for later project reads and writes. The file uses this shape:
+
+```json
+{
+  "type": "streamable-http",
+  "url": "http://127.0.0.1:64462/stream",
+  "headers": {
+    "IJ_MCP_SERVER_PROJECT_PATH": "/absolute/path/to/the/project"
+  }
+}
+```
+
+The backend caches discovered tools by conversation for 30 minutes. Clients may
+send a stable `conversation_id`; otherwise the backend returns its generated id
+in `X-CodePartner-Conversation-ID` and associates the session with the bootstrap
+tool call in resent chat history. The cache is local to one backend process.
 
 For unattended deployments, provide `ANTHROPIC_API_KEY` or the applicable Codex
 access token through a secret manager or runtime environment. Never copy credentials
@@ -142,17 +158,27 @@ Implement persisted tasks with the model-routing pipeline:
 selector expands to its incomplete tasks in order. Optional execution guidance
 must follow a colon, so task selection remains unambiguous. The backend creates a durable
 implementation job, routes each task only when it starts, and executes tasks
-sequentially. A failed task stops the job; completed tasks are checked off in the
-OpenSpec change and dashboard. IDE tool calls pause the current task and resume
-that same routed provider before the job advances.
+sequentially. Each coder result receives a read-only outcome review before the
+task is checked off in the OpenSpec change and dashboard. Review feedback can
+send the same task back for up to two revisions. Research and verification work
+waits for a user yes/no answer when the reviewer considers it ready; the job
+then advances or revises that task. A failed task stops the job. IDE tool calls
+resume the same routed provider.
 
-`/implement` and `/run` use only source-write tools advertised by the calling IDE
-through the bridge. Code Partner never stores a PyCharm MCP URL or a project path,
-so one container can serve multiple projects without a fixed-project fallback. A
-task is never marked complete from a chat-only response: it must receive a
-successful IDE mutation result. `/review` remains read-only, while `/spec`,
-`/update`, and `/rework` only persist their own OpenSpec artifacts and never grant
-an LLM source-write tools.
+`/implement` and `/run` use tools discovered from the conversation's
+`.codepartner/ide_mcp.json` server. The bridge reads that file for initial
+setup. Task completion depends on the reviewer judging the result against the
+task objective and work-package acceptance criteria, not on an MCP write call.
+If Claude coded the task, Codex reviews it; if Codex coded it, Claude reviews
+it. When only one provider is usable, a fresh read-only review uses that
+provider. `/review` remains a separate manual read-only command, while `/spec`,
+`/update`, and `/rework` only persist their own OpenSpec artifacts.
+
+When a task asks for your decision, reply `yes` to check it off and continue
+the job, or `no: <feedback>` to have the coder revise it. If a reviewer is
+unavailable, the task stays pending; reply `retry review` in the same chat
+after the provider is available again. Reviewer pairings and model tiers are
+configured in `config/model-routing.yaml`.
 
 Review implemented work without granting write tools:
 
@@ -186,12 +212,13 @@ update may currently target tasks from only one OpenSpec change.
 
 For native runs, the backend host must have the `openspec` CLI on `PATH` (or set
 `OPENSPEC_BIN` to its executable); the Compose image already includes it.
-`/spec`, `/update`, `/run`, and `/implement` use only the tools advertised in
-the current AI Assistant request. They do not require `JETBRAINS_MCP_URL` or
-`JETBRAINS_MCP_PROJECT_PATH`, and they do not select a global IDE project.
-If a source-write/refactor capability is absent or unsupported, `/run` and
-`/implement` return a normal assistant diagnostic and record the operation as
-blocked without changing source files. `/spec` and `/update` bypass the
+`/spec`, `/update`, `/run`, and `/implement` read `.codepartner/ide_mcp.json`
+through the current AI Assistant request on first use, then use its
+conversation-scoped server configuration. They do not require
+`JETBRAINS_MCP_URL` or `JETBRAINS_MCP_PROJECT_PATH`. If a source-write/refactor
+capability is absent or unsupported, `/run` reports the missing capability;
+`/implement` can still execute research tasks. If the artifact store cannot be
+accessed, implementation cannot proceed. `/spec` and `/update` bypass the
 optimizer/coder pipeline and never execute generated tasks.
 
 Optimizer tuning — all optional, and every default reproduces the pre-existing

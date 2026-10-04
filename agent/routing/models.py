@@ -3,7 +3,7 @@
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 from agent.spec.models import Task
@@ -18,6 +18,7 @@ class ModelRef:
     executor: str
     cli_model: str | None
     gateway_mode: str = "preferred"
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,7 @@ class ExecutionContext:
     gateway_url: str | None = None
     use_gateway: bool = False
     started_at: float = 0.0
+    direct_tool_handlers: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

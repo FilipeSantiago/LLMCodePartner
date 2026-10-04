@@ -29,7 +29,9 @@ class CodexCLIExecutor:
                 "attempt_started_at": context.started_at,
                 "required_operations": task.required_operations,
             },
-            gateway_url=context.gateway_url if context.use_gateway else None,
-            concrete_model=True,
+             gateway_url=context.gateway_url if context.use_gateway else None,
+             concrete_model=True,
+             reasoning_effort=model.reasoning_effort,
+             direct_tool_handlers=context.direct_tool_handlers,
         ):
             yield event

@@ -300,7 +300,7 @@ class JetBrainsClient(unittest.IsolatedAsyncioTestCase):
         result = SimpleNamespace(content=[], isError=False, structuredContent=None)
         http_client, session, patches = self._transport(result)
         client = JetBrainsMcpClient(
-            "http://127.0.0.1:64462/stream", "/workspace/project", 5
+            "http://127.0.0.1:64462/stream", "/workspace/project", timeout_seconds=5
         )
         with patches[0] as httpx_type, patches[1] as stream_type, patches[2]:
             await client.create_file("openspec/change.md", "content", overwrite=False)
@@ -636,7 +636,7 @@ class HandlerAndController(unittest.IsolatedAsyncioTestCase):
                 )
             )
         self.assertEqual(raised.exception.status_code, 400)
-        self.assertIn("require a streaming request", raised.exception.detail)
+        self.assertIn("requires a streaming request", raised.exception.detail)
 
     async def test_unknown_update_returns_400(self):
         old_handler = dialog_controller.spec_handler
@@ -660,7 +660,7 @@ class HandlerAndController(unittest.IsolatedAsyncioTestCase):
             dialog_controller.spec_handler = old_handler
         self.assertEqual(raised.exception.status_code, 400)
 
-    async def test_implementation_without_advertised_write_tool_returns_blocked_sse(self):
+    async def test_implementation_bootstraps_ide_mcp_before_task_execution(self):
         response = await dialog_controller.chat_completions(
             ChatCompletionRequest(
                 model="test", stream=True,
@@ -673,23 +673,23 @@ class HandlerAndController(unittest.IsolatedAsyncioTestCase):
         )
         chunks = [chunk async for chunk in response.body_iterator]
         body = b"".join(chunk if isinstance(chunk, bytes) else chunk.encode() for chunk in chunks).decode()
-        self.assertIn("No supported source-write", body)
-        self.assertIn('"finish_reason": "stop"', body)
+        self.assertIn(".codepartner/ide_mcp.json", body)
+        self.assertIn('"finish_reason": "tool_calls"', body)
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
 
     async def test_implementation_respects_tool_choice_none(self):
-        response = await dialog_controller.chat_completions(
-            ChatCompletionRequest(
-                model="test", stream=True, tool_choice="none",
-                messages=[ChatMessage(role="user", content="/implement WP1-T1")],
-                tools=[{"type": "function", "function": {
-                    "name": "apply_patch", "parameters": {"type": "object"},
-                }}],
+        with self.assertRaises(HTTPException) as raised:
+            await dialog_controller.chat_completions(
+                ChatCompletionRequest(
+                    model="test", stream=True, tool_choice="none",
+                    messages=[ChatMessage(role="user", content="/implement WP1-T1")],
+                    tools=[{"type": "function", "function": {
+                        "name": "apply_patch", "parameters": {"type": "object"},
+                    }}],
+                )
             )
-        )
-        chunks = [chunk async for chunk in response.body_iterator]
-        body = b"".join(chunk if isinstance(chunk, bytes) else chunk.encode() for chunk in chunks).decode()
-        self.assertIn("No supported source-write", body)
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("requires tool calls", raised.exception.detail)
 
     async def test_normal_request_keeps_existing_provider_flow(self):
         provider = mock.AsyncMock()
