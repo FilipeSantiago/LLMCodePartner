@@ -128,57 +128,163 @@ Each invocation creates a separate directory under `openspec/changes/` containin
 specifications, and `tasks.md`. A later `/spec` creates another change and never
 replaces an earlier one.
 
-The provider groups related work into one or more purpose-oriented work packages.
-The backend assigns globally stable IDs such as `WP1`, `WP1-T1`, and
-`WP1-T2`; IDs come from the backend catalog rather than model output. Work
-packages may be user stories, technical outcomes, migrations, refactorings,
-research, or operational work. Every task retains its title, description,
+Planning uses the explicit hierarchy **Epic → Work Package → Task**. An Epic
+explains why an initiative exists, a WP is a complete demonstrable feature and
+the primary acceptance/review boundary, and a Task is a bounded routed execution
+instruction. The backend assigns stable IDs such as `EPIC1`, `WP1`, and
+`WP1-T1`; IDs come from the catalog rather than model output. WP acceptance
+criteria and required/preferred/optional/not-required validation expectations
+form the reviewer contract. Tasks retain their dependencies, definition of done,
 complexity, reasoning, context, and preferred capability.
 
 `.codepartner/spec-index.json` stores the machine-readable catalog and
 `.codepartner/tasks.md` is regenerated as a dashboard of every active work
 package. The OpenSpec change files remain the planning artifacts.
 
-Refine selected tasks with `/update`:
+Explain canonical work without modifying it, or refine it in a draft:
 
 ```text
-/update WP1-T1 WP1-T2: replace polling with event callbacks
+/explain EPIC1
+/explain WP1
+/refine WP1
+# discuss proposed changes in subsequent messages
+/apply
 ```
+
+`/refine` stores a conversation-scoped draft. Only `/apply` updates the existing
+canonical object. Apply reconciles descendants without erasing task identity or
+execution history; affected completed tasks are marked for re-execution and
+obsolete tasks are cancelled. `/discard` drops the draft without writing anything.
+
+### Modes (chat model picker)
+
+`GET /v1/models` advertises one virtual model per mode. Pick one in the IDE chat
+model dropdown; plain messages then follow that mode, while any message starting
+with `/` keeps its normal one-shot meaning.
+
+| Model | Plain message | Example |
+|---|---|---|
+| `dumb-router` | Default coding agent (unchanged behaviour) | — |
+| `codepartner-spec` | Drafts a new OpenSpec change in the chat; later messages revise it. Nothing is written until `/apply`; `/discard` drops it. | `add password reset` |
+| `codepartner-review` | Runs `/review` read-only. A message without a scope reuses the last scope named in the conversation. | `WP1: are tests missing?` |
+| `codepartner-implement` | Runs `/implement`. Every message must name its scope, so chat never writes code for an unspecified target. | `WP1-T1: add tests` |
+
+Replies to a pending implementation job (`yes`, `accept`, `undo`, …) are always
+handled first, whatever mode is selected. Spec-mode drafts use provisional IDs
+(`WP1`, `WP1-T1`); final IDs are assigned when `/apply` saves the change.
 
 Implement persisted tasks with the model-routing pipeline:
 
 ```text
 /implement WP1-T1
 /implement WP1
-/execute WP1 WP3-T2
+/implement EPIC1
 /implement WP1-T1: add MLflow tracking and keep the configuration injectable
 ```
 
-`/implement` is the canonical command; `/execute` is an alias. A work-package
-selector expands to its incomplete tasks in order. Optional execution guidance
+`/implement` is the canonical execution command. A work-package selector
+expands to incomplete tasks in dependency order. Optional execution guidance
 must follow a colon, so task selection remains unambiguous. The backend creates a durable
 implementation job, routes each task only when it starts, and executes tasks
-sequentially. Each coder result receives a read-only outcome review before the
-task is checked off in the OpenSpec change and dashboard. Review feedback can
-send the same task back for up to two revisions. Research and verification work
-waits for a user yes/no answer when the reviewer considers it ready; the job
-then advances or revises that task. A failed task stops the job. IDE tool calls
-resume the same routed provider.
+sequentially. For WP implementation, all tasks are assembled before one read-only
+WP review evaluates the completed feature against its OpenSpec contract. Outcomes
+are `PASS`, `BLOCK`, or `UNVERIFIED`: only concrete contract violations block;
+tooling or evidence limitations remain review/infrastructure problems and do not
+become coder failures. A failed task stops the job. IDE tool calls resume the
+same routed provider. The older `/run` form is accepted only as a compatibility
+alias and enters this same `/implement` workflow.
+
+After every review attempt, chat shows the verdict, the actual coder and
+reviewer models, the reviewer's reason, the evidence checked, and any remaining
+gaps. For tasks requiring your decision, this explanation appears before the
+three-choice interaction. A reviewer that could not run or could not verify the result
+is shown as pending, not credited with a verdict. Each review attempt remains
+in the operational review history.
+When a task is completed, its final model attribution and approval reason are
+also saved in the generated OpenSpec `tasks.md` and `.codepartner/tasks.md`
+dashboard; the structured catalog preserves those details on regeneration.
 
 `/implement` and `/run` use tools discovered from the conversation's
 `.codepartner/ide_mcp.json` server. The bridge reads that file for initial
 setup. Task completion depends on the reviewer judging the result against the
-task objective and work-package acceptance criteria, not on an MCP write call.
+active task's description and task-level acceptance criteria, not on an MCP write
+call. Work-package criteria are cumulative context for the package and cannot be
+used to require implementation or tests assigned to later sibling tasks. Legacy
+tasks without explicit task criteria use their description as the review criterion.
+The review service reads claimed project artifacts through the request-scoped
+IDE MCP and supplies a balanced, bounded source snapshot to the reviewer so
+interfaces, factories, concrete implementations, and tests receive coverage.
+Task mutation-journal paths are authoritative review evidence. A basename in a
+coder report is reconciled to a unique journal path first; legacy or supplemental
+claims use IDE project search only after a literal not-found result and only when
+the exact filename has one match. Missing or ambiguous paths remain pending.
+Notebook artifacts use the notebook reader when available and fall back to the
+IDE source reader for raw `.ipynb` JSON when the file is not IDE-backed.
+Unreadable required deliverables keep the review pending; unreadable scratch,
+temporary, debug, or ad-hoc artifacts are disclosed as optional limitations
+unless the task objective or acceptance criteria explicitly require them.
+The reviewer
+may make further IDE MCP reads, but cannot use a shell or container filesystem
+to inspect the project. Its decision must identify the artifacts it assessed;
+an unverified review stays pending and cannot become a confirmation question.
+Codex reviewer runs disable the built-in shell and pre-approve only the private
+run's optimizer-approved IDE read/search tools.
 If Claude coded the task, Codex reviews it; if Codex coded it, Claude reviews
 it. When only one provider is usable, a fresh read-only review uses that
 provider. `/review` remains a separate manual read-only command, while `/spec`,
 `/update`, and `/rework` only persist their own OpenSpec artifacts.
 
-When a task asks for your decision, reply `yes` to check it off and continue
-the job, or `no: <feedback>` to have the coder revise it. If a reviewer is
-unavailable, the task stays pending; reply `retry review` in the same chat
-after the provider is available again. Reviewer pairings and model tiers are
-configured in `config/model-routing.yaml`.
+If a reviewer is unavailable or cannot inspect through IDE MCP, the task stays
+pending; reply `retry review` in the same chat after the issue is fixed. Reviewer
+pairings and model tiers are configured in `config/model-routing.yaml`.
+Codex routes may configure a separate `review_reasoning_effort`; this raises the
+reviewer's reasoning budget without changing the effort used when that route codes.
+
+Every reviewer issue is shown as formatted JSON with `problem`, `suggested_task`,
+`approval_criteria`, `artifact_paths`, `owner`, and `reason`. CodePartner owns
+evidence acquisition, the coder owns inconsistent project artifacts and missing
+required execution, and the user owns only external infrastructure or judgment
+gaps. Suggested tasks are advisory: the coder may choose a different implementation,
+but the next review checks the stated problem and approval criteria.
+
+Required journaled and task-declared source artifacts are read completely with
+pagination before review. Verification commands run through the IDE dispatcher are
+captured in an attempt-scoped evidence bundle under the container's temporary
+CodePartner evidence directory (or `CODEPARTNER_EVIDENCE_DIR`). The bundle records
+the command, raw output, hash, outcome, pytest collection count, totals, and node IDs
+without adding evidence files to the target repository. Evidence from an earlier
+coder revision is never reused for changed code.
+
+Every implementation receives an independent review. If the reviewer finds a
+blocking implementation issue, the coder revises and the reviewer checks the
+result again, for up to three automatic revision rounds. Review approval or an
+exhausted revision budget then uses one interaction: reply `accept` to keep the
+implementation, `undo` to restore task-owned changes and stop the job, or
+`submit to coder again: <additional prompt>` to keep the work and begin a fresh
+three-revision coder/reviewer cycle. Accepting unresolved findings is recorded as
+an audited user override. The older `try coder again`, `accept anyway`, and
+`undo code` forms remain aliases for in-flight chats. Coder mutations made
+through direct IDE tools are journaled with before-images and post-write hashes;
+undo refuses to overwrite files changed independently afterward. Older in-flight
+jobs without a journal use a conservative coder-assisted undo that is recorded as
+such and instructed to preserve unrelated changes.
+
+Coder narration is labeled as an untrusted claim and cannot set workflow status.
+New summary, completion, evidence, verification, test-result, or ad-hoc runner
+artifacts are blocked before creation unless the task explicitly declares them;
+existing required documentation remains editable. An incomplete review caused by
+unchanged CodePartner-owned evidence cannot be retried until that evidence changes.
+
+The journal is fail-closed: if a mutation target cannot be identified or its
+before-image cannot be captured, the IDE mutation is not executed. If a write is
+applied but its post-image cannot be verified, the task enters `recovery_required`
+and `retry review` is unavailable. Reply `inspect recovery` to see canonical
+targets and each mutation's lifecycle (`planned`, `snapshotted`, `applied`, or
+`postimage_verified`), `establish new baseline: <recovery prompt>` to audit
+acceptance of the current project state as a new undo baseline and start a fresh
+three-revision coder/reviewer cycle, or `stop and repair manually` to end the job
+without attempting an unsafe undo. Changes made before a new baseline cannot be
+undone automatically.
 
 Review implemented work without granting write tools:
 

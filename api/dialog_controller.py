@@ -26,17 +26,24 @@ from agent.spec import (
     SpecCommandError,
     SpecCommandHandler,
     extract_help_response,
+    extract_object_id,
     extract_implementation_request,
     extract_run_task_id,
     extract_scoped_request,
     is_help_command,
+    is_apply_command,
+    is_discard_command,
+    is_explain_command,
     is_implementation_command,
     is_review_command,
     is_run_command,
     is_rework_command,
+    is_refine_command,
     is_spec_command,
     is_update_command,
 )
+from agent.spec.modes import request_shape, route_message
+from agent.spec.refinement import RefinementError, RefinementService
 from agent.spec.bridge_client import BridgeMcpFileClient, DirectMcpFileClient
 from agent.spec.ide_mcp_sessions import (
     configure_session, conversation_for_request, get_session, new_conversation_id,
@@ -58,6 +65,44 @@ from model.chat import ChatCompletionRequest, ChatCompletionResponse
 from logger.diagnostic import debug, new_trace_id
 
 log = logging.getLogger("codepartner.api")
+
+_IMPLEMENTATION_RESOLUTION = re.compile(
+    r"\s*(submit to coder again|try coder again|accept anyway|accept|undo code|undo)"
+    r"(?:\s*:\s*(.+))?\s*", re.IGNORECASE | re.DOTALL)
+_IMPLEMENTATION_RECOVERY = re.compile(
+    r"\s*establish new baseline\s*:\s*(.+?)\s*", re.IGNORECASE | re.DOTALL)
+_IMPLEMENTATION_RECOVERY_ACTION = re.compile(
+    r"\s*(inspect recovery|stop and repair manually)\s*", re.IGNORECASE)
+
+
+def _implementation_resolution(content: str | None) -> tuple[str, str] | None:
+    match = _IMPLEMENTATION_RESOLUTION.fullmatch(content or "")
+    if match is None:
+        return None
+    command = match.group(1).lower()
+    action = {"submit to coder again": "submit_again",
+              "try coder again": "submit_again",
+              "accept anyway": "accept",
+              "accept": "accept",
+              "undo code": "undo",
+              "undo": "undo"}[command]
+    return action, (match.group(2) or "").strip()
+
+
+def _implementation_recovery(content: str | None) -> str | None:
+    match = _IMPLEMENTATION_RECOVERY.fullmatch(content or "")
+    return match.group(1).strip() if match else None
+
+
+def _implementation_recovery_action(content: str | None) -> tuple[str, str] | None:
+    prompt = _implementation_recovery(content)
+    if prompt:
+        return "establish_baseline", prompt
+    match = _IMPLEMENTATION_RECOVERY_ACTION.fullmatch(content or "")
+    if match is None:
+        return None
+    return ({"inspect recovery": "inspect_recovery",
+             "stop and repair manually": "stop_recovery"}[match.group(1).lower()], "")
 
 router = APIRouter()
 artifact_store = OpenSpecArtifactStore()
@@ -150,8 +195,8 @@ async def _blocked_capability_response(request: ChatCompletionRequest, operation
 def _requires_mcp(request: ChatCompletionRequest, last: dict) -> bool:
     if last.get("role") == "user":
         content = (last.get("content") or "").lstrip().lower()
-        if content.startswith(("/spec", "/update", "/run", "/implement", "/execute",
-                               "/review", "/rework")):
+        if content.startswith(("/spec", "/explain", "/refine", "/apply", "/discard", "/update", "/run",
+                               "/implement", "/execute", "/review", "/rework")):
             return True
     return bool(request.tools) and _tool_calls_permitted(request)
 
@@ -224,6 +269,32 @@ def _start_artifact_command(messages: list[dict], specs: list[ToolSpec], trace_i
     run.metadata["artifact_command"] = True
     debug(log, "api.artifact_command_started", trace_id=trace_id, run_id=run.run_id,
           advertised_tool_names=[spec.name for spec in specs])
+    return run
+
+
+def _start_refinement_command(specs: list[ToolSpec], trace_id: str, client,
+                              conversation_id: str, action: str,
+                              target_id: str = "", instruction: str = ""):
+    async def strategy(run, _prompt, _system, _specs):
+        service = RefinementService(
+            _artifact_store(client, specs), CliOpenSpecAdapter(), task_execution.persistence)
+        if action == "start":
+            content = await service.start(conversation_id, target_id)
+        elif action == "apply":
+            content = await service.apply(conversation_id)
+        elif action == "discard":
+            content = await service.discard(conversation_id)
+        elif action == "draft":
+            content = await service.start_draft(conversation_id, instruction)
+        else:
+            content = await service.update(conversation_id, instruction)
+        await run.put(TextEvent(content))
+        return "endTurn"
+
+    run = bridge_server.start_run("", None, specs, strategy,
+                                  allowed_operations=_ARTIFACT_OPERATIONS)
+    run.metadata.update({"trace_id": trace_id, "artifact_command": True,
+                         "artifact_command_kind": f"refinement_{action}"})
     return run
 
 
@@ -361,6 +432,41 @@ def _start_implementation_review_retry(messages: list[dict], specs: list[ToolSpe
     return run
 
 
+def _start_implementation_resolution(messages: list[dict], specs: list[ToolSpec],
+                                     trace_id: str, client, direct_tool_handlers: dict,
+                                     job_id: str, position: int, instruction: str,
+                                     action: str, detail: str = ""):
+    async def strategy(run, _prompt, _system, _specs):
+        service = ImplementationService(_artifact_store(client, specs), task_execution)
+        if action == "submit_again":
+            events = service.retry_coder(
+                job_id, position, messages, specs, instruction,
+                direct_tool_handlers, detail)
+        elif action == "accept":
+            events = service.accept_anyway(
+                job_id, position, messages, specs, instruction,
+                direct_tool_handlers, detail)
+        elif action == "undo":
+            events = service.undo_code(
+                job_id, position, messages, specs, direct_tool_handlers)
+        elif action == "inspect_recovery":
+            events = service.inspect_recovery(job_id, position)
+        elif action == "stop_recovery":
+            events = service.stop_recovery(job_id, position)
+        else:
+            events = service.establish_new_baseline(
+                job_id, position, messages, specs, instruction,
+                direct_tool_handlers, detail)
+        await _consume_implementation_events(run, service, events, messages, specs)
+        return "endTurn"
+
+    run = bridge_server.start_run("", None, specs, strategy,
+                                  allowed_operations=_ARTIFACT_OPERATIONS)
+    run.metadata.update({"trace_id": trace_id,
+                         "bridge_command": f"implementation_{action}"})
+    return run
+
+
 @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(request: ChatCompletionRequest):
     created = int(time.time())
@@ -399,8 +505,14 @@ async def chat_completions(request: ChatCompletionRequest):
                  [d.name for d in decisions if d.accepted],
                  [(d.name, d.reason) for d in decisions if not d.accepted])
 
+    # The chat model picker selects a mode; a plain message becomes its verb.
+    mode_route = route_message(request.model, messages)
+    routed_last = ({**last, "content": mode_route.content}
+                   if mode_route is not None and mode_route.content else last)
+    requires_mcp = (_requires_mcp(request, routed_last)
+                    or bool(mode_route is not None and mode_route.draft_request))
     is_help = last.get("role") == "user" and is_help_command(last.get("content"))
-    needs_mcp = session is None and not is_help and _requires_mcp(request, last)
+    needs_mcp = session is None and not is_help and requires_mcp
     if needs_mcp and not request.stream:
         raise HTTPException(status_code=400, detail="IDE MCP setup requires a streaming request")
     if needs_mcp:
@@ -427,7 +539,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
     active_specs = session.tools.specs if session is not None else advertised
     direct_handlers = session.tools.handlers if session is not None else {}
-    if session is not None and not request.stream and not is_help and _requires_mcp(request, last):
+    if session is not None and not request.stream and not is_help and requires_mcp:
         raise HTTPException(status_code=400, detail="IDE MCP operations require a streaming request")
 
     if request.stream and oreq.tool_results(request):
@@ -472,9 +584,75 @@ async def chat_completions(request: ChatCompletionRequest):
                 job_id, position, approved, reply, instruction)
             return StreamingResponder().drain_events(_drain_run(run), request.model, created)
 
+    recovery_action = (_implementation_recovery_action(last.get("content"))
+                       if last.get("role") == "user" else None)
+    if recovery_action:
+        pending_recovery = await task_execution.persistence.pending_recovery(conversation_id)
+        if pending_recovery is None:
+            for prior in reversed(messages[:-1]):
+                if prior.get("role") != "assistant":
+                    continue
+                match = re.search(r"\bjob ([0-9a-f-]{36})\b", prior.get("content") or "")
+                if match:
+                    pending_recovery = (
+                        await task_execution.persistence.pending_recovery_for_job(
+                            match.group(1)))
+                    if pending_recovery:
+                        break
+        if pending_recovery is not None:
+            if not request.stream or session is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="IDE MCP session required to establish a recovery baseline",
+                )
+            job_id, position, _, instruction = pending_recovery
+            action, detail = recovery_action
+            run = _start_implementation_resolution(
+                messages, active_specs, trace_id, session.client, direct_handlers,
+                job_id, position, instruction, action, detail)
+            return StreamingResponder().drain_events(_drain_run(run), request.model, created)
+
+    resolution = (_implementation_resolution(last.get("content"))
+                  if last.get("role") == "user" else None)
+    if resolution:
+        pending_resolution = await task_execution.persistence.pending_resolution(conversation_id)
+        if pending_resolution is None:
+            for prior in reversed(messages[:-1]):
+                if prior.get("role") != "assistant":
+                    continue
+                match = re.search(r"\bjob ([0-9a-f-]{36})\b", prior.get("content") or "")
+                if match:
+                    pending_resolution = (
+                        await task_execution.persistence.pending_resolution_for_job(
+                            match.group(1)))
+                    if pending_resolution:
+                        break
+        if pending_resolution is not None:
+            if not request.stream or session is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="IDE MCP session required to resolve an implementation review",
+                )
+            action, detail = resolution
+            job_id, position, _, instruction = pending_resolution
+            run = _start_implementation_resolution(
+                messages, active_specs, trace_id, session.client, direct_handlers,
+                job_id, position, instruction, action, detail)
+            return StreamingResponder().drain_events(_drain_run(run), request.model, created)
+
     if last.get("role") == "user" and (last.get("content") or "").strip().lower() in {
             "retry review", "/retry-review"}:
         pending_review = await task_execution.persistence.pending_review(conversation_id)
+        if pending_review is None:
+            for prior in reversed(messages[:-1]):
+                if prior.get("role") != "assistant":
+                    continue
+                match = re.search(r"\bjob ([0-9a-f-]{36})\b", prior.get("content") or "")
+                if match:
+                    pending_review = await task_execution.persistence.pending_review_for_job(
+                        match.group(1))
+                    if pending_review:
+                        break
         if pending_review is not None:
             if not request.stream or session is None:
                 raise HTTPException(status_code=409, detail="IDE MCP session required to retry review")
@@ -483,6 +661,17 @@ async def chat_completions(request: ChatCompletionRequest):
                 messages, active_specs, trace_id, session.client, direct_handlers,
                 job_id, position, instruction)
             return StreamingResponder().drain_events(_drain_run(run), request.model, created)
+
+    # Mode routing runs after pending-job replies ("yes", "accept", "undo") so a
+    # mode never swallows them, and before the verb branches that it reuses.
+    if mode_route is not None and mode_route.reply is not None:
+        responder = StreamingResponder() if request.stream else NonStreamingResponder()
+        return responder.reply(mode_route.reply, request.model, created)
+    if routed_last is not last:
+        log.info("mode_routed model=%s command=%s", request.model,
+                 routed_last["content"].split(maxsplit=1)[0])
+        last = routed_last
+        messages = [*messages[:-1], last]
 
     if is_help:
         responder = StreamingResponder() if request.stream else NonStreamingResponder()
@@ -541,13 +730,68 @@ async def chat_completions(request: ChatCompletionRequest):
             direct_tool_handlers=direct_handlers,
         )
         return StreamingResponder().drain_events(events, request.model, created)
+    content = last.get("content") or ""
+    if last.get("role") == "user" and is_refine_command(content):
+        if not request.stream or session is None or conversation_id is None:
+            raise HTTPException(status_code=409, detail="/refine requires an active IDE MCP session")
+        target_id = extract_object_id(content, "refine")
+        return StreamingResponder().drain_events(
+            _drain_run(_start_refinement_command(
+                active_specs, trace_id, session.client, conversation_id, "start", target_id)),
+            request.model, created,
+        )
+
+    if last.get("role") == "user" and is_apply_command(content):
+        if not request.stream or session is None or conversation_id is None:
+            raise HTTPException(status_code=409, detail="/apply requires an active IDE MCP session")
+        return StreamingResponder().drain_events(
+            _drain_run(_start_refinement_command(
+                active_specs, trace_id, session.client, conversation_id, "apply")),
+            request.model, created,
+        )
+
+    if last.get("role") == "user" and is_discard_command(content):
+        if not request.stream or session is None or conversation_id is None:
+            raise HTTPException(status_code=409, detail="/discard requires an active IDE MCP session")
+        return StreamingResponder().drain_events(
+            _drain_run(_start_refinement_command(
+                active_specs, trace_id, session.client, conversation_id, "discard")),
+            request.model, created,
+        )
+
+    active_refinement = await task_execution.persistence.active_refinement(conversation_id)
+    if (mode_route is not None and mode_route.draft_request is not None
+            and active_refinement is None):
+        if not request.stream or session is None or conversation_id is None:
+            raise HTTPException(status_code=409, detail="spec mode requires an active IDE MCP session")
+        log.info("spec_draft_request %s", request_shape(mode_route.draft_request))
+        return StreamingResponder().drain_events(
+            _drain_run(_start_refinement_command(
+                active_specs, trace_id, session.client, conversation_id,
+                "draft", instruction=mode_route.draft_request)),
+            request.model, created,
+        )
+    if (active_refinement is not None and last.get("role") == "user"
+            and content.strip() and not content.lstrip().startswith("/")):
+        if not request.stream or session is None or conversation_id is None:
+            raise HTTPException(status_code=409, detail="refinement requires an active IDE MCP session")
+        return StreamingResponder().drain_events(
+            _drain_run(_start_refinement_command(
+                active_specs, trace_id, session.client, conversation_id,
+                "update", instruction=content.strip())),
+            request.model, created,
+        )
+
     is_planning = last.get("role") == "user" and (
             is_spec_command(last.get("content"))
+            or is_explain_command(last.get("content"))
             or is_update_command(last.get("content"))
     )
     if is_planning:
         if not request.stream:
-            raise HTTPException(status_code=400, detail="/spec and /update require a streaming request")
+            raise HTTPException(status_code=400, detail="planning commands require a streaming request")
+        if is_spec_command(last.get("content")):
+            log.info("spec_command_request %s", request_shape(last.get("content") or ""))
         return StreamingResponder().drain_events(
             _drain_run(_start_artifact_command(
                 messages, active_specs, trace_id, session.client)),
@@ -585,12 +829,14 @@ async def chat_completions(request: ChatCompletionRequest):
         if not request.stream:
             raise HTTPException(status_code=400, detail="/run requires a streaming request")
         try:
-            if not _tool_calls_permitted(request) or not has_existing_source_editor(active_specs):
+            if not _tool_calls_permitted(request):
                 return await _blocked_capability_response(request, "run", active_specs, created)
             task_id = extract_run_task_id(last.get("content") or "")
             return StreamingResponder().drain_events(
-                _drain_run(_start_run_command(
-                    messages, active_specs, task_id, trace_id, session.client, direct_handlers)),
+                _drain_run(_start_implementation_command(
+                    messages, active_specs, [task_id],
+                    "Legacy /run alias; execute through the canonical /implement workflow.",
+                    trace_id, session.client, direct_handlers, conversation_id)),
                 request.model, created,
             )
         except SpecCommandError as exc:

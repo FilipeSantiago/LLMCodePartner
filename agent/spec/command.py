@@ -8,10 +8,15 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent.spec.artifact_store import ArtifactSelectionError, ArtifactStore
+from agent.spec.modes import MODES
 from agent.spec.models import OpenSpecChange, Task, render_response
 from agent.spec.openspec_adapter import OpenSpecAdapter
 
 _SPEC_COMMAND = re.compile(r"^\s*/spec(?:\s+|$)", re.IGNORECASE)
+_EXPLAIN_COMMAND = re.compile(r"^\s*/explain(?:\s+|$)", re.IGNORECASE)
+_REFINE_COMMAND = re.compile(r"^\s*/refine(?:\s+|$)", re.IGNORECASE)
+_APPLY_COMMAND = re.compile(r"^\s*/apply\s*$", re.IGNORECASE)
+_DISCARD_COMMAND = re.compile(r"^\s*/discard\s*$", re.IGNORECASE)
 _UPDATE_COMMAND = re.compile(r"^\s*/update(?:\s+|$)", re.IGNORECASE)
 _RUN_COMMAND = re.compile(r"^\s*/run(?:\s+|$)", re.IGNORECASE)
 _IMPLEMENT_COMMAND = re.compile(r"^\s*/(?:implement|execute)(?:\s+|$)", re.IGNORECASE)
@@ -23,6 +28,7 @@ _TASK_TARGET = re.compile(
     re.IGNORECASE,
 )
 _PACKAGE_TARGET = re.compile(r"(?:WP|US)\s*(\d+)", re.IGNORECASE)
+_EPIC_TARGET = re.compile(r"EPIC\s*(\d+)", re.IGNORECASE)
 
 
 class SpecCommandError(ValueError):
@@ -40,18 +46,21 @@ class CommandInfo:
 COMMANDS = (
     CommandInfo("spec", "/spec <request>", "Create an additive OpenSpec change.",
                 "Creates a new change and work packages; it never replaces earlier changes."),
-    CommandInfo("update", "/update WP1-T1 [WP1-T2 ...]: <instruction>", "Refine planned tasks.",
-                "Updates only selected tasks in one existing change. Use before implementation."),
+    CommandInfo("explain", "/explain EPIC1|WP1|WP1-T1", "Explain canonical planned work.",
+                "Reads the selected OpenSpec object without modifying planning or implementation state."),
+    CommandInfo("refine", "/refine EPIC1|WP1|WP1-T1", "Start a draft refinement.",
+                "Creates a conversation-scoped draft; canonical OpenSpec is unchanged until /apply."),
+    CommandInfo("apply", "/apply", "Commit the active refinement.",
+                "Updates the existing canonical object and reconciles descendant task history. "
+                "In spec mode it saves the drafted change as a new OpenSpec change."),
+    CommandInfo("discard", "/discard", "Drop the active draft.",
+                "Ends the active refinement or spec-mode draft without writing anything to OpenSpec."),
     CommandInfo("review", "/review WP1|WP1-T1[: <question>]", "Read-only implementation review.",
                 "Inspects selected work through read-only IDE tools and reports evidence, gaps, and tests. It never writes files."),
     CommandInfo("rework", "/rework WP1|WP1-T1[: <feedback>]", "Create corrective follow-up work.",
                 "Creates a separate additive OpenSpec change linked to the selected source tasks; completed history is preserved."),
     CommandInfo("implement", "/implement WP1|WP1-T1 [more selectors][: <execution instruction>]", "Route and implement tasks sequentially.",
                 "Expands work packages into incomplete tasks, routes each task at start time, executes sequentially, and stops on failure. Put optional execution guidance after ':'."),
-    CommandInfo("execute", "/execute WP1|WP1-T1 [more selectors][: <execution instruction>]", "Alias for /implement.",
-                "Uses exactly the same persisted sequential implementation-job flow as /implement."),
-    CommandInfo("run", "/run WP1-T1", "Run one task through the routing pipeline.",
-                "Use /implement for new work; /run remains available for a single-task execution."),
     CommandInfo("help", "/help", "List available commands.", "Use /man <command> for detailed syntax and behavior."),
     CommandInfo("man", "/man <command>", "Show command documentation.", "For example: /man implement or /man rework."),
 )
@@ -60,6 +69,9 @@ COMMANDS = (
 def help_text() -> str:
     lines = ["# Code Partner commands", ""]
     lines.extend(f"- `{item.usage}` — {item.summary}" for item in COMMANDS)
+    lines.extend(["", "## Modes", "",
+                  "Select a mode in the chat model picker; plain messages then follow it:", ""])
+    lines.extend(f"- `{mode.model_id}` — {mode.summary}" for mode in MODES)
     lines.extend(["", "Use `/man <command>` for details."])
     return "\n".join(lines)
 
@@ -86,6 +98,22 @@ def is_spec_command(content: str | None) -> bool:
 
 def is_update_command(content: str | None) -> bool:
     return bool(content and _UPDATE_COMMAND.match(content))
+
+
+def is_explain_command(content: str | None) -> bool:
+    return bool(content and _EXPLAIN_COMMAND.match(content))
+
+
+def is_refine_command(content: str | None) -> bool:
+    return bool(content and _REFINE_COMMAND.match(content))
+
+
+def is_apply_command(content: str | None) -> bool:
+    return bool(content and _APPLY_COMMAND.fullmatch(content))
+
+
+def is_discard_command(content: str | None) -> bool:
+    return bool(content and _DISCARD_COMMAND.fullmatch(content))
 
 
 def is_run_command(content: str | None) -> bool:
@@ -133,6 +161,25 @@ def extract_spec_request(content: str) -> str:
     if not request:
         raise SpecCommandError("/spec requires a request")
     return request
+
+
+def extract_object_id(content: str, verb: str) -> str:
+    pattern = {"explain": _EXPLAIN_COMMAND, "refine": _REFINE_COMMAND}[verb]
+    match = pattern.match(content)
+    if not match:
+        raise SpecCommandError(f"message is not an /{verb} command")
+    target = content[match.end():].strip().upper().replace(" ", "")
+    if (_EPIC_TARGET.fullmatch(target) or _PACKAGE_TARGET.fullmatch(target)
+            or _TASK_TARGET.fullmatch(target)):
+        task = _TASK_TARGET.fullmatch(target)
+        if task:
+            return f"WP{task.group(1)}-T{task.group(2)}"
+        package = _PACKAGE_TARGET.fullmatch(target)
+        if package:
+            return f"WP{package.group(1)}"
+        epic = _EPIC_TARGET.fullmatch(target)
+        return f"EPIC{epic.group(1)}"
+    raise SpecCommandError(f"/{verb} requires EPIC1, WP1, or WP1-T1")
 
 
 def extract_update_request(content: str) -> tuple[list[str], str]:
@@ -206,13 +253,17 @@ def _parse_implementation_selectors(body: str) -> list[str]:
         if package:
             selectors.append(f"WP{package.group(1)}")
             continue
+        epic = _EPIC_TARGET.fullmatch(token)
+        if epic:
+            selectors.append(f"EPIC{epic.group(1)}")
+            continue
         if selectors:
             raise SpecCommandError(
                 f"non-selector text {token!r} follows an implementation selector; "
                 "put execution guidance after ':' (for example, /implement WP1-T1: add tests)"
             )
         raise SpecCommandError(
-            f"invalid implementation selector {token!r}; use WP1-T1 or WP1"
+            f"invalid implementation selector {token!r}; use EPIC1, WP1, or WP1-T1"
         )
     return list(dict.fromkeys(selectors))
 
@@ -280,6 +331,16 @@ class SpecCommandHandler:
                     render_response(change),
                     change.path,
                 )
+            if is_explain_command(content):
+                object_id = extract_object_id(content, "explain")
+                try:
+                    kind, change, target = await self._store.object_by_id(object_id)
+                except ArtifactSelectionError as exc:
+                    raise SpecCommandError(str(exc)) from exc
+                return SpecResult(
+                    change.id, self._explain(kind, change, target), change.path,
+                    (object_id,),
+                )
             if is_update_command(content):
                 task_ids, instruction = extract_update_request(content)
                 try:
@@ -297,6 +358,56 @@ class SpecCommandHandler:
                     tuple(task_ids),
                 )
         raise SpecCommandError("no active planning command")
+
+    @staticmethod
+    def _explain(kind: str, change: OpenSpecChange, target: Any) -> str:
+        if kind == "epic":
+            packages = [package for package in change.work_packages
+                        if package.id in target.work_package_ids]
+            lines = [
+                f"# {target.id} — {target.title}", "", target.objective, "",
+                "## Work packages", "",
+                *[f"- {package.id} — {package.title}: {package.objective}"
+                  for package in packages],
+            ]
+            if target.acceptance_criteria:
+                lines.extend(["", "## Integration outcomes", "",
+                              *[f"- {item}" for item in target.acceptance_criteria]])
+            lines.extend(["", "WP review is the primary review boundary; Epic review covers only integration across WPs."])
+            return "\n".join(lines)
+        if kind == "work_package":
+            lines = [
+                f"# {target.id} — {target.title}", "", target.objective, "",
+                "## Acceptance criteria", "",
+                *[f"- {item}" for item in target.acceptance_criteria], "",
+                "## Tasks and execution order", "",
+            ]
+            for task in target.tasks:
+                dependency = f"; depends on {', '.join(task.depends_on)}" if task.depends_on else ""
+                lines.append(
+                    f"- {task.id} — {task.title} ({task.complexity}{dependency}): {task.description}"
+                )
+            validation = target.validation
+            lines.extend(["", "## Validation", ""])
+            for label, items in (("Required", validation.required),
+                                 ("Preferred", validation.preferred),
+                                 ("Optional", validation.optional),
+                                 ("Explicitly not required", validation.not_required)):
+                lines.append(f"**{label}:**")
+                lines.extend([f"- {item}" for item in items] or ["- None specified."])
+            lines.extend(["", "## Review boundary", "",
+                          "The reviewer evaluates the assembled WP against this WP contract after its tasks complete."])
+            return "\n".join(lines)
+        done = target.acceptance_criteria or [target.description]
+        lines = [
+            f"# {target.id} — {target.title}", "", target.description, "",
+            f"Complexity: {target.complexity}",
+            f"Preferred capability: {target.preferred_capability}",
+            f"Dependencies: {', '.join(target.depends_on) if target.depends_on else 'none'}", "",
+            "## Definition of done", "", *[f"- {item}" for item in done], "",
+            "This task is an execution unit. Its completion does not independently approve the WP.",
+        ]
+        return "\n".join(lines)
 
     async def rework(self, targets: list[tuple[OpenSpecChange, Task]],
                      feedback: str) -> SpecResult:

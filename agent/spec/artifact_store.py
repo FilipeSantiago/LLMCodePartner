@@ -3,11 +3,14 @@
 import abc
 import json
 import logging
+import re
 from dataclasses import replace
-from typing import Protocol
+from typing import Any, Protocol
 
 from agent.spec.jetbrains_mcp import JetBrainsMcpError
 from agent.spec.models import (
+    CompletionReview,
+    Epic,
     OpenSpecChange,
     Task,
     render_capability,
@@ -94,8 +97,22 @@ class ArtifactStore(abc.ABC):
         ...
 
     @abc.abstractmethod
-    async def mark_task_completed(self, task_id: str) -> None:
+    async def mark_task_completed(self, task_id: str,
+                                  review: CompletionReview | None = None) -> None:
         ...
+
+    async def object_by_id(self, object_id: str) -> tuple[str, OpenSpecChange, Any]:
+        raise NotImplementedError
+
+    async def update_change(self, change: OpenSpecChange) -> OpenSpecChange:
+        raise NotImplementedError
+
+    async def package_for_task(self, task_id: str):
+        raise NotImplementedError
+
+    async def record_work_package_review(self, package_id: str, review,
+                                         completed: bool) -> OpenSpecChange:
+        raise NotImplementedError
 
 
 class OpenSpecArtifactStore(ArtifactStore):
@@ -111,13 +128,36 @@ class OpenSpecArtifactStore(ArtifactStore):
         change_number = catalog["next_change"]
         next_package = catalog["next_work_package"]
         packages = []
+        draft_package_ids = {
+            f"WP{index}": f"WP{next_package + index - 1}"
+            for index in range(1, len(draft.work_packages) + 1)
+        }
+        def task_dependency(value: str, current_package: str) -> str:
+            normalized = value.upper()
+            if re_match := re.fullmatch(r"WP(\d+)-T(\d+)", normalized):
+                mapped = draft_package_ids.get(f"WP{re_match.group(1)}")
+                return f"{mapped}-T{re_match.group(2)}" if mapped else normalized
+            if normalized.startswith("T"):
+                return f"{current_package}-{normalized}"
+            return normalized
         for package in draft.work_packages:
             package_id = f"WP{next_package}"
             tasks = [
-                replace(task, id=f"{package_id}-T{task_number}")
+                replace(
+                    task,
+                    id=f"{package_id}-T{task_number}",
+                    depends_on=[task_dependency(dependency, package_id)
+                                for dependency in task.depends_on],
+                )
                 for task_number, task in enumerate(package.tasks, start=1)
             ]
-            packages.append(replace(package, id=package_id, tasks=tasks))
+            packages.append(replace(
+                package,
+                id=package_id,
+                tasks=tasks,
+                depends_on=[draft_package_ids.get(item.upper(), item.upper())
+                            for item in package.depends_on],
+            ))
             next_package += 1
 
         change = replace(
@@ -126,13 +166,18 @@ class OpenSpecArtifactStore(ArtifactStore):
             number=change_number,
             slug=f"change-{change_number:04d}-{slug}",
             work_packages=packages,
+            epic=replace(
+                draft.epic or Epic("", draft.title, draft.proposal.why),
+                id=f"EPIC{change_number}",
+                work_package_ids=[package.id for package in packages],
+            ),
         )
         changes = [
             OpenSpecChange.from_dict(value) for value in catalog.get("changes", [])
         ]
         changes.append(change)
         updated_catalog = {
-            "version": 1,
+            "version": 2,
             "next_change": change_number + 1,
             "next_work_package": next_package,
             "changes": [item.to_dict() for item in changes],
@@ -207,6 +252,9 @@ class OpenSpecArtifactStore(ArtifactStore):
             task.id: (change, task)
             for change in changes for package in change.work_packages for task in package.tasks
         }
+        epics = {
+            change.epic.id: change for change in changes if change.epic is not None
+        }
         selected: list[tuple[OpenSpecChange, Task]] = []
         selected_ids: set[str] = set()
         for selector in selectors:
@@ -215,18 +263,53 @@ class OpenSpecArtifactStore(ArtifactStore):
             elif selector in packages:
                 change, package = packages[selector]
                 candidates = [(change, task) for task in package.tasks]
+            elif selector in epics:
+                change = epics[selector]
+                candidates = [
+                    (change, task) for package in change.work_packages
+                    for task in package.tasks
+                ]
             else:
                 raise ArtifactSelectionError(f"unknown task or work package ID: {selector}")
             for change, task in candidates:
-                if (task.completed and not include_completed) or task.id in selected_ids:
+                if ((task.completed or task.status in {"completed", "cancelled"})
+                        and not include_completed) or task.id in selected_ids:
                     continue
                 selected.append((change, task))
                 selected_ids.add(task.id)
         if not selected:
-            raise ArtifactSelectionError("the selected tasks are already completed")
+            raise ArtifactSelectionError("the selected work is already completed or cancelled")
+        selected = self._dependency_order(selected)
         return selected
 
-    async def mark_task_completed(self, task_id: str) -> None:
+    @staticmethod
+    def _dependency_order(
+            selected: list[tuple[OpenSpecChange, Task]]) -> list[tuple[OpenSpecChange, Task]]:
+        by_id = {task.id: (change, task) for change, task in selected}
+        ordered: list[tuple[OpenSpecChange, Task]] = []
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(task_id: str) -> None:
+            if task_id in visited:
+                return
+            if task_id in visiting:
+                raise ArtifactSelectionError(f"cyclic task dependency involving {task_id}")
+            visiting.add(task_id)
+            change, task = by_id[task_id]
+            for dependency in task.depends_on:
+                if dependency in by_id:
+                    visit(dependency)
+            visiting.remove(task_id)
+            visited.add(task_id)
+            ordered.append((change, task))
+
+        for _, task in selected:
+            visit(task.id)
+        return ordered
+
+    async def mark_task_completed(self, task_id: str,
+                                  review: CompletionReview | None = None) -> None:
         catalog = await self._load_catalog(required=True)
         changes = [OpenSpecChange.from_dict(value) for value in catalog.get("changes", [])]
         owner: OpenSpecChange | None = None
@@ -238,7 +321,8 @@ class OpenSpecArtifactStore(ArtifactStore):
                 tasks = []
                 for task in package.tasks:
                     if task.id == task_id:
-                        task = replace(task, completed=True)
+                        task = replace(task, completed=True, status="completed",
+                                       completion_review=review)
                         found = True
                     tasks.append(task)
                 packages.append(replace(package, tasks=tasks))
@@ -300,6 +384,70 @@ class OpenSpecArtifactStore(ArtifactStore):
             ) from exc
         return updated
 
+    async def object_by_id(self, object_id: str) -> tuple[str, OpenSpecChange, Any]:
+        target = object_id.strip().upper()
+        catalog = await self._load_catalog(required=True)
+        for value in catalog.get("changes", []):
+            change = OpenSpecChange.from_dict(value)
+            if change.epic and change.epic.id.upper() == target:
+                return "epic", change, change.epic
+            for package in change.work_packages:
+                if package.id.upper() == target:
+                    return "work_package", change, package
+                for task in package.tasks:
+                    if task.id.upper() == target:
+                        return "task", change, task
+        raise ArtifactSelectionError(f"unknown OpenSpec object ID: {object_id}")
+
+    async def update_change(self, change: OpenSpecChange) -> OpenSpecChange:
+        catalog = await self._load_catalog(required=True)
+        changes = [OpenSpecChange.from_dict(value) for value in catalog.get("changes", [])]
+        if not any(item.id == change.id for item in changes):
+            raise ArtifactSelectionError(f"unknown OpenSpec change: {change.id}")
+        changes = [change if item.id == change.id else item for item in changes]
+        catalog["version"] = 2
+        catalog["changes"] = [item.to_dict() for item in changes]
+        try:
+            await self._write_change(change)
+            await self._client.create_file(
+                DASHBOARD_PATH, render_dashboard(changes), overwrite=True)
+            await self._client.create_file(
+                CATALOG_PATH, json.dumps(catalog, indent=2, ensure_ascii=False) + "\n",
+                overwrite=True)
+        except JetBrainsMcpError as exc:
+            raise ArtifactStoreError(
+                f"could not update {change.id} through JetBrains MCP: {exc}"
+            ) from exc
+        return change
+
+    async def package_for_task(self, task_id: str):
+        catalog = await self._load_catalog(required=True)
+        for value in catalog.get("changes", []):
+            change = OpenSpecChange.from_dict(value)
+            for package in change.work_packages:
+                if any(task.id == task_id for task in package.tasks):
+                    return change, package
+        raise ArtifactSelectionError(f"unknown task ID: {task_id}")
+
+    async def record_work_package_review(self, package_id: str, review,
+                                         completed: bool) -> OpenSpecChange:
+        kind, change, target = await self.object_by_id(package_id)
+        if kind != "work_package":
+            raise ArtifactSelectionError(f"{package_id} is not a work package")
+        packages = []
+        for package in change.work_packages:
+            if package.id != package_id:
+                packages.append(package)
+                continue
+            tasks = [replace(task, completed=True, status="completed")
+                     for task in package.tasks] if completed else package.tasks
+            packages.append(replace(
+                package, tasks=tasks, review=review,
+                status="completed" if completed else (
+                    "blocked" if review.outcome == "BLOCK" else "unverified"),
+            ))
+        return await self.update_change(replace(change, work_packages=packages))
+
     async def _load_catalog(self, required: bool = False) -> dict:
         try:
             lookup_indeterminate = False
@@ -320,7 +468,7 @@ class OpenSpecArtifactStore(ArtifactStore):
                         "the request may be attached to a different target project"
                     )
                 return {
-                    "version": 1,
+                    "version": 2,
                     "next_change": 1,
                     "next_work_package": 1,
                     "changes": [],
@@ -335,7 +483,7 @@ class OpenSpecArtifactStore(ArtifactStore):
                             f"{CATALOG_PATH} was not found when the current IDE MCP bridge attempted to read it"
                         ) from exc
                     return {
-                        "version": 1,
+                        "version": 2,
                         "next_change": 1,
                         "next_work_package": 1,
                         "changes": [],
@@ -348,7 +496,7 @@ class OpenSpecArtifactStore(ArtifactStore):
             debug(log, "artifact.catalog_json_decoded", path=CATALOG_PATH, catalog=payload)
             if (
                     not isinstance(payload, dict)
-                    or payload.get("version") != 1
+                    or payload.get("version") not in {1, 2}
                     or not isinstance(payload.get("changes"), list)
             ):
                 # ##DELETE AFTER CORRECTION## Keep schema failures distinct from JSON parsing.

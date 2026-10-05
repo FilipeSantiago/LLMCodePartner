@@ -23,7 +23,8 @@ def safe_request_structure(request: ChatCompletionRequest) -> dict:
     if last and last.role == "user" and last.content:
         token = last.content.lstrip().split(maxsplit=1)[0].lower()
         command = token if token in {
-            "/spec", "/update", "/run", "/implement", "/execute", "/review", "/rework",
+            "/spec", "/explain", "/refine", "/apply", "/update", "/run",
+            "/implement", "/execute", "/review", "/rework",
         } else "ordinary"
     has_results = any(message.role == "tool" and message.tool_call_id for message in request.messages)
     has_calls = any(message.tool_calls for message in request.messages)

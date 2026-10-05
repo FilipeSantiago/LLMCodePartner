@@ -2,8 +2,10 @@
 
 import json
 import os
+import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -22,27 +24,39 @@ from agent.spec.bridge_client import BridgeMcpFileClient
 from agent.spec.command import (
     SpecCommandError,
     SpecCommandHandler,
+    extract_object_id,
     extract_help_response,
     extract_scoped_request,
     extract_spec_request,
     extract_update_request,
     is_spec_command,
+    is_explain_command,
     is_update_command,
 )
 from agent.spec.jetbrains_mcp import JetBrainsMcpClient, JetBrainsMcpError
 from agent.spec.models import (
     Capability,
+    CompletionReview,
     Decision,
     Design,
+    ModelIdentity,
     OpenSpecChange,
     Proposal,
     Requirement,
     Scenario,
     Task,
+    ValidationContract,
     WorkPackage,
 )
-from agent.spec.openspec_adapter import CliOpenSpecAdapter, OpenSpecAdapter, OpenSpecError
+from agent.spec.openspec_adapter import (
+    CliOpenSpecAdapter, MalformedJsonError, OpenSpecAdapter, OpenSpecError,
+)
+from agent.routing.persistence import RoutingPersistence
+from agent.spec.command import help_text, is_discard_command
+from agent.spec.modes import DEFAULT_MODEL, request_shape, route_message, split_scope
+from agent.spec.refinement import RefinementError, RefinementService
 from api import dialog_controller
+from api.model_controller import list_models
 from model.chat import ChatCompletionRequest, ChatMessage
 
 
@@ -259,6 +273,70 @@ class CommandParsing(unittest.TestCase):
 
 
 class ArtifactSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_created_change_has_explicit_epic_and_validation_contract(self):
+        client = FakeMcpClient()
+        store = OpenSpecArtifactStore(client)
+        planned = draft()
+        planned = replace(
+            planned,
+            work_packages=[replace(
+                planned.work_packages[0],
+                validation=ValidationContract(
+                    required=["Exercise the authentication path."],
+                    preferred=["Run relevant existing tests."],
+                    optional=["Run broader regression tests."],
+                    not_required=["Run the entire repository suite."],
+                ),
+            )],
+        )
+        created = await store.create_change(planned, "authentication")
+        self.assertEqual(created.epic.id, "EPIC1")
+        self.assertEqual(created.epic.work_package_ids, ["WP1"])
+        self.assertEqual(
+            created.work_packages[0].validation.required,
+            ["Exercise the authentication path."],
+        )
+
+    async def test_explain_is_read_only(self):
+        client = FakeMcpClient()
+        store = OpenSpecArtifactStore(client)
+        await store.create_change(draft(), "authentication")
+        writes_before = list(client.writes)
+        handler = SpecCommandHandler(FakeAdapter(), store)
+        result = await handler.handle([{"role": "user", "content": "/explain WP1"}])
+        self.assertIn("WP1 — Credential validation", result.content)
+        self.assertIn("Review boundary", result.content)
+        self.assertEqual(client.writes, writes_before)
+
+    def test_object_command_parsing(self):
+        self.assertTrue(is_explain_command("/explain EPIC1"))
+        self.assertEqual(extract_object_id("/explain epic 3", "explain"), "EPIC3")
+        self.assertEqual(extract_object_id("/refine WP2-T4", "refine"), "WP2-T4")
+
+    async def test_reconciliation_preserves_ids_and_history(self):
+        store = OpenSpecArtifactStore(FakeMcpClient())
+        canonical = await store.create_change(
+            replace(draft(), work_packages=[draft().work_packages[0]]), "authentication")
+        package = canonical.work_packages[0]
+        first = replace(package.tasks[0], completed=True, status="completed")
+        canonical = replace(
+            canonical,
+            work_packages=[replace(package, tasks=[first, package.tasks[1]])],
+        )
+        changed = replace(first, description="Use a provider-neutral credential boundary.")
+        new_task = replace(first, id="", title="Wire credential boundary", completed=False,
+                           status="pending", completion_review=None)
+        proposed = replace(
+            canonical,
+            work_packages=[replace(package, tasks=[changed, new_task])],
+        )
+        reconciled = RefinementService._reconcile(canonical, proposed)
+        tasks = {task.id: task for task in reconciled.work_packages[0].tasks}
+        self.assertEqual(tasks["WP1-T1"].status, "needs_reexecution")
+        self.assertEqual(tasks["WP1-T2"].status, "cancelled")
+        self.assertIn("WP1-T3", tasks)
+        self.assertEqual(tasks["WP1-T3"].status, "pending")
+
     async def test_work_package_selection_skips_completed_tasks_and_completion_rewrites_artifacts(self):
         client = FakeMcpClient()
         store = OpenSpecArtifactStore(client)
@@ -266,10 +344,49 @@ class ArtifactSelectionTests(unittest.IsolatedAsyncioTestCase):
         selected = await store.tasks_for_selectors(["WP1", "WP1-T2"])
         self.assertEqual([task.id for _, task in selected], ["WP1-T1", "WP1-T2"])
 
-        await store.mark_task_completed("WP1-T1")
+        review = CompletionReview(
+            coder=ModelIdentity("claude-opus", "claude", "opus", None, "Claude Opus"),
+            reviewer=ModelIdentity("codex-sol-high", "codex", "gpt-6.1-sol", "high",
+                                   "Codex GPT-6.1 Sol (high effort)"),
+            reason="The implementation meets the requested interface.",
+            evidence=["Reviewed the implementation and tests."],
+        )
+        await store.mark_task_completed("WP1-T1", review)
         selected_after_completion = await store.tasks_for_selectors(["WP1"])
         self.assertEqual([task.id for _, task in selected_after_completion], ["WP1-T2"])
         self.assertIn("- [x] WP1-T1", client.files[f"{change.path}/tasks.md"])
+        self.assertIn("Coded by: Claude Opus", client.files[f"{change.path}/tasks.md"])
+        self.assertIn("Reviewed by: Codex GPT-6.1 Sol (high effort)",
+                      client.files[f"{change.path}/tasks.md"])
+        self.assertIn("Review decision: Approved — The implementation meets the requested interface.",
+                      client.files[f"{change.path}/tasks.md"])
+        self.assertIn("Coded by Claude Opus; reviewed by Codex GPT-6.1 Sol (high effort)",
+                      client.files[DASHBOARD_PATH])
+        catalog = json.loads(client.files[CATALOG_PATH])
+        self.assertEqual(catalog["changes"][0]["work_packages"][0]["tasks"][0]
+                         ["completion_review"]["reviewer"]["route_name"], "codex-sol-high")
+        selected_change = await store.change_for_tasks(["WP1-T1"])
+        await store.replace_tasks(selected_change, {})
+        self.assertIn("Coded by: Claude Opus", client.files[f"{change.path}/tasks.md"])
+        original_task = selected_change.work_packages[0].tasks[0]
+        refinement = json.dumps([{
+            "id": original_task.id,
+            "title": "Refined title",
+            "description": original_task.description,
+            "acceptance_criteria": original_task.acceptance_criteria or [original_task.description],
+            "complexity": original_task.complexity,
+            "reasoning": original_task.reasoning,
+            "context": original_task.context,
+            "preferred_capability": original_task.preferred_capability,
+        }])
+        refined = CliOpenSpecAdapter._parse_refined_tasks(
+            refinement, {original_task.id: original_task})
+        self.assertEqual(refined[original_task.id].completion_review, review)
+        adapter = CliOpenSpecAdapter()
+        with mock.patch.object(adapter, "_complete", new=mock.AsyncMock(return_value=refinement)):
+            updated_tasks = await adapter.refine_tasks(
+                selected_change, [original_task.id], "Refine the title")
+        self.assertEqual(updated_tasks[original_task.id].completion_review, review)
 
 
 class JetBrainsClient(unittest.IsolatedAsyncioTestCase):
@@ -509,6 +626,9 @@ class AdapterValidation(unittest.IsolatedAsyncioTestCase):
                 "tasks": [{
                     "title": "Add validation",
                     "description": "Validate submitted credentials.",
+                    "acceptance_criteria": [
+                        "The existing validation path and its dependencies are identified."
+                    ],
                     "complexity": "simple",
                     "reasoning": "The behavior is focused.",
                     "context": "",
@@ -568,6 +688,7 @@ class AdapterValidation(unittest.IsolatedAsyncioTestCase):
             "id": "WP1-T1",
             "title": "Refined validation",
             "description": "Use the revised validation flow.",
+            "acceptance_criteria": ["The revised validation flow is implemented."],
             "complexity": "medium",
             "reasoning": "The revision crosses boundaries.",
             "context": "",
@@ -577,10 +698,49 @@ class AdapterValidation(unittest.IsolatedAsyncioTestCase):
         result = await adapter.refine_tasks(assigned, ["WP1-T1"], "revise validation")
         self.assertEqual(list(result), ["WP1-T1"])
         self.assertEqual(result["WP1-T1"].title, "Refined validation")
+        self.assertEqual(
+            result["WP1-T1"].acceptance_criteria,
+            ["The revised validation flow is implemented."],
+        )
         self.assertTrue(result["WP1-T1"].completed)
 
 
 class HandlerAndController(unittest.IsolatedAsyncioTestCase):
+    def test_implementation_review_actions_and_legacy_aliases_route_consistently(self):
+        cases = {
+            "accept": ("accept", ""),
+            "accept anyway: prototype": ("accept", "prototype"),
+            "undo": ("undo", ""),
+            "undo code": ("undo", ""),
+            "submit to coder again: add coverage": ("submit_again", "add coverage"),
+            "try coder again: preserve API": ("submit_again", "preserve API"),
+        }
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(
+                    dialog_controller._implementation_resolution(command), expected)
+        self.assertIsNone(dialog_controller._implementation_resolution("accept this plan"))
+
+    def test_recovery_command_requires_an_explicit_nonempty_prompt(self):
+        self.assertEqual(
+            dialog_controller._implementation_recovery(
+                "establish new baseline: repair named originals and run tests"),
+            "repair named originals and run tests")
+        self.assertIsNone(
+            dialog_controller._implementation_recovery("establish new baseline:"))
+        self.assertIsNone(dialog_controller._implementation_recovery("retry review"))
+        self.assertEqual(
+            dialog_controller._implementation_recovery_action("inspect recovery"),
+            ("inspect_recovery", ""))
+        self.assertEqual(
+            dialog_controller._implementation_recovery_action(
+                "stop and repair manually"),
+            ("stop_recovery", ""))
+        self.assertEqual(
+            dialog_controller._implementation_recovery_action(
+                "establish new baseline: repair originals"),
+            ("establish_baseline", "repair originals"))
+
     async def test_default_artifact_store_refuses_unbridged_target_project_access(self):
         store = OpenSpecArtifactStore()
         self.assertIsInstance(store._client, BridgeRequiredMcpClient)
@@ -706,6 +866,153 @@ class HandlerAndController(unittest.IsolatedAsyncioTestCase):
                 )
             )
         self.assertEqual(response.choices[0].message.content, "normal response")
+
+
+class ModeAdapter(FakeAdapter):
+    async def refine_change(self, change: OpenSpecChange, target_id: str,
+                            instruction: str) -> OpenSpecChange:
+        self.refined.append((target_id, instruction))
+        return replace(change, title=f"{change.title} ({instruction})")
+
+
+class ModeRouting(unittest.TestCase):
+    def route(self, model, *contents):
+        roles = ["user", "assistant"]
+        messages = [{"role": roles[index % 2], "content": content}
+                    for index, content in enumerate(contents)]
+        return route_message(model, messages)
+
+    def test_default_and_unknown_models_have_no_mode(self):
+        self.assertIsNone(self.route(DEFAULT_MODEL, "WP1: hello"))
+        self.assertIsNone(self.route("test", "WP1: hello"))
+
+    def test_slash_commands_bypass_the_mode(self):
+        self.assertIsNone(self.route("codepartner-review", "/explain EPIC1"))
+        self.assertIsNone(self.route("codepartner-spec", "/apply"))
+
+    def test_review_mode_uses_and_reuses_scope(self):
+        self.assertEqual(self.route("codepartner-review", "wp1, WP2-T1: are tests missing?").content,
+                         "/review wp1 WP2-T1: are tests missing?")
+        self.assertEqual(self.route("codepartner-review", "WP3 check naming").content,
+                         "/review WP3: check naming")
+        self.assertEqual(self.route("codepartner-review", "WP1-T2").content, "/review WP1-T2")
+        sticky = self.route("codepartner-review", "WP1: first", "answer", "what about errors?")
+        self.assertEqual(sticky.content, "/review WP1: what about errors?")
+        sticky = self.route("codepartner-review", "/review WP4", "answer", "and tests?")
+        self.assertEqual(sticky.content, "/review WP4: and tests?")
+        self.assertIn("needs a scope", self.route("codepartner-review", "anything wrong?").reply)
+
+    def test_review_parses_rewritten_command(self):
+        command = self.route("codepartner-review", "wp1 WP2-T1: why?").content
+        self.assertEqual(extract_scoped_request(command, "review"), (["WP1", "WP2-T1"], "why?"))
+
+    def test_implement_mode_requires_scope_in_each_message(self):
+        self.assertEqual(self.route("codepartner-implement", "WP1-T1: add tests").content,
+                         "/implement WP1-T1: add tests")
+        self.assertIn("Nothing was executed",
+                      self.route("codepartner-implement", "WP1", "done", "now add logging").reply)
+        self.assertIsNone(split_scope("WP1x: nope"))
+
+    def test_spec_mode_drafts_plain_messages(self):
+        self.assertEqual(self.route("codepartner-spec", "add authentication").draft_request,
+                         "add authentication")
+
+    def test_help_and_model_list_advertise_modes(self):
+        self.assertIn("codepartner-review", help_text())
+        ids = [model.id for model in list_models().data]
+        self.assertEqual(ids[0], DEFAULT_MODEL)
+        self.assertIn("codepartner-spec", ids)
+        self.assertTrue(is_discard_command(" /discard "))
+
+
+class SpecModeDrafts(unittest.IsolatedAsyncioTestCase):
+    async def test_draft_is_saved_only_on_apply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeMcpClient()
+            adapter = ModeAdapter()
+            service = RefinementService(
+                OpenSpecArtifactStore(client), adapter,
+                RoutingPersistence(Path(directory) / "routing.sqlite3"))
+            created = await service.start_draft("conv", "add authentication")
+            self.assertIn("not saved", created)
+            self.assertIn("WP1-T1", created)
+            self.assertEqual(client.files, {})
+            updated = await service.update("conv", "use tokens")
+            self.assertIn("Add Authentication (use tokens)", updated)
+            self.assertEqual(adapter.refined[0][1], "use tokens")
+            self.assertEqual(client.files, {})
+            applied = await service.apply("conv")
+            self.assertIn("Created CHG1", applied)
+            self.assertNotEqual(client.files, {})
+            with self.assertRaises(RefinementError):
+                await service.apply("conv")
+
+    async def test_discard_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeMcpClient()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            service = RefinementService(OpenSpecArtifactStore(client), ModeAdapter(), persistence)
+            await service.start_draft("conv", "add authentication")
+            self.assertIn("new change", await service.discard("conv"))
+            self.assertIsNone(await persistence.active_refinement("conv"))
+            self.assertEqual(client.files, {})
+
+    async def test_implement_mode_without_scope_replies_with_hint(self):
+        response = await dialog_controller.chat_completions(ChatCompletionRequest(
+            model="codepartner-implement",
+            messages=[ChatMessage(role="user", content="make it faster")],
+        ))
+        self.assertIn("needs an explicit scope", response.choices[0].message.content)
+
+
+class JsonReplyTolerance(unittest.IsolatedAsyncioTestCase):
+    def test_fenced_and_prefixed_objects_parse(self):
+        value = {"title": "x"}
+        for reply in ('```json\n{"title": "x"}\n```', 'Here is the change:\n{"title": "x"}\nDone.',
+                      '  {"title": "x"}  '):
+            self.assertEqual(CliOpenSpecAdapter._json_object(reply, "change"), value)
+        self.assertEqual(CliOpenSpecAdapter._extract_json('```\n[1, 2]\n```', "["), "[1, 2]")
+
+    def test_empty_or_prose_reply_is_malformed(self):
+        for reply in ("", "I could not produce a plan."):
+            with self.assertRaises(MalformedJsonError):
+                CliOpenSpecAdapter._json_object(reply, "change")
+
+    async def test_malformed_reply_is_retried_once_with_json_only_reminder(self):
+        adapter = CliOpenSpecAdapter()
+        complete = mock.AsyncMock(side_effect=["Sure! Planning now.", '{"title": "x"}'])
+        with mock.patch.object(adapter, "_complete", new=complete):
+            result = await adapter._complete_json(
+                "req", "system", "change generation",
+                lambda text: adapter._json_object(text, "change"))
+        self.assertEqual(result, {"title": "x"})
+        self.assertEqual(complete.await_count, 2)
+        self.assertIn("not bare JSON", complete.await_args_list[1].args[1])
+
+    async def test_second_malformed_reply_reports_what_was_received(self):
+        adapter = CliOpenSpecAdapter()
+        complete = mock.AsyncMock(return_value="No JSON here")
+        with mock.patch.object(adapter, "_complete", new=complete):
+            with self.assertRaisesRegex(MalformedJsonError, "after a retry .*No JSON here"):
+                await adapter._complete_json(
+                    "req", "system", "change generation",
+                    lambda text: adapter._json_object(text, "change"))
+        self.assertEqual(complete.await_count, 2)
+
+    async def test_schema_errors_are_not_retried(self):
+        adapter = CliOpenSpecAdapter()
+        complete = mock.AsyncMock(return_value='{"unexpected": true}')
+        with mock.patch.object(adapter, "_complete", new=complete):
+            with self.assertRaises(OpenSpecError) as raised:
+                await adapter._complete_json("req", "system", "change generation",
+                                             adapter._parse_change)
+        self.assertNotIsInstance(raised.exception, MalformedJsonError)
+        self.assertEqual(complete.await_count, 1)
+
+    def test_request_shape_reports_structure_lines(self):
+        shape = request_shape("add password reset\n\n<attachments>\nfile.py\n</attachments>")
+        self.assertEqual(shape["lines"], 5)
+        self.assertEqual([number for number, _ in shape["markers"]], [3, 5])
 
 
 if __name__ == "__main__":
