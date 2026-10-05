@@ -1,6 +1,8 @@
 """Dependency-free unit tests for OpenSpec task routing and audit persistence."""
 
 import asyncio
+import json
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -14,7 +16,10 @@ from agent.routing.executors.registry import ExecutorRegistry
 from agent.routing.implementation import ImplementationService
 from agent.routing.models import ModelRef
 from agent.routing.persistence import RoutingPersistence
-from agent.routing.review import ReviewDecision, ReviewError, ReviewService
+from agent.routing.review import (ReviewDecision, ReviewError, ReviewFinding,
+                                  ReviewFormatError, ReviewService, _artifact_candidates,
+                                  _candidate_paths)
+from agent.routing.rollback import RollbackJournal, journal_handlers
 from agent.routing.semantic_router import SemanticRouterError
 from agent.routing.service import ModelRoutingService
 from agent.routing.task_execution import TaskExecutionService
@@ -97,6 +102,28 @@ class ExecutorDispatchTests(unittest.TestCase):
 
 
 class PersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_verification_evidence_is_scoped_to_current_revision_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            with store._database() as db:
+                db.execute("""INSERT INTO implementation_jobs
+                  (job_id, selectors_json, instruction, status, created_at, updated_at)
+                  VALUES ('job', '[]', '', 'running', 1, 1)""")
+                db.execute("""INSERT INTO implementation_job_tasks
+                  (job_id, position, change_id, task_id, status)
+                  VALUES ('job', 0, 'CHG', 'WP1-T1', 'running')""")
+            first = await store.reserve_evidence(
+                "job", 0, "verification", "execute_tool", {"command": "pytest"}, True)
+            await store.complete_evidence(first, "/tmp/first", "hash-0", "1 passed")
+            self.assertEqual(len(await store.verification_evidence("job", 0)), 1)
+            self.assertTrue(await store.consume_revision("job", 0))
+            self.assertEqual(await store.verification_evidence("job", 0), [])
+            second = await store.reserve_evidence(
+                "job", 0, "verification", "execute_tool", {"command": "pytest"}, True)
+            await store.complete_evidence(second, "/tmp/second", "hash-1", "2 passed")
+            current = await store.verification_evidence("job", 0)
+            self.assertEqual([item["evidence_id"] for item in current], [second])
+
     async def test_records_recommendation_and_actual_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "routing.sqlite3"
@@ -150,6 +177,14 @@ class ExecutionFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[0]["content"], "system")
         self.assertIn("Implement OpenSpec task WP1-T1", messages[-1]["content"])
         self.assertIn("Keep the tracking URI injectable", messages[-1]["content"])
+        self.assertIn('"schema_version":1', messages[-1]["content"])
+        self.assertIn('"changed_files"', messages[-1]["content"])
+        self.assertIn('"execution_dispute":null', messages[-1]["content"])
+        self.assertIn("numeric IDs actually issued", messages[-1]["content"])
+        self.assertIn("does not replace the mutation journal", messages[-1]["content"])
+        self.assertIn("Do not create summary", messages[-1]["content"])
+        self.assertIn("project-native environment", messages[-1]["content"])
+        self.assertIn(".venv/bin/python -m pytest", messages[-1]["content"])
         self.assertNotIn("/run", messages[-1]["content"])
 
     async def test_pre_output_executor_failure_tries_same_tier_candidate(self):
@@ -222,6 +257,7 @@ class _Artifacts:
         }
         self.change = type("Change", (), {"id": "CHG1"})()
         self.completed = []
+        self.reviews = []
 
     async def tasks_for_selectors(self, selectors):
         result = []
@@ -235,8 +271,9 @@ class _Artifacts:
     async def task_by_id(self, task_id):
         return self.change, self.tasks[task_id]
 
-    async def mark_task_completed(self, task_id):
+    async def mark_task_completed(self, task_id, review):
         self.completed.append(task_id)
+        self.reviews.append(review)
 
 
 class _TaskExecution:
@@ -255,7 +292,16 @@ class _TaskExecution:
 
 
 class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_review_can_complete_without_a_mutation_event(self):
+    def test_revision_prompt_requires_direct_artifact_edits_and_real_verification(self):
+        finding = ReviewFinding(
+            "implementation", "Counts conflict", "Correct the named reports",
+            ("Counts agree",), ("REPORT.md",))
+        prompt = ImplementationService._revision_context("WP1-T1", (finding,))
+        self.assertIn("Edit every reviewer-named artifact_path directly", prompt)
+        self.assertIn("Do not create substitute reports", prompt)
+        self.assertIn("Never claim an unexecuted check passed", prompt)
+
+    async def test_work_package_runs_all_tasks_before_one_review(self):
         with tempfile.TemporaryDirectory() as directory:
             artifacts = _Artifacts()
             execution = _TaskExecution()
@@ -263,7 +309,7 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
             async def actual_model(_decision_id):
                 return "claude-haiku"
             persistence.actual_model_for = actual_model
-            reviewer = _Reviewer(["done", "done"])
+            reviewer = _Reviewer(["done"])
             service = ImplementationService(artifacts, execution, persistence, reviewer)
             job = await service.create_job(["WP1", "WP1-T2"], "Add traceability")
             events = [event async for event in service.start(
@@ -272,8 +318,10 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(execution.started, [("WP1-T1", "CHG1"), ("WP1-T2", "CHG1")])
             self.assertEqual(execution.instructions, ["Add traceability"] * 2)
             self.assertEqual(artifacts.completed, ["WP1-T1", "WP1-T2"])
-            self.assertEqual(reviewer.reports, ["Task result with supporting evidence."] * 2)
-            self.assertTrue(any("completed after review" in event.text
+            self.assertEqual(len(reviewer.reports), 1)
+            self.assertIn("Task WP1-T1 coder handoff", reviewer.reports[0])
+            self.assertIn("Task WP1-T2 coder handoff", reviewer.reports[0])
+            self.assertTrue(any("WP1 — PASS" in event.text
                                 for event in events if isinstance(event, TextEvent)))
             db = sqlite3.connect(persistence.path)
             try:
@@ -284,7 +332,39 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
                 db.close()
             self.assertEqual(row, ("completed", "Add traceability"))
 
-    async def test_research_task_waits_for_user_confirmation(self):
+    async def test_work_package_review_failure_is_unverified_not_coder_failure(self):
+        class UnavailableReviewer:
+            def __init__(self):
+                self.calls = 0
+
+            async def review(self, *args):
+                self.calls += 1
+                raise ReviewError("required service is unavailable", "codex-sol-medium")
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def actual_model(_decision_id):
+                return "claude-haiku"
+
+            persistence.actual_model_for = actual_model
+            reviewer = UnavailableReviewer()
+            service = ImplementationService(artifacts, execution, persistence, reviewer)
+            job = await service.create_job(["WP1"])
+            events = [event async for event in service.start(job, [], [])]
+            self.assertEqual(execution.started,
+                             [("WP1-T1", "CHG1"), ("WP1-T2", "CHG1")])
+            self.assertEqual(reviewer.calls, 1)
+            self.assertTrue(any("WP1 — UNVERIFIED" in event.text
+                                for event in events if isinstance(event, TextEvent)))
+            self.assertEqual(
+                (await persistence.implementation_task(job.job_id, 1)).status,
+                "review_pending",
+            )
+
+    async def test_research_task_uses_review_resolution_interaction(self):
         with tempfile.TemporaryDirectory() as directory:
             artifacts = _Artifacts()
             artifacts.tasks["WP1-T1"] = replace(artifacts.tasks["WP1-T1"],
@@ -301,10 +381,46 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(artifacts.completed, [])
             self.assertTrue(any("Do you consider" in event.text
                                 for event in events if isinstance(event, TextEvent)))
-            self.assertEqual((await persistence.pending_confirmation("conv-test"))[0], job.job_id)
-            events = [event async for event in service.confirm(job.job_id, 0, True, "yes", [], [])]
+            decision_index = next(i for i, event in enumerate(events)
+                                  if isinstance(event, TextEvent) and "Reviewer decision:" in event.text)
+            question_index = next(i for i, event in enumerate(events)
+                                  if isinstance(event, TextEvent) and "Reviewer question:" in event.text)
+            self.assertLess(decision_index, question_index)
+            self.assertEqual((await persistence.pending_resolution("conv-test"))[0], job.job_id)
+            events = [event async for event in service.accept_anyway(
+                job.job_id, 0, [], [], "", {})]
             self.assertEqual(artifacts.completed, ["WP1-T1"])
+            self.assertEqual(artifacts.reviews[0].reason, "Reviewed task result")
+            self.assertEqual(artifacts.reviews[0].evidence, ["Inspected task result"])
             self.assertTrue(any("completed" in event.text for event in events if isinstance(event, TextEvent)))
+
+    async def test_submit_again_recodes_and_starts_fresh_review_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            artifacts.tasks["WP1-T1"] = replace(artifacts.tasks["WP1-T1"],
+                                                 preferred_capability="research")
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            async def actual_model(_decision_id):
+                return "claude-haiku"
+            persistence.actual_model_for = actual_model
+            reviewer = _Reviewer(["ask_user", "ask_user"])
+            service = ImplementationService(artifacts, execution, persistence, reviewer)
+            job = await service.create_job(["WP1-T1"], conversation_id="conv-test")
+            [event async for event in service.start(job, [], [])]
+            self.assertEqual(len(execution.started), 1)
+            self.assertEqual((await persistence.pending_resolution("conv-test"))[0], job.job_id)
+            events = [event async for event in service.retry_coder(
+                job.job_id, 0, [], [], "", {}, "add coverage")]
+            self.assertEqual(len(execution.started), 2)
+            self.assertEqual(await persistence.review_count(job.job_id, 0), 2)
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "awaiting_user_decision")
+            self.assertEqual(await persistence.revision_state(job.job_id, 0), (0, 3))
+            self.assertEqual(reviewer.reports,
+                             ["Task result with supporting evidence."] * 2)
+            self.assertTrue(any("Reviewer decision:" in event.text
+                                for event in events if isinstance(event, TextEvent)))
 
     async def test_unrelated_write_does_not_override_review_gaps(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -314,27 +430,1067 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
             async def actual_model(_decision_id):
                 return "claude-haiku"
             persistence.actual_model_for = actual_model
-            reviewer = _Reviewer(["needs_work"] * 3)
+            reviewer = _Reviewer(["needs_work"] * 4)
             service = ImplementationService(artifacts, execution, persistence, reviewer)
             job = await service.create_job(["WP1-T1"])
             [event async for event in service.start(job, [], [])]
             self.assertEqual(artifacts.completed, [])
-            self.assertEqual(len(execution.started), 3)
+            self.assertEqual(len(execution.started), 4)
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "awaiting_user_decision")
+            latest = await persistence.latest_review(job.job_id, 0)
+            self.assertEqual(latest["details"]["gaps"], ["Requested outcome missing"])
+            self.assertEqual(latest["details"]["feedback"], "Requested outcome missing")
+            self.assertEqual(latest["details"]["findings_schema_version"], 1)
+            self.assertEqual(latest["details"]["findings"][0]["problem"],
+                             "Requested outcome missing")
+            self.assertTrue(latest["details"]["findings"][0]["approval_criteria"])
+
+    async def test_revision_records_final_models_and_chat_explanation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            async def actual_model(_decision_id):
+                return "claude-haiku"
+            persistence.actual_model_for = actual_model
+            reviewer = _Reviewer(["needs_work", "done"])
+            service = ImplementationService(artifacts, execution, persistence, reviewer)
+            job = await service.create_job(["WP1-T1"])
+            events = [event async for event in service.start(job, [], [])]
+            self.assertEqual(len(execution.started), 2)
+            self.assertEqual(len(artifacts.reviews), 0)
+            self.assertEqual(await persistence.review_count(job.job_id, 0), 2)
+            self.assertTrue(any("Implementation findings:" in event.text
+                                and "Requested outcome missing" in event.text
+                                for event in events if isinstance(event, TextEvent)))
+            self.assertTrue(any("approval_criteria" in instruction
+                                and "suggested_task" in instruction
+                                and "advisory" in instruction
+                                for instruction in execution.instructions if instruction))
+            [event async for event in service.accept_anyway(
+                job.job_id, 0, [], [], "", {})]
+            self.assertEqual(len(artifacts.reviews), 1)
+
+    async def test_chat_and_completion_use_models_that_actually_ran(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            async def actual_model(_decision_id):
+                return "codex-sol-high"
+            persistence.actual_model_for = actual_model
+            reviewer = _Reviewer(["done"], reviewer_models=["claude-opus"])
+            service = ImplementationService(artifacts, execution, persistence, reviewer)
+            job = await service.create_job(["WP1-T1"])
+            events = [event async for event in service.start(job, [], [])]
+            [event async for event in service.accept_anyway(
+                job.job_id, 0, [], [], "", {})]
+            self.assertEqual(artifacts.reviews[0].coder.label,
+                             "Codex GPT-6.1 Sol (high effort)")
+            self.assertEqual(artifacts.reviews[0].reviewer.label, "Claude Opus")
+            self.assertTrue(any("Reviewed by: Claude Opus" in event.text
+                                for event in events if isinstance(event, TextEvent)))
+
+    async def test_submit_again_and_accept_use_latest_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            async def actual_model(_decision_id):
+                return "claude-haiku"
+            persistence.actual_model_for = actual_model
+            reviewer = _Reviewer(["ask_user", "ask_user"],
+                                 reviewer_models=["codex-luna-low", "claude-haiku"])
+            service = ImplementationService(artifacts, execution, persistence, reviewer)
+            job = await service.create_job(["WP1-T1"])
+            [event async for event in service.start(job, [], [])]
+            events = [event async for event in service.retry_coder(
+                job.job_id, 0, [], [], "", {}, "add coverage")]
+            self.assertEqual(artifacts.completed, [])
+            self.assertEqual(len(execution.started), 2)
+            self.assertTrue(any("Reviewed by: Claude Haiku" in event.text
+                                for event in events if isinstance(event, TextEvent)))
+            [event async for event in service.accept_anyway(
+                job.job_id, 0, [], [], "", {})]
+            self.assertEqual(artifacts.reviews[0].reviewer.label, "Claude Haiku")
+
+    async def test_review_error_identifies_coder_without_inventing_reviewer(self):
+        class FailingReviewer:
+            async def review(self, *args):
+                raise ReviewError("provider unavailable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            async def actual_model(_decision_id):
+                return "claude-haiku"
+            persistence.actual_model_for = actual_model
+            service = ImplementationService(artifacts, execution, persistence,
+                                            FailingReviewer())
+            job = await service.create_job(["WP1-T1"])
+            events = [event async for event in service.start(job, [], [])]
+            self.assertEqual(artifacts.completed, [])
+            self.assertTrue(any("Coded by: Claude Haiku" in event.text
+                                and "Reviewer: not run" in event.text
+                                for event in events if isinstance(event, TextEvent)))
+
+    async def test_review_error_identifies_reviewer_that_ran_but_could_not_verify(self):
+        class IncompleteReviewer:
+            async def review(self, *args):
+                raise ReviewError("reviewer returned no concrete evidence",
+                                  "codex-sol-medium")
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def actual_model(_decision_id):
+                return "claude-sonnet"
+
+            persistence.actual_model_for = actual_model
+            service = ImplementationService(artifacts, execution, persistence,
+                                            IncompleteReviewer())
+            job = await service.create_job(["WP1-T1"])
+            events = [event async for event in service.start(job, [], [])]
+            self.assertEqual(artifacts.completed, [])
+            self.assertTrue(any(
+                "Reviewer: Codex GPT-6.1 Sol (medium effort) "
+                "(ran, verification incomplete)" in event.text
+                for event in events if isinstance(event, TextEvent)))
+
+    async def test_incomplete_mutation_journal_blocks_review_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def actual_model(_decision_id):
+                return "claude-haiku"
+
+            persistence.actual_model_for = actual_model
+            reviewer = _Reviewer(["done"])
+            service = ImplementationService(artifacts, execution, persistence, reviewer)
+            job = await service.create_job(["WP1-T1"])
+            await persistence.record_resolution_action(
+                job.job_id, 0, "rollback_snapshot_failed", {
+                    "tool": "edit_notebook",
+                    "path": "models/train.ipynb",
+                    "error": "raw read unavailable",
+                })
+            events = [event async for event in service.start(job, [], [])]
+            self.assertEqual(reviewer.reports, [])
+            self.assertEqual(
+                (await persistence.implementation_task(job.job_id, 0)).status,
+                "recovery_required")
+            self.assertIsNone(await persistence.pending_review(None))
+            self.assertTrue(any("Recovery required" in event.text
+                                and "retry review` is unavailable" in event.text
+                                for event in events if isinstance(event, TextEvent)))
+
+    async def test_establishing_recovery_baseline_clears_only_prior_journal_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            service = ImplementationService(_Artifacts(), _TaskExecution(), persistence,
+                                            _Reviewer(["done"]))
+            job = await service.create_job(["WP1-T1"], conversation_id="conv-test")
+            await persistence.update_implementation_task(
+                job.job_id, 0, "recovery_required", error="journal failure")
+            await persistence.record_resolution_action(
+                job.job_id, 0, "rollback_postimage_failed",
+                {"path": "src/uncertain.py", "error": "read failed"})
+            await persistence.record_rollback_file(
+                job.job_id, 0, "src/uncertain.py", True, "before", "hash")
+
+            self.assertIsNotNone(await persistence.pending_recovery("conv-test"))
+            self.assertTrue(await persistence.establish_recovery_baseline(
+                job.job_id, 0, 3, "repair the original report"))
+            self.assertEqual(await persistence.rollback_integrity_issues(job.job_id, 0), [])
+            self.assertEqual(await persistence.rollback_files(job.job_id, 0), [])
+            self.assertEqual(await persistence.revision_state(job.job_id, 0), (0, 3))
+            self.assertEqual(
+                (await persistence.implementation_task(job.job_id, 0)).status, "running")
+
+    async def test_recovery_can_be_inspected_then_stopped_for_manual_repair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            service = ImplementationService(_Artifacts(), _TaskExecution(), persistence,
+                                            _Reviewer(["done"]))
+            job = await service.create_job(["WP1-T1"], conversation_id="conv-test")
+            await persistence.update_implementation_task(
+                job.job_id, 0, "recovery_required", error="journal failure")
+            mutation_id = await persistence.plan_mutation(
+                job.job_id, 0, "apply_patch", "patch", ["src/a.py"])
+            await persistence.advance_mutation(
+                mutation_id, "applied", "postimage", "IDE read failed")
+            await persistence.record_resolution_action(
+                job.job_id, 0, "rollback_postimage_failed",
+                {"path": "src/a.py", "error": "IDE read failed"})
+
+            events = [event async for event in service.inspect_recovery(job.job_id, 0)]
+            audit = "\n".join(event.text for event in events
+                              if isinstance(event, TextEvent))
+            self.assertIn("Mutation lifecycle", audit)
+            self.assertIn("src/a.py", audit)
+            self.assertIn("failure=postimage", audit)
+
+            events = [event async for event in service.stop_recovery(job.job_id, 0)]
+            self.assertTrue(any("No automatic undo" in event.text
+                                for event in events if isinstance(event, TextEvent)))
+            self.assertEqual(
+                (await persistence.implementation_task(job.job_id, 0)).status,
+                "recovery_stopped")
+            self.assertIsNone(await persistence.pending_recovery("conv-test"))
+
+    async def test_failed_current_review_cannot_accept_stale_needs_work_verdict(self):
+        finding = ReviewFinding(
+            "implementation", "First attempt has a defect", "Correct the behavior",
+            ("The corrected behavior is visible in src/trainer.py",),
+            ("src/trainer.py",),
+        )
+
+        class FailsAfterRevision:
+            def __init__(self):
+                self.calls = 0
+
+            async def review(self, *args):
+                self.calls += 1
+                if self.calls == 1:
+                    return ReviewDecision(
+                        "needs_work", "First attempt needs work", "codex-luna-low",
+                        feedback="Correct the behavior", findings=(finding,))
+                raise ReviewError("current revised attempt could not be verified")
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def actual_model(_decision_id):
+                return "claude-haiku"
+
+            persistence.actual_model_for = actual_model
+            service = ImplementationService(
+                artifacts, execution, persistence, FailsAfterRevision())
+            job = await service.create_job(["WP1-T1"], conversation_id="conv-test")
+            [event async for event in service.start(job, [], [])]
+            self.assertEqual(len(execution.started), 2)
+            self.assertEqual(
+                (await persistence.implementation_task(job.job_id, 0)).status,
+                "review_pending")
+            self.assertIsNone(await persistence.pending_resolution("conv-test"))
+            events = [event async for event in service.accept_anyway(
+                job.job_id, 0, [], [], "", {})]
+            self.assertEqual(artifacts.completed, [])
+            self.assertTrue(any(isinstance(event, ErrorEvent) for event in events))
+
+    async def test_verification_findings_do_not_rerun_the_coder(self):
+        finding = ReviewFinding(
+            "verification", "Integration tests could not be read",
+            "Restore IDE MCP read access and retry review",
+            ("The reviewer can inspect tests/test_integration.py",),
+            ("tests/test_integration.py",),
+        )
+
+        class IncompleteReviewer:
+            async def review(self, *args):
+                raise ReviewError("Required evidence was unavailable",
+                                  "codex-sol-medium", (finding,))
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def actual_model(_decision_id):
+                return "claude-sonnet"
+
+            persistence.actual_model_for = actual_model
+            service = ImplementationService(artifacts, execution, persistence,
+                                            IncompleteReviewer())
+            job = await service.create_job(["WP1-T1"])
+            events = [event async for event in service.start(job, [], [])]
+            self.assertEqual(len(execution.started), 1)
+            self.assertEqual(await persistence.review_count(job.job_id, 0), 1)
+            self.assertEqual(await persistence.revision_count(job.job_id, 0), 0)
             self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
                              "review_pending")
+            latest = await persistence.latest_review(job.job_id, 0)
+            self.assertEqual(latest["verdict"], "review_pending")
+            self.assertEqual(latest["details"]["run_status"], "ran_incomplete")
+            self.assertEqual(latest["details"]["findings"][0]["kind"], "verification")
+            self.assertTrue(any("```json" in event.text
+                                and '"problem": "Integration tests could not be read"' in event.text
+                                for event in events if isinstance(event, TextEvent)))
+
+    async def test_coder_owned_verification_finding_starts_revision(self):
+        finding = ReviewFinding(
+            "verification", "No captured pytest execution result is available",
+            "Run the required test module through the mediated runner",
+            ("A successful captured test run is linked to this attempt",),
+            ("tests/test_integration.py",), "coder", "missing_execution",
+        )
+
+        class MissingThenVerified:
+            def __init__(self):
+                self.calls = 0
+
+            async def review(self, *args):
+                self.calls += 1
+                if self.calls == 1:
+                    return ReviewDecision(
+                        "needs_work", "Execution evidence is missing", "codex-sol-medium",
+                        feedback=finding.problem, findings=(finding,))
+                return ReviewDecision(
+                    "done", "Execution is now captured", "codex-sol-medium",
+                    evidence=("Captured run passed",))
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def actual_model(_decision_id):
+                return "claude-sonnet"
+
+            persistence.actual_model_for = actual_model
+            service = ImplementationService(
+                artifacts, execution, persistence, MissingThenVerified())
+            job = await service.create_job(["WP1-T1"])
+            [event async for event in service.start(job, [], [])]
+            self.assertEqual(len(execution.started), 2)
+            self.assertIn("No captured pytest execution result", execution.instructions[1])
+            self.assertIn('"owner": "coder"', execution.instructions[1])
+
+    async def test_unchanged_evidence_service_failure_cannot_retry_review(self):
+        finding = ReviewFinding(
+            "verification", "The required source snapshot is truncated",
+            "Complete the paginated source read",
+            ("The complete source is available",),
+            ("tests/test_large.py",), "evidence_service", "incomplete_snapshot",
+        )
+
+        class IncompleteEvidence:
+            def __init__(self):
+                self.calls = 0
+
+            async def review(self, *args):
+                self.calls += 1
+                raise ReviewError(
+                    "Required evidence remains incomplete", "codex-sol-medium", (finding,))
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def actual_model(_decision_id):
+                return "claude-sonnet"
+
+            persistence.actual_model_for = actual_model
+            reviewer = IncompleteEvidence()
+            service = ImplementationService(artifacts, execution, persistence, reviewer)
+            job = await service.create_job(["WP1-T1"])
+            [event async for event in service.start(job, [], [])]
+            events = [event async for event in service.retry_review(
+                job.job_id, 0, [], [], "", {})]
+            self.assertEqual(reviewer.calls, 1)
+            self.assertTrue(any(
+                isinstance(event, ErrorEvent) and "evidence is unchanged" in event.message
+                for event in events))
+
+    async def test_three_revisions_then_submit_again_starts_fresh_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def actual_model(_decision_id):
+                return "claude-haiku"
+
+            persistence.actual_model_for = actual_model
+            reviewer = _Reviewer(["needs_work"] * 8)
+            service = ImplementationService(artifacts, execution, persistence, reviewer)
+            job = await service.create_job(["WP1-T1"], conversation_id="conv-test")
+            first_events = [event async for event in service.start(job, [], [])]
+            self.assertEqual(len(execution.started), 4)
+            self.assertEqual(await persistence.revision_state(job.job_id, 0), (3, 3))
+            self.assertTrue(any("submit to coder again" in event.text
+                                and "`accept`" in event.text
+                                and "`undo`" in event.text
+                                for event in first_events if isinstance(event, TextEvent)))
+            self.assertEqual((await persistence.pending_resolution("conv-test"))[0],
+                             job.job_id)
+
+            retry_events = [event async for event in service.retry_coder(
+                job.job_id, 0, [], [], "", {}, "Prefer immutable configuration")]
+            self.assertEqual(len(execution.started), 8)
+            self.assertEqual(await persistence.revision_state(job.job_id, 0), (3, 3))
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "awaiting_user_decision")
+            self.assertTrue(any("fresh 3-revision review cycle" in event.text
+                                for event in retry_events if isinstance(event, TextEvent)))
+            self.assertTrue(any("Prefer immutable configuration" in value
+                                for value in execution.instructions if value))
+
+    async def test_accept_anyway_preserves_needs_work_as_user_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def actual_model(_decision_id):
+                return "claude-haiku"
+
+            persistence.actual_model_for = actual_model
+            service = ImplementationService(
+                artifacts, execution, persistence, _Reviewer(["needs_work"] * 4))
+            job = await service.create_job(["WP1-T1"], conversation_id="conv-test")
+            [event async for event in service.start(job, [], [])]
+            events = [event async for event in service.accept_anyway(
+                job.job_id, 0, [], [], "", {}, "Accepted for the prototype")]
+            self.assertEqual(artifacts.completed, ["WP1-T1"])
+            self.assertIn("User override", artifacts.reviews[0].reason)
+            self.assertIn("needs_work", artifacts.reviews[0].reason)
+            self.assertTrue(any("reviewer verdict remains needs_work" in event.text
+                                for event in events if isinstance(event, TextEvent)))
+            db = sqlite3.connect(persistence.path)
+            try:
+                action = db.execute("""SELECT action FROM implementation_resolution_actions
+                  WHERE job_id=? ORDER BY id DESC LIMIT 1""", (job.job_id,)).fetchone()
+            finally:
+                db.close()
+            self.assertEqual(action, ("accept_override",))
+            duplicate = [event async for event in service.accept_anyway(
+                job.job_id, 0, [], [], "", {}, "duplicate")]
+            self.assertEqual(artifacts.completed, ["WP1-T1"])
+            self.assertTrue(any(isinstance(event, ErrorEvent) for event in duplicate))
+
+    async def test_undo_code_stops_job_and_leaves_task_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = _TaskExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def actual_model(_decision_id):
+                return "claude-haiku"
+
+            persistence.actual_model_for = actual_model
+            service = ImplementationService(
+                artifacts, execution, persistence, _Reviewer(["needs_work"] * 4))
+            job = await service.create_job(["WP1-T1"], conversation_id="conv-test")
+            [event async for event in service.start(job, [], [])]
+            events = [event async for event in service.undo_code(
+                job.job_id, 0, [], [], {})]
+            self.assertEqual(artifacts.completed, [])
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "undone")
+            self.assertTrue(any("task remains incomplete" in event.text
+                                for event in events if isinstance(event, TextEvent)))
+            db = sqlite3.connect(persistence.path)
+            try:
+                status = db.execute("SELECT status FROM implementation_jobs WHERE job_id=?",
+                                    (job.job_id,)).fetchone()
+            finally:
+                db.close()
+            self.assertEqual(status, ("undone",))
+
+    def test_findings_render_as_parseable_json(self):
+        finding = ReviewFinding(
+            "implementation", "Factory ignores config", "Honor supplied configuration",
+            ("Configured creation succeeds",), ("trainer/factory.py",),
+        )
+        lines = ImplementationService._findings_json((finding,))
+        self.assertEqual(lines[0], "```json")
+        self.assertEqual(lines[-1], "```")
+        payload = json.loads(lines[1])
+        self.assertEqual(payload[0]["problem"], "Factory ignores config")
+        self.assertEqual(payload[0]["approval_criteria"],
+                         ["Configured creation succeeds"])
+
+
+class RollbackJournalTests(unittest.IsolatedAsyncioTestCase):
+    async def test_communication_only_artifact_is_blocked_unless_task_declares_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            files = {}
+            calls = []
+
+            async def read_file(arguments):
+                path = arguments["file_path"]
+                return f"File {path} doesn't exist or can't be opened"
+
+            async def create_file(arguments):
+                calls.append(arguments["pathInProject"])
+                files[arguments["pathInProject"]] = arguments["text"]
+                return "created"
+
+            specs = [
+                ToolSpec("read_file", "read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "limit": {"type": "integer"}}}),
+                ToolSpec("create_new_file", "create", {"type": "object", "properties": {
+                    "pathInProject": {"type": "string"}, "text": {"type": "string"}},
+                    "required": ["pathInProject", "text"]}),
+            ]
+            handlers = {"read_file": read_file, "create_new_file": create_file}
+            blocked = journal_handlers(
+                persistence, "job", 0, specs, handlers)["create_new_file"]
+            result = await blocked({
+                "pathInProject": "WP2_FINAL_SUMMARY.md", "text": "status complete"})
+            self.assertIn("communication artifacts", result)
+            self.assertEqual(calls, [])
+
+            allowed = journal_handlers(
+                persistence, "other-job", 0, specs, handlers,
+                frozenset({"WP2_FINAL_SUMMARY.md"}))["create_new_file"]
+            self.assertEqual(await allowed({
+                "pathInProject": "WP2_FINAL_SUMMARY.md", "text": "required doc"}),
+                "created")
+            self.assertEqual(calls, ["WP2_FINAL_SUMMARY.md"])
+
+    async def test_ad_hoc_validation_scripts_and_notebooks_are_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            calls = []
+
+            async def read_file(arguments):
+                return f"File {arguments['file_path']} doesn't exist or can't be opened"
+
+            async def create_file(arguments):
+                calls.append(arguments["pathInProject"])
+                return "created"
+
+            specs = [
+                ToolSpec("read_file", "read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "limit": {"type": "integer"}}}),
+                ToolSpec("create_new_file", "create", {"type": "object", "properties": {
+                    "pathInProject": {"type": "string"}, "text": {"type": "string"}},
+                    "required": ["pathInProject", "text"]}),
+            ]
+            wrapped = journal_handlers(
+                persistence, "job", 0, specs,
+                {"read_file": read_file, "create_new_file": create_file})
+            paths = [
+                "wp2_t4_final_validation.py",
+                "verify_wp2_t4_comprehensive.py",
+                "test_wp2_t4_execution.py",
+                "tmp_pytest_runner.ipynb",
+            ]
+            for path in paths:
+                result = await wrapped["create_new_file"]({
+                    "pathInProject": path, "text": "import pytest\npytest.main()"})
+                self.assertIn("evidence workspace", result)
+            generic = await wrapped["create_new_file"]({
+                "pathInProject": "helper.py",
+                "text": "import subprocess\nsubprocess.run(['pytest'])",
+            })
+            self.assertIn("evidence workspace", generic)
+            self.assertEqual(calls, [])
+
+    async def test_explicit_task_artifact_can_use_validation_like_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def read_file(arguments):
+                return f"File {arguments['file_path']} doesn't exist or can't be opened"
+
+            async def create_file(_arguments):
+                return "created"
+
+            specs = [
+                ToolSpec("read_file", "read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "limit": {"type": "integer"}}}),
+                ToolSpec("create_new_file", "create", {"type": "object", "properties": {
+                    "pathInProject": {"type": "string"}, "text": {"type": "string"}},
+                    "required": ["pathInProject", "text"]}),
+            ]
+            wrapped = journal_handlers(
+                persistence, "job", 0, specs,
+                {"read_file": read_file, "create_new_file": create_file},
+                frozenset({"src/input_validation.py"}))
+            result = await wrapped["create_new_file"]({
+                "pathInProject": "src/input_validation.py", "text": "def validate(): pass"})
+            self.assertEqual(result, "created")
+
+    async def test_task_created_helper_is_quarantined_on_later_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            await persistence.record_rollback_file(
+                "job", 0, "verify_feature.py", False, None, "old-hash")
+            calls = []
+
+            async def read_file(_arguments):
+                return "old helper"
+
+            async def replace_file(arguments):
+                calls.append(arguments)
+                return "replaced"
+
+            specs = [
+                ToolSpec("read_file", "read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "limit": {"type": "integer"}}}),
+                ToolSpec("replace_file_text_by_path", "replace", {
+                    "type": "object", "properties": {
+                        "file_path": {"type": "string"}, "text": {"type": "string"}}}),
+            ]
+            wrapped = journal_handlers(
+                persistence, "job", 0, specs,
+                {"read_file": read_file, "replace_file_text_by_path": replace_file})
+            result = await wrapped["replace_file_text_by_path"]({
+                "file_path": "verify_feature.py", "text": "import pytest"})
+            self.assertIn("quarantined", result)
+            self.assertEqual(calls, [])
+
+    async def test_execution_dispute_is_replayed_into_evidence_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def execute_tool(arguments):
+                self.assertIn("pytest", arguments["command"])
+                return "collected 1 item\n1 passed\nexit_code: 0"
+
+            spec = ToolSpec("execute_tool", "dispatch", {
+                "type": "object", "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            })
+            handlers = {"execute_tool": execute_tool}
+            journal = RollbackJournal(persistence, "job", 0, [spec], handlers)
+            report = json.dumps({
+                "schema_version": 1,
+                "execution_dispute": {
+                    "claim": "The target tests pass",
+                    "source_paths": ["tests/test_feature.py"],
+                    "working_directory": ".",
+                    "steps": [{
+                        "tool": "execute_tool",
+                        "arguments": {"command": "execute_terminal_command pytest tests/test_feature.py"},
+                    }],
+                },
+            })
+            service = object.__new__(ImplementationService)
+            with mock.patch.dict(
+                    "os.environ", {"CODEPARTNER_EVIDENCE_DIR": str(Path(directory) / "evidence")}):
+                errors = await service._capture_execution_dispute(
+                    journal, report, handlers, [])
+            self.assertEqual(errors, [])
+            evidence = await persistence.verification_evidence("job", 0)
+            self.assertEqual(len(evidence), 1)
+            self.assertTrue(evidence[0]["success"])
+            self.assertEqual(evidence[0]["metadata"]["pytest"]["totals"]["passed"], 1)
+
+    def test_handoff_evidence_ids_must_resolve_to_captured_records(self):
+        report = json.dumps({
+            "schema_version": 1,
+            "criteria": [{"evidence_ids": ["syntax_valid", 7]}],
+        })
+        errors = ImplementationService._handoff_evidence_errors(
+            report, [{"evidence_id": 7}])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("syntax_valid", errors[0])
+
+    async def test_execution_dispute_cannot_replay_generic_shell_commands(self):
+        service = object.__new__(ImplementationService)
+        handler = mock.AsyncMock(return_value="deleted")
+        report = json.dumps({
+            "schema_version": 1,
+            "execution_dispute": {
+                "claim": "cleanup proves the test passes",
+                "source_paths": ["tests/test_feature.py"],
+                "working_directory": ".",
+                "steps": [{
+                    "tool": "execute_tool",
+                    "arguments": {"command": "execute_terminal_command rm -rf build"},
+                }],
+            },
+        })
+        errors = await service._capture_execution_dispute(
+            mock.AsyncMock(), report, {"execute_tool": handler}, [])
+        self.assertEqual(len(errors), 1)
+        handler.assert_not_awaited()
+
+    async def test_verification_output_is_stored_outside_project_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def execute_tool(_arguments):
+                return "collected 2 items\n2 passed\nexit_code: 0"
+
+            spec = ToolSpec("execute_tool", "dispatch", {
+                "type": "object", "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            })
+            with mock.patch.dict(
+                    "os.environ", {"CODEPARTNER_EVIDENCE_DIR": str(Path(directory) / "evidence")}):
+                wrapped = journal_handlers(
+                    persistence, "job", 0, [spec], {"execute_tool": execute_tool})
+                result = await wrapped["execute_tool"]({
+                    "command": "execute_run_configuration --name tests"})
+            self.assertIn("2 passed", result)
+            evidence = await persistence.verification_evidence("job", 0)
+            self.assertEqual(len(evidence), 1)
+            self.assertTrue(evidence[0]["success"])
+            self.assertEqual(evidence[0]["metadata"]["pytest"]["collected"], 2)
+            self.assertEqual(evidence[0]["metadata"]["pytest"]["totals"]["passed"], 2)
+            self.assertTrue(Path(evidence[0]["payload_path"]).is_file())
+            self.assertEqual(await persistence.mutations("job", 0), [])
+
+    async def test_journal_restores_edited_files_and_deletes_created_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            files = {"src/existing.py": "before"}
+
+            async def read_file(arguments):
+                path = arguments["file_path"]
+                return files.get(path, f"File {path} doesn't exist or can't be opened")
+
+            async def create_file(arguments):
+                files[arguments["pathInProject"]] = arguments["text"]
+                return "created"
+
+            async def replace_file(arguments):
+                files[arguments["file_path"]] = arguments["text"]
+                return "replaced"
+
+            async def delete_file(arguments):
+                files.pop(arguments["file_path"], None)
+                return "deleted"
+
+            specs = [
+                ToolSpec("read_file", "read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "limit": {"type": "integer"}}}),
+                ToolSpec("create_new_file", "create", {"type": "object", "properties": {
+                    "pathInProject": {"type": "string"}, "text": {"type": "string"},
+                    "overwrite": {"type": "boolean"}},
+                    "required": ["pathInProject", "text"]}),
+                ToolSpec("replace_file_text_by_path", "replace", {
+                    "type": "object", "properties": {
+                        "file_path": {"type": "string"}, "text": {"type": "string"}}}),
+                ToolSpec("delete_file", "delete", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}}}),
+            ]
+            handlers = {"read_file": read_file, "create_new_file": create_file,
+                        "replace_file_text_by_path": replace_file,
+                        "delete_file": delete_file}
+            wrapped = journal_handlers(persistence, "job", 0, specs, handlers)
+            await wrapped["replace_file_text_by_path"](
+                {"file_path": "src/existing.py", "text": "after"})
+            await wrapped["create_new_file"](
+                {"pathInProject": "src/new.py", "text": "new", "overwrite": True})
+            self.assertEqual(files, {"src/existing.py": "after", "src/new.py": "new"})
+            mutations = await persistence.mutations("job", 0)
+            self.assertEqual(
+                [(item["operation"], item["stage"], item["targets"])
+                 for item in mutations],
+                [("replace", "postimage_verified", ["src/existing.py"]),
+                 ("create", "postimage_verified", ["src/new.py"])],
+            )
+
+            result = await RollbackJournal(
+                persistence, "job", 0, specs, handlers).restore()
+            self.assertEqual(result, (["src/new.py", "src/existing.py"], []))
+            self.assertEqual(files, {"src/existing.py": "before"})
+
+    async def test_journal_refuses_to_overwrite_later_user_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            files = {"src/existing.py": "before", "src/other.py": "other before"}
+
+            async def read_file(arguments):
+                return files[arguments["file_path"]]
+
+            async def create_file(arguments):
+                files[arguments["pathInProject"]] = arguments["text"]
+                return "created"
+
+            async def replace_file(arguments):
+                files[arguments["file_path"]] = arguments["text"]
+                return "replaced"
+
+            specs = [
+                ToolSpec("read_file", "read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "limit": {"type": "integer"}}}),
+                ToolSpec("create_new_file", "create", {"type": "object", "properties": {
+                    "pathInProject": {"type": "string"}, "text": {"type": "string"}},
+                    "required": ["pathInProject", "text"]}),
+                ToolSpec("replace_file_text_by_path", "replace", {
+                    "type": "object", "properties": {
+                        "file_path": {"type": "string"}, "text": {"type": "string"}}}),
+            ]
+            handlers = {"read_file": read_file, "create_new_file": create_file,
+                        "replace_file_text_by_path": replace_file}
+            wrapped = journal_handlers(persistence, "job", 0, specs, handlers)
+            await wrapped["replace_file_text_by_path"](
+                {"file_path": "src/existing.py", "text": "coder"})
+            await wrapped["replace_file_text_by_path"](
+                {"file_path": "src/other.py", "text": "other coder"})
+            files["src/existing.py"] = "later user edit"
+            result = await RollbackJournal(
+                persistence, "job", 0, specs, handlers).restore()
+            self.assertEqual(result, ([], ["src/existing.py"]))
+            self.assertEqual(files["src/existing.py"], "later user edit")
+            self.assertEqual(files["src/other.py"], "other coder")
+
+    async def test_notebook_mutation_is_journaled_and_restored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            files = {"models/train.ipynb": "before notebook"}
+
+            async def read_file(arguments):
+                return files[arguments["file_path"]]
+
+            async def create_file(arguments):
+                files[arguments["pathInProject"]] = arguments["text"]
+                return "created"
+
+            async def edit_notebook(arguments):
+                files[arguments["file_path"]] = "after notebook"
+                return "edited"
+
+            specs = [
+                ToolSpec("read_file", "read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "limit": {"type": "integer"}}}),
+                ToolSpec("create_new_file", "create", {"type": "object", "properties": {
+                    "pathInProject": {"type": "string"}, "text": {"type": "string"},
+                    "overwrite": {"type": "boolean"}}}),
+                ToolSpec("edit_notebook", "edit", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "new_source": {"type": "string"}}}),
+            ]
+            handlers = {"read_file": read_file, "create_new_file": create_file,
+                        "edit_notebook": edit_notebook}
+            wrapped = journal_handlers(persistence, "job", 0, specs, handlers)
+            await wrapped["edit_notebook"]({
+                "file_path": "models/train.ipynb", "new_source": "changed",
+            })
+            journal = RollbackJournal(persistence, "job", 0, specs, handlers)
+            self.assertEqual(await journal.changed_paths(), ["models/train.ipynb"])
+            self.assertEqual(await journal.restore(), (["models/train.ipynb"], []))
+            self.assertEqual(files["models/train.ipynb"], "before notebook")
+
+    async def test_snapshot_failure_blocks_mutation_before_handler_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            files = {"src/tracked.py": "before", "models/train.ipynb": "before notebook"}
+
+            async def read_file(arguments):
+                path = arguments["file_path"]
+                if path.endswith(".ipynb"):
+                    raise RuntimeError("notebook raw read unavailable")
+                return files[path]
+
+            async def create_file(arguments):
+                files[arguments["pathInProject"]] = arguments["text"]
+                return "created"
+
+            async def replace_file(arguments):
+                files[arguments["file_path"]] = arguments["text"]
+                return "replaced"
+
+            async def edit_notebook(arguments):
+                files[arguments["file_path"]] = "after notebook"
+                return "edited"
+
+            specs = [
+                ToolSpec("read_file", "read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "limit": {"type": "integer"}}}),
+                ToolSpec("create_new_file", "create", {"type": "object", "properties": {
+                    "pathInProject": {"type": "string"}, "text": {"type": "string"}}}),
+                ToolSpec("replace_file_text_by_path", "replace", {
+                    "type": "object", "properties": {
+                        "file_path": {"type": "string"}, "text": {"type": "string"}}}),
+                ToolSpec("edit_notebook", "edit", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "new_source": {"type": "string"}}}),
+            ]
+            handlers = {"read_file": read_file, "create_new_file": create_file,
+                        "replace_file_text_by_path": replace_file,
+                        "edit_notebook": edit_notebook}
+            wrapped = journal_handlers(persistence, "job", 0, specs, handlers)
+            await wrapped["replace_file_text_by_path"](
+                {"file_path": "src/tracked.py", "text": "after"})
+            result = await wrapped["edit_notebook"](
+                {"file_path": "models/train.ipynb", "new_source": "changed"})
+            self.assertTrue(result.startswith("Error: mutation blocked before execution"))
+            self.assertEqual(files["src/tracked.py"], "after")
+            self.assertEqual(files["models/train.ipynb"], "before notebook")
+            self.assertEqual(
+                await RollbackJournal(persistence, "job", 0, specs, handlers).restore(),
+                (["src/tracked.py"], []))
+
+    async def test_apply_patch_input_tracks_multifile_move_and_unified_prefixes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            files = {
+                "src/old.py": "old", "src/a.py": "a", "src/b.py": "b",
+            }
+
+            async def read_file(arguments):
+                path = arguments["file_path"]
+                return files.get(path, f"File {path} doesn't exist or can't be opened")
+
+            async def apply_patch(arguments):
+                files["src/new.py"] = files.pop("src/old.py")
+                files["src/a.py"] = "changed a"
+                files["src/b.py"] = "changed b"
+                return "Done!"
+
+            specs = [
+                ToolSpec("read_file", "read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "limit": {"type": "integer"}}}),
+                ToolSpec("apply_patch", "patch", {"type": "object", "properties": {
+                    "input": {"type": "string"}}}),
+            ]
+            handlers = {"read_file": read_file, "apply_patch": apply_patch}
+            patch = """*** Update File: src/old.py
+*** Move to: src/new.py
+--- a/src/a.py
++++ b/src/a.py
+--- a/src/b.py
++++ b/src/b.py
+"""
+            result = await journal_handlers(
+                persistence, "job", 0, specs, handlers)["apply_patch"]({"input": patch})
+            self.assertEqual(result, "Done!")
+            self.assertCountEqual(
+                await RollbackJournal(persistence, "job", 0, specs, handlers).changed_paths(),
+                ["src/old.py", "src/new.py", "src/a.py", "src/b.py"])
+
+    async def test_unknown_mutation_shape_is_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            called = False
+
+            async def mutate(_arguments):
+                nonlocal called
+                called = True
+                return "changed"
+
+            spec = ToolSpec("replace_file_text_by_path", "replace", {
+                "type": "object", "properties": {"opaque": {"type": "string"}}})
+            result = await journal_handlers(
+                persistence, "job", 0, [spec],
+                {"replace_file_text_by_path": mutate})["replace_file_text_by_path"](
+                    {"opaque": "value"})
+            self.assertFalse(called)
+            self.assertTrue(result.startswith("Error: mutation blocked before execution"))
+            mutation = (await persistence.mutations("job", 0))[0]
+            self.assertEqual(mutation["stage"], "planned")
+            self.assertEqual(mutation["failure_stage"], "target_resolution")
+            self.assertEqual(mutation["targets"], [])
+            self.assertEqual(
+                await RollbackJournal(
+                    persistence, "job", 0, [spec], {}).integrity_issues(), [])
+
+    async def test_postimage_failure_marks_recovery_and_blocks_later_mutations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            files = {"src/a.py": "before"}
+            reads = 0
+            mutations = 0
+
+            async def read_file(arguments):
+                nonlocal reads
+                reads += 1
+                if reads > 1:
+                    return "Error: IDE read failed"
+                return files[arguments["file_path"]]
+
+            async def replace_file(arguments):
+                nonlocal mutations
+                mutations += 1
+                files[arguments["file_path"]] = arguments["text"]
+                return "replaced"
+
+            specs = [
+                ToolSpec("read_file", "read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "limit": {"type": "integer"}}}),
+                ToolSpec("replace_file_text_by_path", "replace", {
+                    "type": "object", "properties": {
+                        "file_path": {"type": "string"}, "text": {"type": "string"}}}),
+            ]
+            handlers = {"read_file": read_file,
+                        "replace_file_text_by_path": replace_file}
+            wrapped = journal_handlers(persistence, "job", 0, specs, handlers)
+            first = await wrapped["replace_file_text_by_path"](
+                {"file_path": "src/a.py", "text": "after"})
+            second = await wrapped["replace_file_text_by_path"](
+                {"file_path": "src/a.py", "text": "again"})
+            self.assertIn("post-image could not be verified", first)
+            self.assertIn("requires journal recovery", second)
+            self.assertEqual(mutations, 1)
+            mutation = (await persistence.mutations("job", 0))[0]
+            self.assertEqual(mutation["stage"], "applied")
+            self.assertEqual(mutation["failure_stage"], "postimage")
+            self.assertEqual(
+                (await RollbackJournal(
+                    persistence, "job", 0, specs, handlers).integrity_issues())[0]["action"],
+                "rollback_postimage_failed")
+
+    async def test_path_arrays_are_snapshotted_before_reformat(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            files = {"src/a.py": "a", "src/b.py": "b"}
+
+            async def read_file(arguments):
+                return files[arguments["file_path"]]
+
+            async def reformat(arguments):
+                for path in arguments["files"]:
+                    files[path] += " formatted"
+                return "formatted"
+
+            specs = [
+                ToolSpec("read_file", "read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "limit": {"type": "integer"}}}),
+                ToolSpec("reformat_file", "format", {"type": "object", "properties": {
+                    "files": {"type": "array", "items": {"type": "string"}}}}),
+            ]
+            handlers = {"read_file": read_file, "reformat_file": reformat}
+            await journal_handlers(persistence, "job", 0, specs, handlers)["reformat_file"](
+                {"files": ["src/a.py", "src/b.py"]})
+            self.assertCountEqual(
+                await RollbackJournal(persistence, "job", 0, specs, handlers).changed_paths(),
+                ["src/a.py", "src/b.py"])
+
+
+class _RecordingReviewer:
+    """Fake reviewer provider: records its prompt, optionally reads one file, returns a verdict."""
+
+    def __init__(self, read_path=None, verdict=None):
+        self.prompt = None
+        self.read_path = read_path
+        self.verdict = verdict
+
+    async def tools(self, messages, specs, **kwargs):
+        self.prompt = messages[0]["content"]
+        if self.read_path:
+            await kwargs["direct_tool_handlers"]["read_file"]({"file_path": self.read_path})
+        if self.verdict:
+            yield TextEvent(json.dumps(self.verdict))
+        yield DoneEvent("endTurn")
 
 
 class _Reviewer:
-    def __init__(self, verdicts):
+    def __init__(self, verdicts, reviewer_models=None):
         self.verdicts = list(verdicts)
+        self.reviewer_models = list(reviewer_models or ["codex-luna-low"] * len(verdicts))
         self.reports = []
 
     async def review(self, change, queued_task, report, coder_model, specs, handlers):
         self.reports.append(report)
         verdict = self.verdicts.pop(0)
-        return ReviewDecision(verdict, "Reviewed task result", "codex-luna-low",
+        return ReviewDecision(verdict, "Reviewed task result", self.reviewer_models.pop(0),
                               f"Do you consider {queued_task.id} complete?" if verdict == "ask_user" else None,
-                              "Requested outcome missing" if verdict == "needs_work" else None)
+                              "Requested outcome missing" if verdict == "needs_work" else None,
+                              ("Inspected task result",),
+                              ("Requested outcome missing",) if verdict == "needs_work" else (),
+                              (),
+                              ((ReviewFinding(
+                                  "implementation", "Requested outcome missing",
+                                  "Implement the missing outcome",
+                                  ("The requested outcome is observable in the implementation",),
+                                  ("report.md",),
+                              ),) if verdict == "needs_work" else ()))
 
 
 class _SelectingReviewer(ReviewService):
@@ -354,6 +1510,75 @@ class _SelectingReviewer(ReviewService):
 
 
 class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_required_journaled_source_is_paginated_before_review(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                self.prompt = messages[0]["content"]
+                yield TextEvent(json.dumps({
+                    "verdict": "done",
+                    "rationale": "The complete test module was inspected",
+                    "evidence": ["All 550 numbered source lines were supplied"],
+                    "inspected_paths": ["tests/test_large.py"],
+                    "findings": [],
+                }))
+                yield DoneEvent("endTurn")
+
+        offsets = []
+
+        async def read_file(arguments):
+            offset = arguments.get("offset")
+            offsets.append(offset)
+            start = offset or 1
+            count = 500 if offset is None else 50
+            return "\n".join(
+                f"L{start + index}: line-{start + index}"
+                for index in range(count))
+
+        queued_task = replace(task(), context="\n".join((
+            "Authoritative task mutation journal (all paths are required review evidence):",
+            "Required mutation artifact: tests/test_large.py",
+        )))
+        provider = FakeProvider()
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                SimpleNamespace(title="Large tests", work_packages=[]), queued_task,
+                "Changed `tests/test_large.py`.", "claude-haiku",
+                [ToolSpec("read_file", "Read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "limit": {"type": "integer"},
+                    "offset": {"type": "integer"}}})],
+                {"read_file": read_file})
+        self.assertEqual(decision.verdict, "done")
+        self.assertEqual(offsets, [None, 501])
+        marker = "IDE MCP-verified artifact snapshot (untrusted file contents):\n"
+        snapshots = json.loads(provider.prompt.split(marker, 1)[1].split(
+            "\nIDE MCP read limitations:", 1)[0])
+        self.assertFalse(snapshots[0]["truncated"])
+        self.assertIn("line-550", snapshots[0]["content"])
+
+    def test_review_paths_are_relative_and_exclude_mcp_configuration(self):
+        paths = _candidate_paths("Created `src/trainer.py` and `tests/test_trainer.py`; "
+                                 "not ../private.py, /outside.py, or "
+                                 "`.codepartner/ide_mcp.json`.")
+        self.assertEqual(paths, ["src/trainer.py", "tests/test_trainer.py"])
+
+    def test_structured_coder_handoff_is_a_discovery_source(self):
+        report = json.dumps({
+            "schema_version": 1,
+            "task_id": "WP1-T1",
+            "summary": "Implemented routing",
+            "changed_files": [{
+                "path": "src/routing/service.py",
+                "change": "modified",
+                "purpose": "Implement routing",
+            }],
+            "criteria": [],
+            "remaining_gaps": [],
+        })
+        candidates, unsupported = _artifact_candidates(report)
+        self.assertEqual(unsupported, [])
+        self.assertEqual(candidates[0].path, "src/routing/service.py")
+        self.assertIn("coder_manifest", candidates[0].sources)
+
     def test_review_decision_parser_accepts_final_json_after_commentary(self):
         value = ReviewService._parse_decision(
             'I inspected the result.\n```json\n'
@@ -389,22 +1614,1347 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
         class FakeProvider:
             async def tools(self, messages, specs, **kwargs):
                 self.role = kwargs["role"]
+                self.reviewer_mode = kwargs["reviewer_mode"]
+                self.reasoning_effort = kwargs["reasoning_effort"]
+                self.run_metadata = kwargs["run_metadata"]
+                await kwargs["direct_tool_handlers"]["read_file"]({"file_path": "report.md"})
                 yield TextEvent('{"verdict":"done","rationale":"Outcome meets the task",'
-                                '"feedback":"","question":""}')
+                                '"evidence":["Inspected report.md"],'
+                                '"inspected_paths":["report.md"],"findings":[],'
+                                '"question":""}')
                 yield DoneEvent("endTurn")
 
         provider = FakeProvider()
         change = SimpleNamespace(title="Routing change", work_packages=[])
+        async def read_file(_arguments):
+            return "The report explains the routing change."
         with mock.patch("agent.routing.review.providers.get", return_value=provider):
             decision = await ReviewService().review(
-                change, task(), "Implemented routing", "claude-haiku", [], {})
+                change, task(), "Implemented `report.md`.", "claude-haiku",
+                [ToolSpec("read_file", "Read a file", {"type": "object",
+                 "properties": {"file_path": {"type": "string"}}})],
+                {"read_file": read_file})
         self.assertEqual(provider.role, "optimizer")
+        self.assertTrue(provider.reviewer_mode)
+        self.assertEqual(provider.reasoning_effort, "medium")
+        self.assertEqual(provider.run_metadata,
+                         {"reviewer": True, "reviewer_model": "codex-luna-low"})
         self.assertEqual(decision.verdict, "done")
         self.assertEqual(decision.reviewer_model, "codex-luna-low")
+        self.assertEqual(decision.evidence, ("Inspected report.md",))
+        self.assertEqual(decision.inspected_paths, ("report.md",))
+
+    async def test_research_review_uses_task_scope_and_defers_sibling_outcomes(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                self.prompt = messages[0]["content"]
+                yield TextEvent(json.dumps({
+                    "verdict": "done",
+                    "rationale": "The requested generation inspection is complete",
+                    "evidence": ["models/ngram/model.py documents the sampling path"],
+                    "inspected_paths": ["models/ngram/model.py"],
+                    "findings": [],
+                    "question": "",
+                }))
+                yield DoneEvent("endTurn")
+
+        research = Task(
+            id="WP3-T1",
+            title="Inspect existing generation code",
+            description="Review generation sampling and canonical conversion utilities.",
+            complexity="simple",
+            reasoning="Reuse existing behavior.",
+            context="",
+            preferred_capability="research",
+            acceptance_criteria=[
+                "Existing generation and canonical conversion entry points are identified."
+            ],
+        )
+        implementation = replace(
+            research,
+            id="WP3-T3",
+            title="Implement evaluation-dataset generation abstraction",
+            description="Build generate_evaluation_dataset with per-piece status.",
+            preferred_capability="write",
+        )
+        tests = replace(
+            research,
+            id="WP3-T5",
+            title="Add generation workflow tests",
+            description="Test empty output and successful generation.",
+            preferred_capability="test",
+        )
+        package = SimpleNamespace(
+            objective="Provide a generic evaluation and generation pipeline.",
+            acceptance_criteria=[
+                "generate_evaluation_dataset returns canonical generated data.",
+                "Empty generated output raises a clear error.",
+            ],
+            tasks=[research, implementation, tests],
+        )
+        provider = FakeProvider()
+
+        async def read_file(_arguments):
+            return "def note_table_predict(context): pass"
+
+        change = SimpleNamespace(title="Evaluation pipeline", work_packages=[package])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                change, research,
+                "Inspected `models/ngram/model.py`.", "claude-haiku",
+                [ToolSpec("read_file", "Read a file", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}}})],
+                {"read_file": read_file},
+            )
+
+        self.assertEqual(decision.verdict, "ask_user")
+        self.assertNotIn(
+            "Test execution was not independently verified through IDE MCP.",
+            decision.evidence,
+        )
+        self.assertIn("active task only", provider.prompt)
+        self.assertIn("Active-task acceptance criteria", provider.prompt)
+        self.assertIn("Sibling tasks with deferred responsibilities", provider.prompt)
+        self.assertIn("WP3-T3", provider.prompt)
+        self.assertIn("WP3-T5", provider.prompt)
+
+    async def test_reviewer_uses_mcp_snapshot_without_initiating_tool_call(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                self.prompt = messages[0]["content"]
+                yield TextEvent('{"verdict":"done","rationale":"Contract matches the task",'
+                                '"evidence":["src/trainer.py defines Trainer"],'
+                                '"inspected_paths":["src/trainer.py"],"findings":[]}')
+                yield DoneEvent("endTurn")
+
+        reads = []
+        async def read_file(arguments):
+            reads.append(arguments)
+            return "L1: class Trainer:\nL2:     pass"
+        provider = FakeProvider()
+        change = SimpleNamespace(title="Trainer contract", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                change, task(), "Created `src/trainer.py`.", "claude-haiku",
+                [ToolSpec("read_file", "Read a file", {"type": "object",
+                 "properties": {"file_path": {"type": "string"}}})],
+                {"read_file": read_file})
+        self.assertEqual([item["file_path"] for item in reads], ["src/trainer.py"])
+        self.assertIn("class Trainer", provider.prompt)
+        self.assertIn("FORBIDDEN to access project files", provider.prompt)
+        self.assertEqual(decision.inspected_paths, ("src/trainer.py",))
+
+    async def test_approval_must_account_for_every_journaled_mutation(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                yield TextEvent(json.dumps({
+                    "verdict": "done",
+                    "rationale": "The reported file looks correct",
+                    "evidence": ["Inspected src/reported.py"],
+                    "inspected_paths": ["src/reported.py"],
+                    "findings": [],
+                }))
+                yield DoneEvent("endTurn")
+
+        reads = []
+
+        async def read_file(arguments):
+            reads.append(arguments["file_path"])
+            return "implemented"
+
+        queued_task = replace(task(), context="\n".join((
+            "Authoritative task mutation journal (all paths are required review evidence):",
+            "Required mutation artifact: src/reported.py",
+            "Required mutation artifact: src/omitted.py",
+        )))
+        change = SimpleNamespace(title="Trainer contract", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
+            with self.assertRaisesRegex(
+                    ReviewError, "did not account for every journaled mutation"):
+                await ReviewService().review(
+                    change, queued_task, "Changed `src/reported.py`.", "claude-haiku",
+                    [ToolSpec("read_file", "Read a file", {"type": "object",
+                     "properties": {"file_path": {"type": "string"}}})],
+                    {"read_file": read_file})
+        self.assertEqual(set(reads), {"src/reported.py", "src/omitted.py"})
+
+    async def test_coder_basename_is_reconciled_to_unique_journal_path(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                yield TextEvent(json.dumps({
+                    "verdict": "done",
+                    "rationale": "The trainer contract tests cover the interface",
+                    "evidence": ["Inspected the trainer contract tests"],
+                    "inspected_paths": ["tests/test_trainer_contract.py"],
+                    "findings": [],
+                }))
+                yield DoneEvent("endTurn")
+
+        reads = []
+
+        async def read_file(arguments):
+            reads.append(arguments["file_path"])
+            if arguments["file_path"] != "tests/test_trainer_contract.py":
+                raise RuntimeError("unexpected non-journal path")
+            return "def test_contract(): pass"
+
+        async def search_file(_arguments):
+            raise AssertionError("journal reconciliation must not need project search")
+
+        queued_task = replace(task(), context="\n".join((
+            "Authoritative task mutation journal (all paths are required review evidence):",
+            "Required mutation artifact: tests/test_trainer_contract.py",
+        )))
+        specs = [
+            ToolSpec("read_file", "Read", {"type": "object", "properties": {
+                "file_path": {"type": "string"}}}),
+            ToolSpec("search_file", "Search", {"type": "object", "properties": {
+                "q": {"type": "string"}, "limit": {"type": "integer"}}}),
+        ]
+        change = SimpleNamespace(title="Trainer contract", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
+            decision = await ReviewService().review(
+                change, queued_task, "Changed `test_trainer_contract.py`.",
+                "claude-haiku", specs,
+                {"read_file": read_file, "search_file": search_file})
+        self.assertEqual(reads, ["tests/test_trainer_contract.py"])
+        self.assertEqual(decision.inspected_paths, ("tests/test_trainer_contract.py",))
+
+    async def test_unique_project_search_resolves_supplemental_basename(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                self.prompt = messages[0]["content"]
+                yield TextEvent(json.dumps({
+                    "verdict": "done",
+                    "rationale": "The tests cover the contract",
+                    "evidence": ["Inspected the resolved contract test"],
+                    "inspected_paths": ["tests/test_trainer_contract.py"],
+                    "findings": [],
+                }))
+                yield DoneEvent("endTurn")
+
+        reads = []
+        searches = []
+
+        async def read_file(arguments):
+            path = arguments["file_path"]
+            reads.append(path)
+            if path == "test_trainer_contract.py":
+                raise RuntimeError("File test_trainer_contract.py doesn't exist")
+            return "def test_contract(): pass"
+
+        async def search_file(arguments):
+            searches.append(arguments)
+            return {"items": [{"filePath": "tests/test_trainer_contract.py"}]}
+
+        specs = [
+            ToolSpec("read_file", "Read", {"type": "object", "properties": {
+                "file_path": {"type": "string"}}}),
+            ToolSpec("search_file", "Search", {"type": "object", "properties": {
+                "q": {"type": "string"}, "limit": {"type": "integer"}}}),
+        ]
+        provider = FakeProvider()
+        change = SimpleNamespace(title="Trainer contract", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                change, task(), "Added `test_trainer_contract.py`.", "claude-haiku",
+                specs, {"read_file": read_file, "search_file": search_file})
+        self.assertEqual(reads, ["test_trainer_contract.py",
+                                 "tests/test_trainer_contract.py"])
+        self.assertEqual(searches[0]["q"], "**/test_trainer_contract.py")
+        self.assertIn('"claimed_path": "test_trainer_contract.py"', provider.prompt)
+        self.assertEqual(decision.inspected_paths, ("tests/test_trainer_contract.py",))
+
+    async def test_reviewer_discovers_artifact_when_coder_supplies_no_path(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                self.prompt = messages[0]["content"]
+                found = await kwargs["direct_tool_handlers"]["search_file"]({
+                    "q": "**/*factory*.py", "limit": 20,
+                })
+                self.asserted_search_result = found
+                await kwargs["direct_tool_handlers"]["read_file"]({
+                    "file_path": "trainer/factory.py",
+                })
+                yield TextEvent(json.dumps({
+                    "verdict": "done",
+                    "rationale": "Independent project discovery found the implementation",
+                    "evidence": ["trainer/factory.py defines TrainerFactory"],
+                    "inspected_paths": ["trainer/factory.py"],
+                    "findings": [],
+                }))
+                yield DoneEvent("endTurn")
+
+        async def search_file(_arguments):
+            return {"items": [{"filePath": "trainer/factory.py"}]}
+
+        async def read_file(arguments):
+            self.assertEqual(arguments["file_path"], "trainer/factory.py")
+            return "class TrainerFactory: pass"
+
+        provider = FakeProvider()
+        specs = [
+            ToolSpec("read_file", "Read", {"type": "object", "properties": {
+                "file_path": {"type": "string"}}}),
+            ToolSpec("search_file", "Search", {"type": "object", "properties": {
+                "q": {"type": "string"}, "limit": {"type": "integer"}}}),
+        ]
+        change = SimpleNamespace(title="Trainer factory", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                change, task(), "Implementation complete.", "claude-haiku", specs,
+                {"read_file": read_file, "search_file": search_file})
+        self.assertIn("initial artifact snapshot is empty", provider.prompt)
+        self.assertEqual(decision.inspected_paths, ("trainer/factory.py",))
+
+    async def test_ambiguous_supplemental_basename_goes_to_reviewer(self):
+        files = {"tests/unit/test_contract.py": "def test_unit(): pass",
+                 "tests/integration/test_contract.py": "def test_integration(): pass"}
+
+        async def read_file(arguments):
+            if arguments["file_path"] not in files:
+                raise RuntimeError(f"File {arguments['file_path']} doesn't exist")
+            return files[arguments["file_path"]]
+
+        async def search_file(_arguments):
+            return {"items": [{"filePath": path} for path in files]}
+
+        provider = _RecordingReviewer("tests/unit/test_contract.py", {
+            "verdict": "done", "rationale": "The unit contract test exists",
+            "evidence": ["`test_contract.py` -> `tests/unit/test_contract.py` from context"],
+            "inspected_paths": ["tests/unit/test_contract.py"], "findings": []})
+        specs = [ToolSpec("read_file", "Read", {"type": "object", "properties": {
+                "file_path": {"type": "string"}}}),
+                 ToolSpec("search_file", "Search", {"type": "object", "properties": {
+                "q": {"type": "string"}, "limit": {"type": "integer"}}})]
+        change = SimpleNamespace(title="Contract", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                change, task(), "Added `test_contract.py`.", "claude-haiku",
+                specs, {"read_file": read_file, "search_file": search_file})
+        self.assertEqual(decision.verdict, "done")
+        reference = decision.unresolved_references[0]
+        self.assertEqual((reference["path"], reference["status"]), ("test_contract.py", "ambiguous"))
+        self.assertEqual(sorted(reference["matches"]), sorted(files))
+        self.assertIn("Unresolved references", provider.prompt)
+        self.assertIn('"candidate_for": "test_contract.py"', provider.prompt)
+
+    async def test_missing_supplemental_basename_goes_to_reviewer(self):
+        async def read_file(arguments):
+            if arguments["file_path"] == "tests/test_other.py":
+                return "def test_other(): pass"
+            raise RuntimeError(f"File {arguments['file_path']} doesn't exist")
+
+        async def search_file(_arguments):
+            return {"items": []}
+
+        provider = _RecordingReviewer("tests/test_other.py", {
+            "verdict": "needs_work", "rationale": "The claimed test file was never created",
+            "evidence": ["`test_missing.py` does not exist anywhere in the project"],
+            "inspected_paths": ["tests/test_other.py"],
+            "findings": [{"kind": "implementation", "problem": "Claimed test file is missing",
+                          "suggested_task": "Create the claimed test file",
+                          "approval_criteria": ["The claimed test file exists"],
+                          "artifact_paths": ["test_missing.py"], "owner": "coder",
+                          "reason": "implementation_defect"}]})
+        specs = [ToolSpec("read_file", "Read", {"type": "object", "properties": {
+                "file_path": {"type": "string"}}}),
+                 ToolSpec("search_file", "Search", {"type": "object", "properties": {
+                "q": {"type": "string"}, "limit": {"type": "integer"}}})]
+        change = SimpleNamespace(title="Contract", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                change, task(), "Added `test_missing.py`.", "claude-haiku",
+                specs, {"read_file": read_file, "search_file": search_file})
+        self.assertEqual(decision.verdict, "needs_work")
+        self.assertEqual(decision.unresolved_references[0]["status"], "not_found")
+        self.assertIn("test_missing.py", provider.prompt)
+
+    async def test_non_missing_read_failure_does_not_trigger_path_search(self):
+        search_file = mock.AsyncMock()
+
+        async def read_file(_arguments):
+            raise RuntimeError("IDE permission denied")
+        provider = _RecordingReviewer()
+        change = SimpleNamespace(title="Review", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            with self.assertRaisesRegex(
+                    ReviewError, r"did not successfully inspect[\s\S]*Unresolved references given "
+                                 r"to the reviewer:\n- `test_contract\.py` from [^\n]*: unreadable "):
+                await ReviewService().review(
+                    change, task(), "Added `test_contract.py`.", "claude-haiku",
+                    [ToolSpec("read_file", "Read", {"type": "object", "properties": {
+                "file_path": {"type": "string"}}}), ToolSpec("search_file", "Search", {"type": "object", "properties": {
+                "q": {"type": "string"}, "limit": {"type": "integer"}}})], {"read_file": read_file, "search_file": search_file})
+        self.assertIn("Unresolved references", provider.prompt)
+        search_file.assert_not_awaited()
+
+    async def test_task_and_coder_dual_source_path_is_independently_resolved(self):
+        search_file = mock.AsyncMock(return_value={
+            "items": [{"filePath": "tests/test_contract.py"}],
+        })
+
+        async def read_file(arguments):
+            if arguments["file_path"] == "test_contract.py":
+                raise RuntimeError("File test_contract.py doesn't exist")
+            return "def test_contract(): pass"
+
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                yield TextEvent(json.dumps({
+                    "verdict": "done",
+                    "rationale": "The independently resolved test is valid",
+                    "evidence": ["Inspected the resolved test"],
+                    "inspected_paths": ["tests/test_contract.py"],
+                    "findings": [],
+                }))
+                yield DoneEvent("endTurn")
+
+        queued_task = replace(task(), context="Verify test_contract.py")
+        specs = [
+            ToolSpec("read_file", "Read", {"type": "object", "properties": {
+                "file_path": {"type": "string"}}}),
+            ToolSpec("search_file", "Search", {"type": "object", "properties": {
+                "q": {"type": "string"}, "limit": {"type": "integer"}}}),
+        ]
+        change = SimpleNamespace(title="Contract", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
+            decision = await ReviewService().review(
+                change, queued_task, "Changed `test_contract.py`.", "claude-haiku",
+                specs, {"read_file": read_file, "search_file": search_file})
+        search_file.assert_awaited_once()
+        self.assertEqual(decision.inspected_paths, ("tests/test_contract.py",))
+
+    async def test_mixed_literal_read_failures_do_not_trigger_path_search(self):
+        search_file = mock.AsyncMock(return_value={
+            "items": [{"filePath": "models/train.ipynb"}],
+        })
+
+        async def read_notebook(_arguments):
+            raise RuntimeError("File train.ipynb doesn't exist")
+
+        async def read_file(_arguments):
+            raise RuntimeError("IDE permission denied")
+        provider = _RecordingReviewer()
+        change = SimpleNamespace(title="Review", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            with self.assertRaisesRegex(
+                    ReviewError, r"did not successfully inspect[\s\S]*Unresolved references given "
+                                 r"to the reviewer:\n- `train\.ipynb` from [^\n]*: unreadable "):
+                await ReviewService().review(
+                    change, task(), "Changed `train.ipynb`.", "claude-haiku",
+                    [ToolSpec("read_notebook", "Read notebook", {"type": "object", "properties": {"file_path": {"type": "string"}}}), ToolSpec("read_file", "Read", {"type": "object", "properties": {
+                "file_path": {"type": "string"}}}), ToolSpec("search_file", "Search", {"type": "object", "properties": {
+                "q": {"type": "string"}, "limit": {"type": "integer"}}})], {"read_notebook": read_notebook, "read_file": read_file, "search_file": search_file})
+        self.assertIn("Unresolved references", provider.prompt)
+        search_file.assert_not_awaited()
+
+    async def test_journal_path_is_never_remapped_by_project_search(self):
+        search_file = mock.AsyncMock()
+
+        async def read_file(_arguments):
+            raise RuntimeError("File tests/test_contract.py doesn't exist")
+
+        queued_task = replace(task(), context="\n".join((
+            "Authoritative task mutation journal (all paths are required review evidence):",
+            "Required mutation artifact: tests/test_contract.py",
+        )))
+        specs = [
+            ToolSpec("read_file", "Read", {"type": "object", "properties": {
+                "file_path": {"type": "string"}}}),
+            ToolSpec("search_file", "Search", {"type": "object", "properties": {
+                "q": {"type": "string"}, "limit": {"type": "integer"}}}),
+        ]
+        change = SimpleNamespace(title="Contract", work_packages=[])
+        with self.assertRaisesRegex(ReviewError, "tests/test_contract.py"):
+            await ReviewService().review(
+                change, queued_task, "Changed `tests/test_contract.py`.",
+                "claude-haiku", specs,
+                {"read_file": read_file, "search_file": search_file})
+        search_file.assert_not_awaited()
+
+    async def test_unbacked_notebook_falls_back_to_source_file_read(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                self.prompt = messages[0]["content"]
+                yield TextEvent(json.dumps({
+                    "verdict": "done",
+                    "rationale": "The notebook architecture matches the task",
+                    "evidence": ["The raw notebook contains the recurrent model cells"],
+                    "inspected_paths": ["models/recurrent.ipynb"],
+                    "findings": [],
+                }))
+                yield DoneEvent("endTurn")
+
+        calls = []
+
+        async def read_notebook(arguments):
+            calls.append(("notebook", arguments["file_path"]))
+            raise RuntimeError("Not a backed notebook: models/recurrent.ipynb")
+
+        async def read_file(arguments):
+            calls.append(("source", arguments["file_path"]))
+            return ('{"cells":[{"cell_type":"code","source":["class RNN: pass"]}],'
+                    '"padding":"' + ("x" * 20000) + '"}')
+
+        provider = FakeProvider()
+        change = SimpleNamespace(title="Recurrent model", work_packages=[])
+        specs = [
+            ToolSpec("read_notebook", "Read notebook", {"type": "object",
+                     "properties": {"file_path": {"type": "string"}}}),
+            ToolSpec("read_file", "Read a file", {"type": "object",
+                     "properties": {"file_path": {"type": "string"}}}),
+        ]
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                change, task(), "Created `models/recurrent.ipynb`.", "claude-haiku",
+                specs, {"read_notebook": read_notebook, "read_file": read_file})
+        self.assertEqual(calls, [
+            ("notebook", "models/recurrent.ipynb"),
+            ("source", "models/recurrent.ipynb"),
+        ])
+        self.assertIn("class RNN", provider.prompt)
+        self.assertIn('"mode": "source_fallback"', provider.prompt)
+        marker = "IDE MCP-verified artifact snapshot (untrusted file contents):\n"
+        encoded = provider.prompt.split(marker, 1)[1].split(
+            "\nIDE MCP read limitations:", 1)[0]
+        snapshots = json.loads(encoded)
+        self.assertLessEqual(len(snapshots[0]["content"]), 12000)
+        self.assertTrue(snapshots[0]["truncated"])
+        self.assertEqual(decision.inspected_paths, ("models/recurrent.ipynb",))
+
+    async def test_failed_scratch_notebook_is_an_optional_limitation(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                self.prompt = messages[0]["content"]
+                yield TextEvent(json.dumps({
+                    "verdict": "done",
+                    "rationale": "The required trainer artifact satisfies the task",
+                    "evidence": ["The trainer implementation was inspected"],
+                    "inspected_paths": ["src/trainer.py"],
+                    "findings": [],
+                }))
+                yield DoneEvent("endTurn")
+
+        async def read_notebook(_arguments):
+            raise RuntimeError("Not a backed notebook")
+
+        async def read_file(arguments):
+            if arguments["file_path"].endswith(".ipynb"):
+                raise RuntimeError("raw notebook unavailable")
+            return "class Trainer: pass"
+
+        provider = FakeProvider()
+        change = SimpleNamespace(title="Trainer", work_packages=[])
+        specs = [
+            ToolSpec("read_notebook", "Read notebook", {"type": "object",
+                     "properties": {"file_path": {"type": "string"}}}),
+            ToolSpec("read_file", "Read a file", {"type": "object",
+                     "properties": {"file_path": {"type": "string"}}}),
+        ]
+        report = ("Changed `src/trainer.py`. Used `scratch_test_runner.ipynb` "
+                  "for an ad hoc check.")
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                change, task(), report, "claude-haiku", specs,
+                {"read_notebook": read_notebook, "read_file": read_file})
+        self.assertEqual(decision.verdict, "done")
+        self.assertIn("scratch_test_runner.ipynb", provider.prompt)
+        self.assertIn('"required": false', provider.prompt)
+        self.assertIn("raw notebook unavailable", provider.prompt)
+
+    async def test_unbacked_notebook_is_named_after_fallback_failure(self):
+        async def read_notebook(_arguments):
+            raise RuntimeError("Not a backed notebook")
+
+        async def read_file(_arguments):
+            raise RuntimeError("raw notebook unavailable")
+        provider = _RecordingReviewer()
+        change = SimpleNamespace(title="Review", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            with self.assertRaisesRegex(
+                    ReviewError, r"did not successfully inspect[\s\S]*Unresolved references given "
+                                 r"to the reviewer:\n- `models/recurrent\.ipynb` from [^\n]*: unreadable "):
+                await ReviewService().review(
+                    change, task(), "Created `models/recurrent.ipynb`.", "claude-haiku",
+                    [ToolSpec("read_notebook", "Read notebook", {"type": "object", "properties": {"file_path": {"type": "string"}}}), ToolSpec("read_file", "Read a file", {"type": "object", "properties": {"file_path": {"type": "string"}}})], {"read_notebook": read_notebook, "read_file": read_file})
+        self.assertIn("Unresolved references", provider.prompt)
+
+    async def test_scratch_notebook_named_by_task_context_reaches_reviewer(self):
+        async def read_notebook(_arguments):
+            raise RuntimeError("Not a backed notebook")
+
+        async def read_file(_arguments):
+            raise RuntimeError("raw notebook unavailable")
+
+        queued_task = replace(task(), context=(
+            "Validate the behavior recorded in `scratch_test_runner.ipynb`."))
+        provider = _RecordingReviewer()
+        change = SimpleNamespace(title="Review", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            with self.assertRaisesRegex(
+                    ReviewError, r"did not successfully inspect[\s\S]*Unresolved references given "
+                                 r"to the reviewer:\n- `scratch_test_runner\.ipynb` from [^\n]*: unreadable "):
+                await ReviewService().review(
+                    change, queued_task, "Used `scratch_test_runner.ipynb`.", "claude-haiku",
+                    [ToolSpec("read_notebook", "Read notebook", {"type": "object", "properties": {"file_path": {"type": "string"}}}), ToolSpec("read_file", "Read a file", {"type": "object", "properties": {"file_path": {"type": "string"}}})], {"read_notebook": read_notebook, "read_file": read_file})
+        self.assertIn("Unresolved references", provider.prompt)
+
+    async def test_structured_implementation_finding_is_actionable_and_evidence_backed(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                yield TextEvent(json.dumps({
+                    "verdict": "needs_work",
+                    "rationale": "The factory omits the recurrent trainer",
+                    "evidence": ["trainer_factory.py contains no recurrent mapping"],
+                    "inspected_paths": ["src/trainer_factory.py"],
+                    "findings": [{
+                        "kind": "implementation",
+                        "problem": "The recurrent trainer is not registered",
+                        "suggested_task": "Add a recurrent trainer mapping",
+                        "approval_criteria": [
+                            "The recurrent model type resolves to its trainer",
+                            "Existing factory mappings remain valid",
+                        ],
+                        "artifact_paths": ["src/trainer_factory.py"],
+                    }],
+                    "question": "",
+                }))
+                yield DoneEvent("endTurn")
+
+        async def read_file(_arguments):
+            return "class TrainerFactory: pass"
+
+        change = SimpleNamespace(title="Trainer factory", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
+            decision = await ReviewService().review(
+                change, task(), "Changed `src/trainer_factory.py`.", "claude-haiku",
+                [ToolSpec("read_file", "Read a file", {"type": "object",
+                 "properties": {"file_path": {"type": "string"}}})],
+                {"read_file": read_file})
+        self.assertEqual(decision.verdict, "needs_work")
+        self.assertEqual(decision.findings[0].suggested_task,
+                         "Add a recurrent trainer mapping")
+        self.assertEqual(len(decision.findings[0].approval_criteria), 2)
+
+    async def test_verification_only_finding_becomes_pending_review(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                yield TextEvent(json.dumps({
+                    "verdict": "needs_work",
+                    "rationale": "Integration tests remain unverified",
+                    "evidence": ["The supplied factory snapshot was inspected"],
+                    "inspected_paths": ["src/trainer_factory.py"],
+                    "findings": [{
+                        "kind": "verification",
+                        "problem": "The integration test was outside the supplied snapshot",
+                        "suggested_task": "Read the test through IDE MCP and retry review",
+                        "approval_criteria": ["The reviewer can inspect the integration test"],
+                        "artifact_paths": ["tests/test_integration.py"],
+                    }],
+                    "question": "",
+                }))
+                yield DoneEvent("endTurn")
+
+        async def read_file(_arguments):
+            return "class TrainerFactory: pass"
+
+        report = ("Changed `src/trainer_factory.py`. Relevant follow-up: "
+                  "`tests/test_integration.py`.")
+        change = SimpleNamespace(title="Trainer factory", work_packages=[])
+        # Keep the test path out of the service snapshot to model a bounded omission.
+        with (mock.patch("agent.routing.review._MAX_ARTIFACTS", 1),
+              mock.patch("agent.routing.review.providers.get", return_value=FakeProvider())):
+            with self.assertRaisesRegex(ReviewError, "Integration tests remain unverified") as raised:
+                await ReviewService().review(
+                    change, task(), report, "claude-haiku",
+                    [ToolSpec("read_file", "Read a file", {"type": "object",
+                     "properties": {"file_path": {"type": "string"}}})],
+                    {"read_file": read_file})
+        self.assertEqual(raised.exception.reviewer_model, "codex-luna-low")
+        self.assertEqual(raised.exception.findings[0].kind, "verification")
+
+    async def test_finding_without_approval_criteria_is_rejected(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                yield TextEvent(json.dumps({
+                    "verdict": "needs_work",
+                    "rationale": "The factory is incomplete",
+                    "evidence": ["Inspected the factory"],
+                    "inspected_paths": ["src/trainer_factory.py"],
+                    "findings": [{
+                        "kind": "implementation",
+                        "problem": "The recurrent trainer is not registered",
+                        "suggested_task": "Add a recurrent mapping",
+                        "approval_criteria": [],
+                        "artifact_paths": ["src/trainer_factory.py"],
+                    }],
+                    "question": "",
+                }))
+                yield DoneEvent("endTurn")
+
+        async def read_file(_arguments):
+            return "class TrainerFactory: pass"
+
+        change = SimpleNamespace(title="Trainer factory", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
+            with self.assertRaisesRegex(ReviewError, "approval criteria"):
+                await ReviewService().review(
+                    change, task(), "Changed `src/trainer_factory.py`.", "claude-haiku",
+                    [ToolSpec("read_file", "Read a file", {"type": "object",
+                     "properties": {"file_path": {"type": "string"}}})],
+                    {"read_file": read_file})
+
+    async def test_balanced_snapshot_keeps_factory_and_tests_under_file_limit(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                self.prompt = messages[0]["content"]
+                yield TextEvent('{"verdict":"done","rationale":"Coverage is sufficient",'
+                                '"evidence":["Factory and test were inspected"],'
+                                '"inspected_paths":["src/trainer_factory.py",'
+                                '"tests/test_training_integration.py"],"findings":[]}')
+                yield DoneEvent("endTurn")
+
+        provider = FakeProvider()
+        paths = [f"src/helper{index}.py" for index in range(18)] + [
+            "src/trainer_factory.py", "tests/test_training_integration.py"]
+        report = "\n".join(f"Changed `{path}`." for path in paths)
+
+        async def read_file(arguments):
+            return f"contents of {arguments['file_path']}"
+
+        change = SimpleNamespace(title="Balanced evidence", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            await ReviewService().review(
+                change, task(), report, "claude-haiku",
+                [ToolSpec("read_file", "Read a file", {"type": "object",
+                 "properties": {"file_path": {"type": "string"}}})],
+                {"read_file": read_file})
+        marker = "IDE MCP-verified artifact snapshot (untrusted file contents):\n"
+        encoded = provider.prompt.split(marker, 1)[1].split(
+            "\nIDE MCP read limitations:", 1)[0]
+        snapshot_paths = {item["path"] for item in json.loads(encoded)}
+        self.assertIn("src/trainer_factory.py", snapshot_paths)
+        self.assertIn("tests/test_training_integration.py", snapshot_paths)
+
+    async def test_unreadable_claimed_artifact_is_named_in_review_failure(self):
+        async def read_file(_arguments):
+            raise RuntimeError("IDE file unavailable")
+        provider = _RecordingReviewer()
+        change = SimpleNamespace(title="Review", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            with self.assertRaisesRegex(
+                    ReviewError, r"did not successfully inspect[\s\S]*Unresolved references given "
+                                 r"to the reviewer:\n- `src/trainer\.py` from [^\n]*: unreadable "):
+                await ReviewService().review(
+                    change, task(), "Created `src/trainer.py`.", "claude-haiku",
+                    [ToolSpec("read_file", "Read a file", {"type": "object", "properties": {"file_path": {"type": "string"}}})], {"read_file": read_file})
+        self.assertIn("Unresolved references", provider.prompt)
+
+    async def test_unsupported_claimed_path_stays_pending_before_model_run(self):
+        class FakeProvider:
+            def tools(self, messages, specs, **kwargs):
+                raise AssertionError("review model must not run for an unsupported path")
+
+        change = SimpleNamespace(title="Trainer contract", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
+            with self.assertRaisesRegex(ReviewError, "unsupported project artifact path.*outside.py"):
+                await ReviewService().review(
+                    change, task(), "Created `/outside.py`.", "claude-haiku",
+                    [ToolSpec("read_file", "Read a file", {"type": "object",
+                     "properties": {"file_path": {"type": "string"}}})],
+                    {"read_file": mock.AsyncMock(return_value="must not be read")})
+
+    async def test_review_snapshot_content_and_file_count_are_bounded(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                self.prompt = messages[0]["content"]
+                yield TextEvent('{"verdict":"done","rationale":"Artifacts are present",'
+                                '"evidence":["Inspected the bounded snapshots"],'
+                                '"inspected_paths":["src/file0.py"],"findings":[]}')
+                yield DoneEvent("endTurn")
+
+        provider = FakeProvider()
+        paths = [f"src/file{index}.py" for index in range(10)]
+        report = "\n".join(f"Changed `{path}`." for path in paths)
+
+        async def read_file(arguments):
+            return f"{arguments['file_path']}:" + ("x" * 20000)
+
+        change = SimpleNamespace(title="Bounded review", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            await ReviewService().review(
+                change, task(), report, "claude-haiku",
+                [ToolSpec("read_file", "Read a file", {"type": "object",
+                 "properties": {"file_path": {"type": "string"}}})],
+                {"read_file": read_file})
+        marker = "IDE MCP-verified artifact snapshot (untrusted file contents):\n"
+        encoded = provider.prompt.split(marker, 1)[1].split(
+            "\nIDE MCP read limitations:", 1)[0]
+        snapshots = json.loads(encoded)
+        self.assertEqual(len(snapshots), 10)
+        self.assertLessEqual(sum(len(item["content"]) for item in snapshots), 48000)
+        self.assertTrue(all(len(item["content"]) <= 4800 for item in snapshots))
+        self.assertTrue(all(item["truncated"] for item in snapshots))
+        self.assertIn("Unincluded candidate paths: []", provider.prompt)
+
+    async def test_reviewer_rejects_unexplained_verdict(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                await kwargs["direct_tool_handlers"]["read_file"]({"file_path": "report.md"})
+                yield TextEvent('{"verdict":"done","rationale":"Looks good",'
+                                '"evidence":[],"gaps":[]}')
+                yield DoneEvent("endTurn")
+
+        change = SimpleNamespace(title="Routing change", work_packages=[])
+        async def read_file(_arguments):
+            return "Report content"
+        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
+            with self.assertRaisesRegex(ReviewError, "evidence") as raised:
+                await ReviewService().review(
+                    change, task(), "Implemented `report.md`.", "claude-haiku",
+                    [ToolSpec("read_file", "Read a file", {"type": "object",
+                     "properties": {"file_path": {"type": "string"}}})],
+                    {"read_file": read_file})
+        self.assertEqual(raised.exception.reviewer_model, "codex-luna-low")
+
+    async def test_reviewer_without_ide_inspection_fails_with_explanation(self):
+        async def read_file(_arguments):
+            return "Error: file not found"
+        provider = _RecordingReviewer()
+        change = SimpleNamespace(title="Review", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            with self.assertRaisesRegex(
+                    ReviewError, r"did not successfully inspect[\s\S]*Unresolved references given "
+                                 r"to the reviewer:\n- `report\.md` from [^\n]*: not_found "):
+                await ReviewService().review(
+                    change, task(), "Implemented `report.md`.", "claude-haiku",
+                    [ToolSpec("read_file", "Read a file", {"type": "object", "properties": {"file_path": {"type": "string"}}})], {"read_file": read_file})
+        self.assertIn("Unresolved references", provider.prompt)
+
+    async def test_failed_ide_read_runs_reviewer_and_explains_failure(self):
+        async def read_file(_arguments):
+            raise RuntimeError("IDE read failed")
+        provider = _RecordingReviewer()
+        change = SimpleNamespace(title="Review", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            with self.assertRaisesRegex(
+                    ReviewError, r"did not successfully inspect[\s\S]*Unresolved references given "
+                                 r"to the reviewer:\n- `missing\.md` from [^\n]*: unreadable "):
+                await ReviewService().review(
+                    change, task(), "Implemented `missing.md`.", "claude-haiku",
+                    [ToolSpec("read_file", "Read a file", {"type": "object", "properties": {"file_path": {"type": "string"}}})], {"read_file": read_file})
+        self.assertIn("Unresolved references", provider.prompt)
+
+class ReviewPersistenceMigrationTests(unittest.TestCase):
+    def test_existing_review_table_gains_details_without_losing_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "routing.sqlite3"
+            db = sqlite3.connect(path)
+            try:
+                db.execute("""CREATE TABLE implementation_reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+                    position INTEGER NOT NULL, coder_model TEXT NOT NULL,
+                    reviewer_model TEXT NOT NULL, verdict TEXT NOT NULL,
+                    rationale TEXT NOT NULL, question TEXT, created_at REAL NOT NULL
+                )""")
+                db.execute("""INSERT INTO implementation_reviews
+                    (job_id, position, coder_model, reviewer_model, verdict, rationale,
+                     question, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                           ("old-job", 0, "claude-haiku", "codex-luna-low",
+                            "done", "Legacy decision", None, 1.0))
+                db.commit()
+            finally:
+                db.close()
+            RoutingPersistence(path)
+            db = sqlite3.connect(path)
+            try:
+                columns = {row[1] for row in db.execute(
+                    "PRAGMA table_info(implementation_reviews)")}
+                row = db.execute("SELECT rationale FROM implementation_reviews").fetchone()
+            finally:
+                db.close()
+            self.assertIn("details_json", columns)
+            self.assertEqual(row, ("Legacy decision",))
+
+    def test_existing_exhausted_job_becomes_actionable_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "routing.sqlite3"
+            db = sqlite3.connect(path)
+            try:
+                db.executescript("""
+                    CREATE TABLE implementation_jobs (
+                      job_id TEXT PRIMARY KEY, selectors_json TEXT NOT NULL,
+                      instruction TEXT NOT NULL DEFAULT '', conversation_id TEXT,
+                      status TEXT NOT NULL, created_at REAL NOT NULL,
+                      updated_at REAL NOT NULL, error TEXT
+                    );
+                    CREATE TABLE implementation_job_tasks (
+                      job_id TEXT NOT NULL, position INTEGER NOT NULL,
+                      change_id TEXT NOT NULL, task_id TEXT NOT NULL,
+                      status TEXT NOT NULL, decision_id TEXT, error TEXT,
+                      coder_report TEXT, review_question TEXT, review_started_at REAL,
+                      PRIMARY KEY(job_id, position)
+                    );
+                    CREATE TABLE implementation_reviews (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+                      position INTEGER NOT NULL, coder_model TEXT NOT NULL,
+                      reviewer_model TEXT NOT NULL, verdict TEXT NOT NULL,
+                      rationale TEXT NOT NULL, question TEXT, details_json TEXT,
+                      created_at REAL NOT NULL
+                    );
+                """)
+                db.execute("""INSERT INTO implementation_jobs VALUES
+                  ('legacy', '[]', '', 'conv', 'review_pending', 1, 2, NULL)""")
+                db.execute("""INSERT INTO implementation_job_tasks VALUES
+                  ('legacy', 0, 'CHG1', 'WP2-T2', 'review_pending', NULL, NULL,
+                   'report', NULL, NULL)""")
+                db.executemany("""INSERT INTO implementation_reviews
+                  (job_id, position, coder_model, reviewer_model, verdict, rationale,
+                   question, details_json, created_at)
+                  VALUES ('legacy', 0, 'claude-sonnet', 'codex-sol-medium',
+                          'needs_work', 'gap', NULL, '{}', ?)""",
+                               [(1,), (2,), (3,)])
+                db.commit()
+            finally:
+                db.close()
+            persistence = RoutingPersistence(path)
+            self.assertEqual(asyncio.run(persistence.revision_state("legacy", 0)), (2, 3))
+            pending = asyncio.run(persistence.pending_resolution("conv"))
+            self.assertEqual(pending[:3], ("legacy", 0, "WP2-T2"))
+
+    def test_active_legacy_job_counts_every_launched_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "routing.sqlite3"
+            db = sqlite3.connect(path)
+            try:
+                db.executescript("""
+                    CREATE TABLE implementation_jobs (
+                      job_id TEXT PRIMARY KEY, selectors_json TEXT NOT NULL,
+                      instruction TEXT NOT NULL DEFAULT '', conversation_id TEXT,
+                      status TEXT NOT NULL, created_at REAL NOT NULL,
+                      updated_at REAL NOT NULL, error TEXT
+                    );
+                    CREATE TABLE implementation_job_tasks (
+                      job_id TEXT NOT NULL, position INTEGER NOT NULL,
+                      change_id TEXT NOT NULL, task_id TEXT NOT NULL,
+                      status TEXT NOT NULL, decision_id TEXT, error TEXT,
+                      coder_report TEXT, review_question TEXT, review_started_at REAL,
+                      PRIMARY KEY(job_id, position)
+                    );
+                    CREATE TABLE implementation_reviews (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+                      position INTEGER NOT NULL, coder_model TEXT NOT NULL,
+                      reviewer_model TEXT NOT NULL, verdict TEXT NOT NULL,
+                      rationale TEXT NOT NULL, question TEXT, details_json TEXT,
+                      created_at REAL NOT NULL
+                    );
+                """)
+                db.execute("""INSERT INTO implementation_jobs VALUES
+                  ('active', '[]', '', 'conv', 'running', 1, 2, NULL)""")
+                db.execute("""INSERT INTO implementation_job_tasks VALUES
+                  ('active', 0, 'CHG1', 'WP2-T2', 'running', NULL, NULL,
+                   'report', NULL, NULL)""")
+                db.executemany("""INSERT INTO implementation_reviews
+                  (job_id, position, coder_model, reviewer_model, verdict, rationale,
+                   question, details_json, created_at)
+                  VALUES ('active', 0, 'claude-sonnet', 'codex-sol-medium',
+                          'needs_work', 'gap', NULL, '{}', ?)""", [(1,), (2,)])
+                db.commit()
+            finally:
+                db.close()
+            persistence = RoutingPersistence(path)
+            self.assertEqual(
+                asyncio.run(persistence.revision_state("active", 0)), (2, 3))
 
 
 async def _value(value):
     return value
+
+
+_PARSE_FAILURE = ("Claude Code returned an error result: "
+                  "The model's tool call could not be parsed (retry also failed).")
+
+
+class _InterruptedTaskExecution(_TaskExecution):
+    """First run fails mid-task with a tool-call parse error; later runs succeed."""
+
+    def __init__(self, failure=_PARSE_FAILURE):
+        super().__init__()
+        self.failure = failure
+        self.excluded = []
+
+    async def execute(self, queued_task, change_id, messages, specs, **kwargs):
+        self.excluded.append(kwargs.get("exclude_models", frozenset()))
+        if len(self.excluded) == 1:
+            self.started.append((queued_task.id, change_id))
+            self.instructions.append(kwargs.get("execution_instruction"))
+            yield TextEvent("Wrote part of the tests.")
+            yield ErrorEvent(self.failure)
+            yield DoneEvent("endTurn")
+            return
+        async for event in super().execute(queued_task, change_id, messages, specs, **kwargs):
+            yield event
+
+
+class CoderRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def _interrupted_job(self, directory, execution, verdicts=("done",)):
+        persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+        async def actual_model(_decision_id):
+            return "claude-haiku"
+
+        persistence.actual_model_for = actual_model
+        artifacts = _Artifacts()
+        service = ImplementationService(artifacts, execution, persistence, _Reviewer(list(verdicts)))
+        job = await service.create_job(["WP1-T1"], conversation_id="conv-recovery")
+        events = [event async for event in service.start(job, [], [])]
+        return service, persistence, artifacts, job, events
+
+    async def test_parse_failure_waits_for_user_instead_of_stopping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service, persistence, _, job, events = await self._interrupted_job(
+                directory, _InterruptedTaskExecution())
+            text = "\n".join(event.text for event in events if isinstance(event, TextEvent))
+            self.assertIn("Coding interrupted", text)
+            self.assertIn("could not be parsed", text)
+            self.assertIn("try coder again", text)
+            self.assertIn(f"job {job.job_id}", text)
+            item = await persistence.implementation_task(job.job_id, 0)
+            self.assertEqual(item.status, "awaiting_coder_recovery")
+            self.assertIsNotNone(await persistence.pending_resolution("conv-recovery"))
+
+    async def test_try_again_excludes_the_failed_model_and_continues(self):
+        with tempfile.TemporaryDirectory() as directory:
+            execution = _InterruptedTaskExecution()
+            service, persistence, artifacts, job, _ = await self._interrupted_job(
+                directory, execution)
+            events = [event async for event in service.retry_coder(
+                job.job_id, 0, [], [], "", {}, "")]
+            self.assertFalse(any(isinstance(event, ErrorEvent) for event in events))
+            self.assertEqual(execution.excluded[-1], frozenset({"claude-haiku"}))
+            self.assertIn("interrupted before finishing", execution.instructions[-1])
+            self.assertTrue(any("Approved" in event.text
+                                for event in events if isinstance(event, TextEvent)))
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "awaiting_user_decision")
+            duplicate = [event async for event in service.retry_coder(
+                job.job_id, 0, [], [], "", {}, "")]
+            self.assertTrue(any(isinstance(event, ErrorEvent) for event in duplicate))
+
+    async def test_undo_is_available_without_a_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service, persistence, artifacts, job, _ = await self._interrupted_job(
+                directory, _InterruptedTaskExecution())
+            [event async for event in service.undo_code(job.job_id, 0, [], [], {})]
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "undone")
+            self.assertEqual(artifacts.completed, [])
+
+    async def test_other_coder_failures_still_stop_the_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, persistence, _, job, events = await self._interrupted_job(
+                directory, _InterruptedTaskExecution("all simple routing candidates failed: boom"))
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "failed")
+            self.assertTrue(any("Reviewer: not run" in event.text
+                                for event in events if isinstance(event, TextEvent)))
+
+    async def test_routing_excludes_models_but_never_empties_the_tier(self):
+        config = load_routing_config()
+        candidates = config.candidates_for("medium")
+        service = ModelRoutingService(config, Router(candidates[0]))
+        decision = await service.route(task(), "CHG1", "/work/project",
+                                       exclude=frozenset({candidates[0]}))
+        if len(candidates) > 1:
+            self.assertNotEqual(decision.recommended_model, candidates[0])
+            self.assertNotIn(candidates[0], decision.candidates)
+        everything = await service.route(task(), "CHG1", "/work/project",
+                                         exclude=frozenset(candidates))
+        self.assertEqual(everything.candidates, candidates)
+
+
+class ClaudeProviderErrorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_error_result_text_replaces_sdk_success_message(self):
+        from claude_agent_sdk import ResultMessage
+        from providers import claude
+
+        async def fake_query(prompt, options):
+            yield ResultMessage(
+                subtype="success", duration_ms=1, duration_api_ms=1, is_error=True,
+                num_turns=3, session_id="s",
+                result="The model's tool call could not be parsed (retry also failed).")
+            raise Exception("Claude Code returned an error result: success")
+
+        with mock.patch.object(claude, "query", fake_query):
+            with self.assertRaisesRegex(claude.ClaudeResultError, "could not be parsed"):
+                async for _ in claude._query_messages("p", None):
+                    pass
+
+    async def test_unrelated_sdk_errors_are_not_rewritten(self):
+        from providers import claude
+
+        async def fake_query(prompt, options):
+            raise RuntimeError("transport closed")
+            yield
+
+        with mock.patch.object(claude, "query", fake_query):
+            with self.assertRaisesRegex(RuntimeError, "transport closed"):
+                async for _ in claude._query_messages("p", None):
+                    pass
+
+    async def test_cli_receives_tool_timeout_in_milliseconds(self):
+        from providers import claude
+        from mcp_bridge.bridge import TOOL_TIMEOUT
+        seen = {}
+
+        async def fake_query(prompt, options):
+            seen["env"] = options.env
+            return
+            yield
+
+        with mock.patch.object(claude, "query", fake_query):
+            await claude.ClaudeProvider()._run_strategy(
+                SimpleNamespace(), "p", None, [], execution_env={"EXTRA": "1"})
+        self.assertEqual(seen["env"]["MCP_TOOL_TIMEOUT"], str(TOOL_TIMEOUT * 1000))
+        self.assertEqual(seen["env"]["EXTRA"], "1")
+
+
+class UnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
+    specs = [
+        ToolSpec("read_file", "Read", {"type": "object", "properties": {
+            "file_path": {"type": "string"}}}),
+        ToolSpec("search_file", "Search", {"type": "object", "properties": {
+            "q": {"type": "string"}, "limit": {"type": "integer"}}}),
+    ]
+
+    @staticmethod
+    def handlers(files):
+        async def read_file(arguments):
+            if arguments["file_path"] not in files:
+                raise RuntimeError(f"File {arguments['file_path']} doesn't exist")
+            return files[arguments["file_path"]]
+
+        async def search_file(arguments):
+            name = arguments["q"].rsplit("/", 1)[-1]
+            return {"items": [{"filePath": path} for path in files
+                              if path.rsplit("/", 1)[-1] == name]}
+        return {"read_file": read_file, "search_file": search_file}
+
+    async def test_planned_file_in_wp_text_reaches_reviewer_as_not_found(self):
+        files = {"data_loader/factory.py": "class DataLoaderFactory: pass"}
+        queued_task = replace(task(), description=(
+            "Add a loader factory so future_pipeline.py never branches on representation."))
+        provider = _RecordingReviewer("data_loader/factory.py", {
+            "verdict": "done", "rationale": "Factory delivered; the pipeline is a later WP",
+            "evidence": ["`future_pipeline.py` is not present; it belongs to a later WP"],
+            "inspected_paths": ["data_loader/factory.py"], "findings": []})
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                SimpleNamespace(title="Pipeline", work_packages=[]), queued_task,
+                "Created `data_loader/factory.py`.", "claude-haiku", self.specs,
+                self.handlers(files))
+        self.assertEqual(decision.verdict, "done")
+        self.assertEqual(
+            [(item["path"], item["status"], item["sources"])
+             for item in decision.unresolved_references],
+            [("future_pipeline.py", "not_found", ["task"])])
+        self.assertIn("may belong to a later work package", provider.prompt)
+
+    async def test_bare_init_lists_the_already_read_package_file(self):
+        files = {"data_loader/__init__.py": "from .factory import *",
+                 "models/__init__.py": "", "evaluation/__init__.py": ""}
+        provider = _RecordingReviewer("data_loader/__init__.py", {
+            "verdict": "done", "rationale": "Exports added",
+            "evidence": ["`__init__.py` -> `data_loader/__init__.py`"],
+            "inspected_paths": ["data_loader/__init__.py"], "findings": []})
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                SimpleNamespace(title="Loaders", work_packages=[]), task(),
+                "Updated `data_loader/__init__.py` exports; `__init__.py` now re-exports the "
+                "factory.", "claude-haiku", self.specs, self.handlers(files))
+        self.assertEqual(decision.verdict, "done")
+        reference = decision.unresolved_references[0]
+        self.assertEqual(reference["status"], "ambiguous")
+        self.assertIn("data_loader/__init__.py", reference["matches"])
+
+    async def test_unreadable_journaled_file_still_stops_with_named_path(self):
+        class FakeProvider:
+            def tools(self, *args, **kwargs):
+                raise AssertionError("journal evidence failures must not reach the reviewer")
+
+        queued_task = replace(task(), context="Required mutation artifact: src/__init__.py")
+        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
+            with self.assertRaisesRegex(ReviewError, r"change journal.*`src/__init__.py`"):
+                await ReviewService().review(
+                    SimpleNamespace(title="Journal", work_packages=[]), queued_task,
+                    "Changed the package init.", "claude-haiku", self.specs,
+                    self.handlers({}))
+
+
+class RequiredTestRunTests(unittest.IsolatedAsyncioTestCase):
+    specs = [ToolSpec("read_file", "Read", {"type": "object", "properties": {
+        "file_path": {"type": "string"}}})]
+    passing = "collected 3 items\n\n3 passed in 0.42s\nexit code 0"
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        patcher = mock.patch.dict("os.environ", {"CODEPARTNER_EVIDENCE_DIR": self.directory.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.persistence = RoutingPersistence(Path(self.directory.name) / "routing.sqlite3")
+        self.calls = []
+
+    def journal(self, project_files=("uv.lock",)):
+        async def execute_tool(arguments):
+            self.calls.append(arguments["command"])
+            return self.passing
+
+        async def read_file(arguments):
+            if arguments["file_path"] in project_files:
+                return "1: content"
+            raise RuntimeError(f"File {arguments['file_path']} doesn't exist")
+
+        handlers = {"execute_tool": execute_tool, "read_file": read_file}
+        return RollbackJournal(self.persistence, "job", 0, self.specs, handlers), handlers
+
+    async def test_malformed_dispatcher_calls_are_rewritten_and_audited(self):
+        journal, _ = self.journal()
+        wrapped = journal.wrapped_handlers()
+        for command in ("pytest tests/test_a.py -v",
+                        "execute_terminal_command pytest tests/test_a.py -v"):
+            await wrapped["execute_tool"]({"command": command})
+        self.assertTrue(all(call.startswith(
+            "execute_terminal_command --command 'pytest tests/test_a.py -v'")
+            for call in self.calls))
+        evidence = await self.persistence.verification_evidence("job", 0)
+        self.assertEqual([item["metadata"]["normalized_from"] for item in evidence],
+                         ["pytest tests/test_a.py -v",
+                          "execute_terminal_command pytest tests/test_a.py -v"])
+        self.assertTrue(evidence[0]["success"])
+
+    async def test_unsafe_command_is_passed_through_unchanged(self):
+        journal, _ = self.journal()
+        await journal.wrapped_handlers()["execute_tool"]({"command": "pytest x && rm -rf y"})
+        self.assertEqual(self.calls, ["pytest x && rm -rf y"])
+
+    async def test_codepartner_reruns_the_coders_failed_test_command_in_project_env(self):
+        journal, handlers = self.journal()
+        await journal.record_verification(
+            "execute_tool", {"command": "pytest tests/test_a.py -v"},
+            "JetBrainsMcpError: Tool 'pytest' not found", False)
+        service = ImplementationService(_Artifacts(), _TaskExecution(), self.persistence,
+                                        _Reviewer([]))
+        rows = [SimpleNamespace(position=0)]
+        events = [event async for event in service._ensure_required_test_run(
+            "job", rows, journal, self.specs, handlers)]
+        self.assertIn("uv run pytest tests/test_a.py -v", events[0].text)
+        self.assertTrue(self.calls[0].startswith(
+            "execute_terminal_command --command 'uv run pytest tests/test_a.py -v'"))
+        again = [event async for event in service._ensure_required_test_run(
+            "job", rows, journal, self.specs, handlers)]
+        self.assertEqual((again, len(self.calls)), ([], 1))
+
+    def test_blocker_message_shows_the_command_and_next_step(self):
+        never_started = ImplementationService._test_blocker_lines([{
+            "arguments": {"command": "execute_terminal_command pytest tests/test_a.py"},
+            "metadata": {"pytest": {"totals": {}}},
+            "result_excerpt": "Invalid argument format: 'pytest'"}])
+        self.assertIn("never started pytest", never_started[0])
+        self.assertIn("Invalid argument format", never_started[1])
+        self.assertIn("retry review", never_started[2])
+        failed = ImplementationService._test_blocker_lines([{
+            "arguments": {"command": "uv run pytest"},
+            "metadata": {"pytest": {"totals": {"passed": 2, "failed": 1}}},
+            "result_excerpt": ""}])
+        self.assertIn("2 passed, 1 failed", failed[0])
+
+    def test_unrelated_review_failure_does_not_mention_unresolved_references(self):
+        from agent.routing.review import _unresolved_summary
+        unresolved = [{"path": "__init__.py", "sources": ["coder_report"], "status": "ambiguous",
+                       "matches": ["a/__init__.py", "b/__init__.py"], "detail": ""}]
+        unrelated = ReviewError("required unit-test validation is unverified", findings=(
+            ReviewFinding("verification", "Tests not run", "Run them", ("Tests pass",),
+                          ("tests/test_a.py",)),))
+        self.assertEqual(_unresolved_summary(unresolved, unrelated), "")
+        inspection = _unresolved_summary(
+            unresolved, ReviewError("reviewer did not successfully inspect project content"))
+        self.assertIn("\n- `__init__.py` from coder_report: ambiguous", inspection)
+
+
+class ReviewerFormatRepairTests(unittest.IsolatedAsyncioTestCase):
+    specs = [ToolSpec("read_file", "Read", {"type": "object", "properties": {
+        "file_path": {"type": "string"}}})]
+
+    class Provider:
+        def __init__(self, replies):
+            self.replies = list(replies)
+            self.conversations = []
+
+        async def tools(self, messages, specs, **kwargs):
+            self.conversations.append(messages)
+            await kwargs["direct_tool_handlers"]["read_file"]({"file_path": "data/factory.py"})
+            yield TextEvent(self.replies.pop(0))
+            yield DoneEvent("endTurn")
+
+    @staticmethod
+    async def read_file(_arguments):
+        return "class Factory: pass"
+
+    @staticmethod
+    def decision(**overrides):
+        value = {"verdict": "done", "rationale": "Factory and tests delivered",
+                 "evidence": ["25 tests passed in the captured run"],
+                 "inspected_paths": ["data/factory.py"], "findings": [],
+                 "validation_results": []}
+        value.update(overrides)
+        return json.dumps(value)
+
+    def wp_task(self):
+        return replace(task(), id="WP1", context="\n".join((
+            "BEGIN WORK PACKAGE REVIEW CONTRACT",
+            'Required validation: ["All DataLoaderFactory unit tests pass."]',
+            "END WORK PACKAGE REVIEW CONTRACT")))
+
+    async def review(self, provider, queued_task=None):
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            return await ReviewService().review(
+                SimpleNamespace(title="Loaders", work_packages=[]), queued_task or task(),
+                "Changed `data/factory.py`.", "claude-haiku", self.specs,
+                {"read_file": self.read_file})
+
+    async def test_reply_without_json_gets_one_correction_request(self):
+        provider = self.Provider(["Looks good to me!", self.decision()])
+        decision = await self.review(provider)
+        self.assertEqual(decision.verdict, "done")
+        self.assertEqual(len(provider.conversations), 2)
+        self.assertIn("CodePartner rejected your JSON decision: reviewer returned no valid "
+                      "JSON decision", provider.conversations[1][-1]["content"])
+        self.assertEqual(provider.conversations[1][-2],
+                         {"role": "assistant", "content": "Looks good to me!"})
+
+    async def test_status_synonyms_and_paraphrased_expectations_are_accepted(self):
+        provider = self.Provider([self.decision(validation_results=[{
+            "expectation": "all DataLoaderFactory unit tests pass",
+            "category": "Required", "status": "passed", "evidence": "25 passed"}])])
+        decision = await self.review(provider, self.wp_task())
+        self.assertEqual(decision.verdict, "done")
+        self.assertEqual(len(provider.conversations), 1)
+        self.assertEqual(decision.validation_results[0]["status"], "satisfied")
+        self.assertEqual(decision.validation_results[0]["evidence"], ["25 passed"])
+
+    async def test_still_malformed_reply_names_the_exact_field(self):
+        bad = self.decision(validation_results=[{
+            "expectation": "All DataLoaderFactory unit tests pass.",
+            "category": "required", "status": "green", "evidence": []}])
+        provider = self.Provider([bad, bad])
+        with self.assertRaises(ReviewFormatError) as raised:
+            await self.review(provider, self.wp_task())
+        message = str(raised.exception)
+        self.assertIn("validation_results[0] status='green'", message)
+        self.assertIn("still malformed after one correction request", message)
+        self.assertEqual(len(provider.conversations), 2)
 
 
 if __name__ == "__main__":

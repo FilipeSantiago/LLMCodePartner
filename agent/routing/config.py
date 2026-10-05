@@ -65,6 +65,7 @@ def load_routing_config(path: Path | str | None = None) -> RoutingConfig:
         cli_model = str(value.get("cli_model") or "").strip() or None
         gateway_mode = str(value.get("gateway_mode") or "preferred").lower()
         reasoning_effort = value.get("reasoning_effort")
+        review_reasoning_effort = value.get("review_reasoning_effort")
         if provider not in {"claude", "codex"}:
             raise RoutingConfigError(f"model {name!r} has unsupported provider")
         if executor not in {"claude-cli", "codex-cli"}:
@@ -75,8 +76,12 @@ def load_routing_config(path: Path | str | None = None) -> RoutingConfig:
             raise RoutingConfigError(f"model {name!r} has invalid gateway_mode")
         if reasoning_effort is not None and reasoning_effort not in {"low", "medium", "high", "xhigh"}:
             raise RoutingConfigError(f"model {name!r} has invalid reasoning_effort")
+        if (review_reasoning_effort is not None
+                and review_reasoning_effort not in {"low", "medium", "high", "xhigh"}):
+            raise RoutingConfigError(
+                f"model {name!r} has invalid review_reasoning_effort")
         models[name] = ModelRef(name, provider, executor, cli_model, gateway_mode,
-                                reasoning_effort)
+                                reasoning_effort, review_reasoning_effort)
 
     tiers: dict[str, tuple[str, ...]] = {}
     raw_tiers = ((raw.get("routing") or {}).get("tiers") or {})

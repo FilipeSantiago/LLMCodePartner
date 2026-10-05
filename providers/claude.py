@@ -24,6 +24,7 @@ from claude_agent_sdk import (
 )
 
 from mcp_bridge import bridge
+from mcp_bridge.bridge import TOOL_TIMEOUT
 from mcp_bridge import server as engine
 from mcp_bridge.models import Event, Run, TextEvent
 from mcp_bridge.registry import ToolSpec, allowed_for
@@ -34,12 +35,43 @@ log = logging.getLogger("codepartner.providers.claude")
 SERVER_NAME = "jetbrains"
 
 
+class ClaudeResultError(RuntimeError):
+    """The CLI finished with an error result; carries its real explanation."""
+
+
+def _result_error_text(message: ResultMessage) -> str | None:
+    """Explain an error result. The SDK's own exception only names the subtype,
+    which is "success" when the final turn was an API or tool-call-parse error."""
+    if not message.is_error:
+        return None
+    text = "; ".join(message.errors or []) or (message.result or "").strip() or message.subtype
+    if message.api_error_status:
+        text = f"{text} (API status {message.api_error_status})"
+    log.warning("claude error result: subtype=%s api_status=%s text=%r",
+                message.subtype, message.api_error_status, text[:500])
+    return text
+
+
+async def _query_messages(prompt: str, options: ClaudeAgentOptions):
+    """`query()` that re-raises the SDK's trailing exception with the reported reason."""
+    reported: str | None = None
+    try:
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, ResultMessage):
+                reported = _result_error_text(message)
+            yield message
+    except Exception as exc:
+        if reported is not None:
+            raise ClaudeResultError(f"Claude Code returned an error result: {reported}") from exc
+        raise
+
+
 class ClaudeProvider(Provider):
     NAME = "claude"
 
     async def stream(self, prompt: str, system: str | None = None
                      ) -> AsyncIterator[tuple[str, str | None]]:
-        async for message in query(prompt=prompt, options=self._plain_options(system)):
+        async for message in _query_messages(prompt, self._plain_options(system)):
             if isinstance(message, AssistantMessage):
                 for b in message.content:
                     if isinstance(b, TextBlock):
@@ -124,10 +156,13 @@ class ClaudeProvider(Provider):
             # The Agent SDK may treat ``env`` as the complete subprocess
             # environment. Preserve the authenticated CLI session while adding
             # a gateway override.
-            env={**os.environ, **(execution_env or {})},
+            # The CLI reads MCP_TOOL_TIMEOUT in milliseconds while CodePartner's
+            # setting is in seconds; without this the CLI abandons IDE tools after ~0.1s.
+            env={**os.environ, "MCP_TOOL_TIMEOUT": str(TOOL_TIMEOUT * 1000),
+                 **(execution_env or {})},
         )
         terminal = "endTurn"
-        async for message in query(prompt=prompt, options=options):
+        async for message in _query_messages(prompt, options):
             if isinstance(message, AssistantMessage):
                 for b in message.content:
                     if isinstance(b, TextBlock) and b.text:

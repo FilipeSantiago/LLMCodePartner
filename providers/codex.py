@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import shlex
+from collections import Counter
 from collections.abc import AsyncIterator
 
 from mcp_bridge import mcp_http
@@ -107,6 +108,7 @@ class CodexProvider(Provider):
                      gateway_url: str | None = None, concrete_model: bool = False,
                      reasoning_effort: str | None = None,
                      direct_tool_handlers: dict | None = None,
+                     reviewer_mode: bool = False,
                     **kwargs) -> AsyncIterator[Event]:
         """Stateful like Claude's, and for the same reason: the `codex` process stays
         alive across HTTP requests, blocked inside its MCP tool call, while JetBrains
@@ -127,7 +129,7 @@ class CodexProvider(Provider):
             async def strategy(run: Run, prompt: str, system: str | None,
                                 specs: list[ToolSpec]) -> str:
                 return await self._run_strategy(run, prompt, system, model, gateway_url,
-                                                concrete_model, reasoning_effort)
+                                                concrete_model, reasoning_effort, reviewer_mode)
 
             run = engine.start_run(prompt, system, specs, strategy=strategy,
                                    allowed=allowed_for(role),
@@ -142,29 +144,65 @@ class CodexProvider(Provider):
     async def _run_strategy(self, run: Run, prompt: str, system: str | None,
                             model: str | None = None, gateway_url: str | None = None,
                             concrete_model: bool = False,
-                            reasoning_effort: str | None = None) -> str:
+                            reasoning_effort: str | None = None,
+                            reviewer_mode: bool = False) -> str:
         """The engine `Strategy`: publish this Run's bridged tools, run `codex exec`
         against them, and push its output onto the Run as neutral events. Returns the
         terminal reason. The MCP endpoint is opened and closed with the process, so a
         finished (or cancelled) run leaves nothing callable behind."""
         async with mcp_http.serve_run(run) as url:
-            args = self._base_args(model, gateway_url, concrete_model, reasoning_effort) + [
-                "-c", f'mcp_servers.{mcp_http.SERVER_NAME}.url="{url}"',
-            ]
+            args = self._base_args(model, gateway_url, concrete_model, reasoning_effort,
+                                   reviewer_mode) + self._mcp_args(
+                                       url, run.registry.names(), reviewer_mode)
+            item_types: Counter[str] = Counter()
+            reviewer_tool_activity: list[dict[str, str | bool]] = []
             async for obj in self._exec(args, self._join(prompt, system)):
+                if reviewer_mode and obj.get("type") in {"item.started", "item.completed"}:
+                    item = obj.get("item") or {}
+                    if isinstance(item, dict):
+                        item_type = str(item.get("type") or "unknown")
+                        item_types[item_type] += 1
+                        if item_type == "mcp_tool_call":
+                            reviewer_tool_activity.append({
+                                "server": str(item.get("server") or "unknown"),
+                                "tool": str(item.get("tool") or item.get("name") or "unknown"),
+                                "status": str(item.get("status") or "unknown"),
+                                "has_error": bool(item.get("error")),
+                            })
                 event = parse_event(obj)
                 if event is not None:
                     await run.put(event)
                 usage = usage_of(obj)
                 if usage is not None:
                     run.usage = usage
-                    log.info("codex coder usage: model=%s usage=%s",
+                    log.info("codex usage: role=%s model=%s usage=%s",
+                             "reviewer" if reviewer_mode else "coder",
                              model_for(model) or "default", usage)
+            if reviewer_mode:
+                log.info("codex_reviewer_activity model=%s item_types=%s mcp_tools=%s",
+                         model or "default", dict(item_types), reviewer_tool_activity)
         return "endTurn"
+
+    @staticmethod
+    def _mcp_args(url: str, tool_names: list[str], reviewer_mode: bool) -> list[str]:
+        server = mcp_http.SERVER_NAME
+        args = [
+            "-c", f'mcp_servers.{server}.url="{url}"',
+            "-c", f"mcp_servers.{server}.enabled_tools={json.dumps(tool_names)}",
+        ]
+        if reviewer_mode:
+            # This endpoint is private to one Run and its registry already exposes
+            # only optimizer-approved read/search tools. Pre-approve those reads so
+            # noninteractive `codex exec` never tries to open an approval prompt.
+            args += [
+                "-c", f'mcp_servers.{server}.default_tools_approval_mode="approve"',
+            ]
+        return args
 
     def _base_args(self, model: str | None = None, gateway_url: str | None = None,
                     concrete_model: bool = False,
-                    reasoning_effort: str | None = None) -> list[str]:
+                    reasoning_effort: str | None = None,
+                    reviewer_mode: bool = False) -> list[str]:
         """`codex exec` flags shared by both surfaces. `read-only` is the locked tool
         surface: codex may reason, but every write has to go through the IDE tools."""
         args = [BIN, "exec", "--json", "--skip-git-repo-check", "--ephemeral",
@@ -193,6 +231,10 @@ class CodexProvider(Provider):
         args += shlex.split(os.getenv("CODEX_ARGS", ""))
         # The sandbox goes LAST on purpose: a repeated flag wins on the right, so no
         # escape-hatch value can loosen it.
+        if reviewer_mode:
+            # Reviewer evidence must come only from the request-scoped MCP endpoint,
+            # never an unrelated server inherited from ~/.codex/config.toml.
+            args += ["--ignore-user-config", "-c", "features.shell_tool=false"]
         return args + ["-s", "read-only"]
 
     def _join(self, prompt: str, system: str | None) -> str:

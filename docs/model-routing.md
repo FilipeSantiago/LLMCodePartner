@@ -2,10 +2,11 @@
 
 `/implement WP1-T1` resolves an existing OpenSpec task, selects a model from the
 task's `simple`, `medium`, or `complex` candidate tier, and starts the selected
-authenticated coding CLI. `/execute` is an alias. `/implement WP1` expands an
-entire work package, and multiple task/package selectors are executed in user
-order, sequentially. It does not change `/spec`, `/update`, ordinary chat, or
-the optimizer acceptance workflow.
+authenticated coding CLI. `/implement WP1` expands an entire work package in
+dependency order, while `/implement EPIC1` expands its WPs. Tasks remain the
+routing unit, but the assembled WP is the primary validation and review boundary.
+The legacy `/run` syntax is normalized into the same durable implementation job;
+there is no parallel executor workflow.
 
 ## Configuration
 
@@ -42,7 +43,11 @@ inside the existing persistent `agent-home` volume. It records model decisions,
 attempts, gateway usage, timing, and available token usage but never prompts or
 credentials.
 
-Implementation jobs and their ordered task statuses are persisted in the same
-database. A task is marked complete in its OpenSpec artifact only after its routed
-CLI run reaches a successful terminal event. A failed task stops the remaining
-queue, avoiding implicit execution of potentially dependent work.
+Implementation jobs, ordered task statuses, refinement drafts, routing evidence,
+and WP review outcomes are persisted in the same database. A WP executes or
+reuses all applicable tasks before review. The reviewer returns `PASS` only with
+sufficient contract evidence, `BLOCK` only for a concrete contract violation or
+regression, and `UNVERIFIED` when review or infrastructure could not establish an
+answer. `UNVERIFIED` is not sent to the coder as an implementation failure. A
+failed task still stops the remaining queue, avoiding implicit execution of
+dependent work.

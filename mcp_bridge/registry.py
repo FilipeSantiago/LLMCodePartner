@@ -113,12 +113,35 @@ class ToolRegistry:
                 return dispatcher.spec.name, prepare_dispatcher_read(arguments)
         spec = self.require(operation, domain); entry = self._entries[spec.name]
         from mcp_bridge.adapters import prepare_arguments
-        return spec.name, prepare_arguments(entry.definition.adapter, spec.schema, arguments)
+        prepared = prepare_arguments(entry.definition.adapter, spec.schema, arguments)
+        self._validate_mutation_targets(entry, prepared)
+        return spec.name, prepared
     def prepare_advertised_call(self, name, arguments):
         entry = self._entries.get(name)
         if entry is None: raise LookupError(f"tool {name!r} is not executable in this request")
         from mcp_bridge.adapters import prepare_arguments
-        return name, prepare_arguments(entry.definition.adapter, entry.spec.schema, arguments)
+        prepared = prepare_arguments(entry.definition.adapter, entry.spec.schema, arguments)
+        self._validate_mutation_targets(entry, prepared)
+        return name, prepared
+    @staticmethod
+    def _validate_mutation_targets(entry, arguments):
+        if not entry.definition.capabilities.intersection({CAP_WRITE, CAP_REFACTOR}):
+            return
+        from mcp_bridge.adapters import mutation_targets
+        if not mutation_targets(entry.definition.adapter, arguments):
+            raise ValueError(
+                f"{entry.spec.name} has no canonical project-relative mutation target")
+    def mutation_targets(self, name, arguments):
+        entry = self._entries.get(name)
+        if entry is None: raise LookupError(f"tool {name!r} is not executable in this request")
+        if not entry.definition.capabilities.intersection({CAP_WRITE, CAP_REFACTOR}):
+            return ()
+        from mcp_bridge.adapters import mutation_targets
+        return mutation_targets(entry.definition.adapter, arguments)
+    def mutation_operation(self, name):
+        entry = self._entries.get(name)
+        if entry is None: raise LookupError(f"tool {name!r} is not executable in this request")
+        return entry.definition.adapter
 def source_mutation_decisions(specs):
     r = ToolRegistry(); r.register(specs)
     ops = {OP_FILE_CREATE, OP_FILE_REPLACE, OP_FILE_PATCH, OP_FILE_DELETE, OP_SYMBOL_RENAME, OP_FILE_FORMAT}
@@ -128,7 +151,8 @@ def has_existing_source_editor(specs):
     return bool(r.candidates(OP_FILE_REPLACE, DOMAIN_SOURCE) or r.candidates(OP_FILE_PATCH, DOMAIN_SOURCE))
 def mutating_tools(specs): return tuple(d.name for d in source_mutation_decisions(specs))
 def is_mutating_tool(name):
-    d = _definition(name); return bool(d and d.domain == DOMAIN_SOURCE and d.operations & {OP_FILE_CREATE, OP_FILE_REPLACE, OP_FILE_PATCH, OP_FILE_DELETE, OP_SYMBOL_RENAME, OP_FILE_FORMAT})
+    d = _definition(name)
+    return bool(d and d.capabilities.intersection({CAP_WRITE, CAP_REFACTOR}))
 def operations_for(name):
     d = _definition(name)
     return d.operations if d else frozenset()

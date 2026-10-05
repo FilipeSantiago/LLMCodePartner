@@ -113,6 +113,23 @@ class ModelForTier(unittest.TestCase):
 
 
 class SandboxArgs(unittest.TestCase):
+    def test_reviewer_preapproves_only_the_ephemeral_mcp_registry(self):
+        args = CodexProvider._mcp_args(
+            "http://127.0.0.1:7777/mcp/token", ["read_file", "search_file"], True)
+        self.assertIn('mcp_servers.jetbrains.default_tools_approval_mode="approve"', args)
+        self.assertIn('mcp_servers.jetbrains.enabled_tools=["read_file", "search_file"]', args)
+
+    def test_coder_mcp_registry_is_not_automatically_approved(self):
+        args = CodexProvider._mcp_args(
+            "http://127.0.0.1:7777/mcp/token", ["read_file", "create_new_file"], False)
+        self.assertFalse(any("default_tools_approval_mode" in item for item in args))
+
+    def test_reviewer_disables_shell_after_extra_args(self):
+        with _clean_env(CODEX_ARGS="-c features.shell_tool=true"):
+            args = CodexProvider()._base_args(reviewer_mode=True)
+        self.assertEqual(args[-5:], ["--ignore-user-config", "-c",
+                                     "features.shell_tool=false", "-s", "read-only"])
+
     def test_every_invocation_is_read_only(self):
         with _clean_env():
             args = CodexProvider()._base_args()

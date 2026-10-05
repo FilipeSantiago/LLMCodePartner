@@ -19,6 +19,7 @@ class ModelRef:
     cli_model: str | None
     gateway_mode: str = "preferred"
     reasoning_effort: str | None = None
+    review_reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)

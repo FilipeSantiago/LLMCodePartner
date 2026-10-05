@@ -20,8 +20,12 @@ class ModelRoutingService:
         )
         self.health = health or ExecutorHealth(config.failure_threshold)
 
-    async def route(self, task: Task, change_id: str, project_path: str) -> ExecutionDecision:
+    async def route(self, task: Task, change_id: str, project_path: str,
+                    exclude: frozenset[str] = frozenset()) -> ExecutionDecision:
+        """Pick a model for the task; `exclude` drops models that already failed it,
+        unless that would leave no candidate."""
         candidates = self.config.candidates_for(task.complexity)
+        candidates = tuple(item for item in candidates if item not in exclude) or candidates
         eligible = tuple(candidate for candidate in candidates if self.health.available(
             candidate, self.config.models[candidate].executor, True
         )) or candidates

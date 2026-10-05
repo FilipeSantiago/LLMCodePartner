@@ -77,7 +77,7 @@ async def call_tool(run: Run, name: str, arguments: dict) -> str:
         log.info("mcp_tool_succeeded route=direct_ide_mcp trace_id=%s run_id=%s name=%s",
                  run.metadata.get("trace_id"), run.run_id, name)
         debug(log, "bridge.direct_tool_result", trace_id=run.metadata.get("trace_id"),
-              run_id=run.run_id, tool_name=name, result=text)
+              run_id=run.run_id, tool_name=name, result_length=len(text or ""))
         return text
     tool_call_id = "call_" + uuid4().hex[:24]
     fut = register(tool_call_id, run, name, arguments)

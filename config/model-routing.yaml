@@ -45,6 +45,7 @@ models:
     executor: codex-cli
     cli_model: gpt-5.6-luna
     reasoning_effort: low
+    review_reasoning_effort: medium
     gateway_mode: preferred
 
   claude-sonnet:

@@ -112,6 +112,35 @@ class RegistryEnforcesTheRole(unittest.TestCase):
         registry.register([malformed])
         self.assertTrue(registry.is_empty())
 
+    def test_registry_exposes_canonical_patch_targets(self):
+        registry = ToolRegistry(allowed_for(ROLE_CODER))
+        registry.register([_spec("apply_patch")])
+        patch = """diff --git a/src/old.py b/src/new.py
+rename from src/old.py
+rename to src/new.py
+--- a/src/a.py
++++ b/src/a.py
+*** Add File: src/added.py
+"""
+        self.assertEqual(
+            registry.mutation_targets("apply_patch", {"input": patch}),
+            ("src/old.py", "src/new.py", "src/a.py", "src/added.py"),
+        )
+
+    def test_registry_extracts_both_rename_targets_and_format_arrays(self):
+        registry = ToolRegistry(allowed_for(ROLE_CODER))
+        registry.register([_spec("rename_refactoring"), _spec("reformat_file")])
+        self.assertEqual(
+            registry.mutation_targets(
+                "rename_refactoring", {"oldPath": "src/a.py", "newPath": "src/b.py"}),
+            ("src/a.py", "src/b.py"),
+        )
+        self.assertEqual(
+            registry.mutation_targets(
+                "reformat_file", {"files": ["src/a.py", "src/b.py"]}),
+            ("src/a.py", "src/b.py"),
+        )
+
     def test_artifact_operation_policy_keeps_exact_lookup_not_regex_fallback(self):
         registry = ToolRegistry(allowed_operations=frozenset({
             OP_FILE_READ, OP_FILE_SEARCH, OP_FILE_CREATE,
@@ -135,6 +164,8 @@ class RegistryEnforcesTheRole(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             prepare_dispatcher_read({"file_path": "openspec/x", "limit": 5001})
+        with self.assertRaisesRegex(ValueError, "positive, 1-based"):
+            prepare_dispatcher_read({"file_path": "openspec/x", "offset": 0})
 
 
 if __name__ == "__main__":

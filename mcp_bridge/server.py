@@ -27,9 +27,17 @@ async def _run(run: Run, prompt: str, system: str | None,
                specs: list[ToolSpec], strategy: Strategy) -> None:
     terminal = "endTurn"
     try:
-        debug(log, "run.strategy_started", trace_id=run.metadata.get("trace_id"),
-              run_id=run.run_id, prompt=prompt, system=system,
-              registered_tools=[vars(spec) for spec in specs])
+        if run.metadata.get("reviewer"):
+            # Reviewer prompts contain IDE MCP file snapshots. Keep diagnostic
+            # visibility without copying project contents into logs.
+            debug(log, "run.strategy_started", trace_id=run.metadata.get("trace_id"),
+                  run_id=run.run_id, reviewer_model=run.metadata.get("reviewer_model"),
+                  prompt_length=len(prompt), has_system=bool(system),
+                  registered_tools=[vars(spec) for spec in specs])
+        else:
+            debug(log, "run.strategy_started", trace_id=run.metadata.get("trace_id"),
+                  run_id=run.run_id, prompt=prompt, system=system,
+                  registered_tools=[vars(spec) for spec in specs])
         terminal = await strategy(run, prompt, system, specs)
     except asyncio.CancelledError:
         bridge.discard(run)

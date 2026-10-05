@@ -33,10 +33,12 @@ class TaskExecutionService:
                       on_decision: Callable[[ExecutionDecision], Awaitable[None]] | None = None,
                       execution_instruction: str = "",
                       direct_tool_handlers: dict | None = None,
+                      exclude_models: frozenset[str] = frozenset(),
                       ) -> AsyncIterator[Event]:
         # The active project belongs to the IDE request that advertised `specs`.
         # Never route through a process-wide IDE/project setting.
-        decision = await self.router.route(task, change_id, "bridge-request")
+        decision = await self.router.route(task, change_id, "bridge-request",
+                                           exclude=exclude_models)
         await self.persistence.record_decision(decision)
         if on_decision is not None:
             await on_decision(decision)
@@ -52,12 +54,44 @@ class TaskExecutionService:
         task_prompt = "\n".join(filter(None, [
             f"Implement OpenSpec task {task.id}: {task.title}",
             f"Description: {task.description}",
+            f"Acceptance criteria: {task.acceptance_criteria or [task.description]}",
             f"Context: {task.context}",
             f"Preferred capability: {task.preferred_capability}",
             (f"Additional execution instruction: {execution_instruction}"
              if execution_instruction else ""),
             "Use the IDE MCP tools as needed to complete the task's actual objective.",
-            "Finish with a concrete account of the result, remaining gaps, and relevant evidence.",
+            "Change existing files with focused patches (apply_patch) instead of re-creating "
+            "whole files, and keep each tool call's arguments small; very large tool-call "
+            "payloads can fail to parse and stop the task.",
+            "If only the universal `execute_tool` is available, it runs IDE tools, not shell "
+            "commands: run tests as `execute_terminal_command --command \"uv run pytest "
+            "tests/test_x.py -v\"` (named `--param value` arguments only).",
+            "If this task requires Python verification, inspect the project metadata and "
+            "configured IDE interpreter or run configurations before declaring the checks "
+            "unavailable. Prefer the project-native environment (for example `uv run pytest` "
+            "or `.venv/bin/python -m pytest` when those are actually present) over a bare "
+            "system `python` or `pytest`. Do not add test execution to a research or inspection "
+            "task unless its own description or acceptance criteria requires it.",
+            "Finish with exactly one JSON object using this handoff schema: "
+            '{"schema_version":1,"task_id":"<task id>","summary":"<work done>",'
+            '"changed_files":[{"path":"project/relative/path","change":'
+            '"created|modified|deleted|renamed|moved","purpose":"<why>"}],'
+            '"criteria":[{"criterion":"<requirement>","status":'
+            '"satisfied|blocked","paths":["project/relative/path"],'
+            '"evidence_ids":[]}],"remaining_gaps":[],"execution_dispute":null}. '
+            "List every created or changed file. Write every path relative to the repository "
+            "root and include its directories (for example, tests/test_trainer.py, never only "
+            "test_trainer.py). This manifest helps discovery but does not replace the mutation "
+            "journal or captured execution evidence. "
+            "Evidence IDs must be numeric IDs actually issued by CodePartner; descriptive labels "
+            "are claims, not evidence. If you disagree with a reviewer statement that code or "
+            "tests do not compile, collect, or run, replace execution_dispute:null with an object "
+            "containing claim, source_paths, working_directory, and steps. Each step must name an "
+            "advertised tool and its exact arguments so CodePartner can replay it for the reviewer. "
+            "Do not create a project-local runner to support a dispute. "
+            "Do not claim a test ran unless it did. Do not create summary, completion, "
+            "evidence, verification, or test-result files solely to communicate with the "
+            "reviewer; return those details in your final response instead.",
         ]))
         prefix = [message for message in messages[:-1] if message.get("role") == "system"]
         return [*prefix, {"role": "user", "content": task_prompt}]

@@ -3,6 +3,8 @@ import time
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from agent.spec.modes import MODES
+
 router = APIRouter()
 
 
@@ -20,4 +22,6 @@ class ModelList(BaseModel):
 
 @router.get("/v1/models", response_model=ModelList)
 def list_models() -> ModelList:
-    return ModelList(data=[Model(id="dumb-router", created=int(time.time()))])
+    # Each mode is a virtual model so the IDE chat model picker selects it.
+    created = int(time.time())
+    return ModelList(data=[Model(id=mode.model_id, created=created) for mode in MODES])
