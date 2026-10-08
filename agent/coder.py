@@ -18,9 +18,10 @@ from mcp_bridge.registry import ROLE_CODER, ToolSpec
 
 CODER_SYSTEM = (
     "You are a coding agent working inside the user's IDE project. You receive an "
-    "objective, self-contained request that already lists the files relevant to the "
-    "task. Use the available JetBrains read tools to read those files (and any others "
-    "you need) before making changes. Then ACTUALLY APPLY the change by calling the "
+    "objective. Treat mentioned files as hints, and inspect other ordinary project "
+    "files when needed. Use codepartner_search_in_file and codepartner_read_file for "
+    "targeted discovery; read only the windows needed to act. Then ACTUALLY APPLY "
+    "the change by calling the "
     "available write tools — create files with the create-file tool and edit existing "
     "files with the replace/edit-file tool (or the rename-refactoring tool for symbol "
     "renames). Make minimal, targeted edits; do not rewrite whole files when a small "
@@ -43,7 +44,13 @@ class Coder:
 
     async def run(self, specs: list[ToolSpec],
                   direct_tool_handlers: dict | None = None) -> AsyncIterator[Event]:
-        augmented = [{"role": "system", "content": CODER_SYSTEM}, *self._messages]
+        system = CODER_SYSTEM
+        if os.getenv("CODEPARTNER_ACI_ENABLED", "true").lower() == "false":
+            system = system.replace(
+                "Use codepartner_search_in_file and codepartner_read_file for targeted discovery; "
+                "read only the windows needed to act.",
+                "Use the advertised IDE tools to inspect relevant source.")
+        augmented = [{"role": "system", "content": system}, *self._messages]
         # Read at call time (not import), like `pipeline.is_enabled` — `.env` may load
         # after this module is imported.
         provider = providers.get(os.getenv("CODER_PROVIDER", "claude"))

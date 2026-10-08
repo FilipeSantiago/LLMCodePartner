@@ -1,9 +1,11 @@
 import asyncio
 import logging
 import os
+import shlex
 from uuid import uuid4
 
 from mcp_bridge.models import MutationEvent, Run, ToolCallEvent
+from mcp_bridge.agent_tools import tool_failed
 from mcp_bridge.registry import is_mutating_tool, operations_for
 from logger.diagnostic import debug
 
@@ -25,6 +27,7 @@ def register(tool_call_id: str, run: Run, name: str, arguments: dict) -> asyncio
     _runs[tool_call_id] = run
     run.pending[tool_call_id] = fut
     run.tool_names[tool_call_id] = name
+    run.tool_arguments[tool_call_id] = arguments
     debug(log, "bridge.tool_call_registered", trace_id=run.metadata.get("trace_id"),
           run_id=run.run_id, tool_call_id=tool_call_id, tool_name=name,
           arguments=arguments, pending_call_ids=sorted(run.pending))
@@ -52,6 +55,19 @@ async def call_tool(run: Run, name: str, arguments: dict) -> str:
     the future until the client returns a `role:"tool"` result. Raises
     `asyncio.TimeoutError` if the client doesn't answer within `TOOL_TIMEOUT`.
     """
+    if run.tool_interface is not None:
+        result = await run.tool_interface.execute(
+            name, arguments, lambda tool_name, tool_args: _call_backend(run, tool_name, tool_args))
+        run.tool_interface.metrics["model_output_bytes"] += len(result.encode())
+        return result
+    return await _call_backend(run, name, arguments)
+
+
+async def _call_backend(run: Run, name: str, arguments: dict) -> str:
+    if run.metadata.get("stop_requested"):
+        return "Error: this job is being stopped; no further tool calls are allowed."
+    if run.tool_interface is not None:
+        run.tool_interface.metrics["backend_calls"] += 1
     # Every route, including direct standalone tools, goes through the per-run
     # catalog adapter.  A provider cannot bypass dispatcher/schema restrictions.
     try:
@@ -59,30 +75,50 @@ async def call_tool(run: Run, name: str, arguments: dict) -> str:
     except (LookupError, ValueError) as exc:
         return f"Error: invalid MCP tool call: {exc}"
     handler = run.direct_tool_handlers.get(name)
-    if handler is not None:
-        log.info("mcp_tool_route route=direct_ide_mcp trace_id=%s run_id=%s name=%s",
-                 run.metadata.get("trace_id"), run.run_id, name)
+    effective_name = _effective_mutation_name(name, arguments)
+    if handler is not None and effective_name:
+        # A stop must wait for this write to finish; see `has_inflight_mutation`.
+        run.metadata["inflight_direct_mutations"] = (
+            run.metadata.get("inflight_direct_mutations", 0) + 1)
         try:
-            debug(log, "bridge.direct_tool_started", trace_id=run.metadata.get("trace_id"),
-                  run_id=run.run_id, tool_name=name, arguments=arguments)
-            text = await handler(arguments)
-        except Exception as exc:
-            log.warning("mcp_tool_failed route=direct_ide_mcp trace_id=%s run_id=%s name=%s error_type=%s",
-                        run.metadata.get("trace_id"), run.run_id, name, type(exc).__name__)
-            return f"Error: direct PyCharm MCP tool '{name}' failed: {exc}"
-        required = set(run.metadata.get("required_operations", ()))
-        if is_mutating_tool(name) and (not required or required.intersection(operations_for(name))):
-            run.mutating_tool_succeeded = True
-            await run.put(MutationEvent(name, arguments))
-        log.info("mcp_tool_succeeded route=direct_ide_mcp trace_id=%s run_id=%s name=%s",
-                 run.metadata.get("trace_id"), run.run_id, name)
-        debug(log, "bridge.direct_tool_result", trace_id=run.metadata.get("trace_id"),
-              run_id=run.run_id, tool_name=name, result_length=len(text or ""))
-        return text
+            return await _call_direct(run, handler, name, arguments, effective_name)
+        finally:
+            run.metadata["inflight_direct_mutations"] -= 1
+    if handler is not None:
+        return await _call_direct(run, handler, name, arguments, effective_name)
     tool_call_id = "call_" + uuid4().hex[:24]
     fut = register(tool_call_id, run, name, arguments)
     await run.put(ToolCallEvent(tool_call_id, name, arguments))
-    return await await_result(tool_call_id, fut)
+    result = await await_result(tool_call_id, fut)
+    if run.tool_interface is not None:
+        run.tool_interface.metrics["backend_output_bytes"] += len(result.encode())
+    return result
+
+
+async def _call_direct(run: Run, handler, name: str, arguments: dict,
+                       effective_name: str | None) -> str:
+    log.info("mcp_tool_route route=direct_ide_mcp trace_id=%s run_id=%s name=%s",
+             run.metadata.get("trace_id"), run.run_id, name)
+    try:
+        debug(log, "bridge.direct_tool_started", trace_id=run.metadata.get("trace_id"),
+              run_id=run.run_id, tool_name=name, arguments=arguments)
+        text = await handler(arguments)
+    except Exception as exc:
+        log.warning("mcp_tool_failed route=direct_ide_mcp trace_id=%s run_id=%s name=%s error_type=%s",
+                    run.metadata.get("trace_id"), run.run_id, name, type(exc).__name__)
+        return f"Error: direct PyCharm MCP tool '{name}' failed: {exc}"
+    required = set(run.metadata.get("required_operations", ()))
+    if (effective_name and not tool_failed(text)
+            and (not required or required.intersection(operations_for(effective_name)))):
+        run.mutating_tool_succeeded = True
+        await run.put(MutationEvent(name, arguments))
+    log.info("mcp_tool_succeeded route=direct_ide_mcp trace_id=%s run_id=%s name=%s",
+             run.metadata.get("trace_id"), run.run_id, name)
+    debug(log, "bridge.direct_tool_result", trace_id=run.metadata.get("trace_id"),
+          run_id=run.run_id, tool_name=name, result_length=len(text or ""))
+    if run.tool_interface is not None:
+        run.tool_interface.metrics["backend_output_bytes"] += len(text.encode())
+    return text
 
 
 def resolve(tool_call_id: str, content: str) -> Run | None:
@@ -105,9 +141,12 @@ def resolve(tool_call_id: str, content: str) -> Run | None:
     # not declare a project mutation in that case: fallback is only unsafe after
     # a write actually succeeded.
     tool_name = run.tool_names.get(tool_call_id, "") if run else ""
+    effective_name = _effective_mutation_name(
+        tool_name, run.tool_arguments.get(tool_call_id, {}) if run else {})
     required = set(run.metadata.get("required_operations", ())) if run else set()
-    if (run is not None and is_mutating_tool(tool_name) and "error" not in (content or "").lower()
-            and (not required or required.intersection(operations_for(tool_name)))):
+    if (run is not None and effective_name
+            and not tool_failed(content)
+            and (not required or required.intersection(operations_for(effective_name)))):
         run.mutating_tool_succeeded = True
     fut.set_result(content)
     log.info("mcp_tool_result_received route=ide_bridge trace_id=%s run_id=%s id=%s name=%s",
@@ -121,6 +160,31 @@ def run_for(tool_call_id: str) -> Run | None:
     return _runs.get(tool_call_id)
 
 
+def has_inflight_mutation(run: Run) -> bool:
+    """True while a write may still be applied: a direct write in progress, or a
+    mutating IDE tool call whose result has not come back yet."""
+    if run.metadata.get("inflight_direct_mutations", 0) > 0:
+        return True
+    return any(not fut.done() and _effective_mutation_name(
+                   run.tool_names.get(call_id, ""), run.tool_arguments.get(call_id, {}))
+               for call_id, fut in run.pending.items())
+
+
+def _effective_mutation_name(name: str, arguments: dict) -> str | None:
+    if is_mutating_tool(name):
+        return name
+    if name.rsplit("__", 1)[-1] != "execute_tool":
+        return None
+    command = arguments.get("command")
+    if not isinstance(command, str):
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    return tokens[0] if tokens and is_mutating_tool(tokens[0]) else None
+
+
 def discard(run: Run) -> None:
     """Clean up a finished/cancelled/timed-out run: cancel leftover futures and
     drop all of its tool_call_ids from the routing tables."""
@@ -131,6 +195,7 @@ def discard(run: Run) -> None:
             fut.cancel()
         _runs.pop(tid, None)
     run.pending.clear()
+    run.tool_arguments.clear()
     if ids:
         log.info("cleanup run tool_calls=%d", len(ids))
     debug(log, "bridge.run_discarded", trace_id=run.metadata.get("trace_id"),

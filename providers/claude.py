@@ -27,7 +27,7 @@ from mcp_bridge import bridge
 from mcp_bridge.bridge import TOOL_TIMEOUT
 from mcp_bridge import server as engine
 from mcp_bridge.models import Event, Run, TextEvent
-from mcp_bridge.registry import ToolSpec, allowed_for
+from mcp_bridge.registry import ROLE_CODER, ToolSpec, allowed_for
 from providers.base import Provider
 
 log = logging.getLogger("codepartner.providers.claude")
@@ -108,7 +108,8 @@ class ClaudeProvider(Provider):
 
             run = engine.start_run(prompt, system, specs, strategy=strategy,
                                    allowed=allowed_for(role),
-                                   direct_tool_handlers=direct_tool_handlers)
+                                   direct_tool_handlers=direct_tool_handlers,
+                                   agent_tool_interface=role == ROLE_CODER)
             run.metadata.update(run_metadata or {})
 
         async for event in self._drain_queue(run):
@@ -171,6 +172,7 @@ class ClaudeProvider(Provider):
                 terminal = message.terminal_reason
                 run.usage = message.usage
                 run.model_usage = message.model_usage
+                run.metadata["cost_usd"] = message.total_cost_usd
                 log.info(
                     "claude coder usage: model=%s cost_usd=%s model_usage=%s",
                     model or "default", message.total_cost_usd, message.model_usage,

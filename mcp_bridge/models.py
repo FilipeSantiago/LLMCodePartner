@@ -79,11 +79,15 @@ class Run:
     # executor after JetBrains returns a tool result.
     metadata: dict[str, Any] = field(default_factory=dict)
     tool_names: dict[str, str] = field(default_factory=dict)
+    tool_arguments: dict[str, dict] = field(default_factory=dict)
     mutating_tool_succeeded: bool = False
     # Direct tools are only attached to implementation runs. Unlike ordinary
     # bridge tools, they execute against PyCharm's standalone MCP endpoint and
     # therefore do not require an AI Chat OpenAI tool-call round trip.
     direct_tool_handlers: dict[str, Callable[[dict], Awaitable[str]]] = field(default_factory=dict)
+    # Populated only for coding runs. Trusted OpenSpec artifact reads bypass this
+    # presentation layer so rollback snapshots remain complete.
+    tool_interface: Any | None = None
 
     async def put(self, event: Any) -> None:
         await self.queue.put(event)

@@ -28,7 +28,7 @@ from collections.abc import AsyncIterator
 from mcp_bridge import mcp_http
 from mcp_bridge import server as engine
 from mcp_bridge.models import ErrorEvent, Event, Run, TextEvent
-from mcp_bridge.registry import ToolSpec, allowed_for
+from mcp_bridge.registry import ROLE_CODER, ToolSpec, allowed_for
 from providers.base import Provider
 
 log = logging.getLogger("codepartner.providers.codex")
@@ -133,7 +133,8 @@ class CodexProvider(Provider):
 
             run = engine.start_run(prompt, system, specs, strategy=strategy,
                                    allowed=allowed_for(role),
-                                   direct_tool_handlers=direct_tool_handlers)
+                                   direct_tool_handlers=direct_tool_handlers,
+                                   agent_tool_interface=role == ROLE_CODER)
             run.metadata.update(run_metadata or {})
 
         async for event in self._drain_queue(run):
@@ -231,10 +232,9 @@ class CodexProvider(Provider):
         args += shlex.split(os.getenv("CODEX_ARGS", ""))
         # The sandbox goes LAST on purpose: a repeated flag wins on the right, so no
         # escape-hatch value can loosen it.
-        if reviewer_mode:
-            # Reviewer evidence must come only from the request-scoped MCP endpoint,
-            # never an unrelated server inherited from ~/.codex/config.toml.
-            args += ["--ignore-user-config", "-c", "features.shell_tool=false"]
+        # Every agent read must pass through the request-scoped MCP boundary.
+        # A read-only Codex shell could still open .env or an out-of-project file.
+        args += ["--ignore-user-config", "-c", "features.shell_tool=false"]
         return args + ["-s", "read-only"]
 
     def _join(self, prompt: str, system: str | None) -> str:

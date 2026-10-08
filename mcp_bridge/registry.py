@@ -18,6 +18,9 @@ class Definition:
 def _d(a, c, domain, ops, adapter): return Definition(frozenset(a), frozenset(c), domain, frozenset(ops), adapter)
 
 DEFINITIONS = (
+    _d(("codepartner_read_file",), (CAP_READ,), DOMAIN_SOURCE, ("aci_window_read",), "virtual"),
+    _d(("codepartner_get_observation",), (CAP_READ,), DOMAIN_SOURCE, ("aci_observation",), "virtual"),
+    _d(("codepartner_search_in_file",), (CAP_SEARCH,), DOMAIN_SOURCE, ("aci_file_search",), "virtual"),
     _d(("read_file",), (CAP_READ,), DOMAIN_SOURCE, (OP_FILE_READ,), "native_read"),
     _d(("get_file_text_by_path",), (CAP_READ,), DOMAIN_SOURCE, (OP_FILE_READ,), "legacy_read"),
     _d(("search_file",), (CAP_SEARCH,), DOMAIN_SOURCE, (OP_FILE_SEARCH,), "file_search"),
