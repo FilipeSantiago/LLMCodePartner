@@ -1,5 +1,6 @@
 """Conversation-scoped configuration and tool discovery for the IDE MCP server."""
 
+import hashlib
 import json
 import logging
 import time
@@ -22,10 +23,31 @@ class IdeMcpSession:
     client: JetBrainsMcpClient
     tools: DirectIdeTools
     expires_at: float
+    # Stable, path-free identity of the IDE project this conversation edits.
+    project_id: str | None = None
 
 
 _sessions: OrderedDict[str, IdeMcpSession] = OrderedDict()
 _bootstrap_calls: dict[str, str] = {}
+# Bootstrap calls whose original user message has already been processed.
+_replayed_bootstraps: set[str] = set()
+
+
+def project_id_for(project_path: str) -> str:
+    """Hash the IDE project path so identity can be stored and logged safely."""
+    return "proj_" + hashlib.sha256(project_path.encode("utf-8")).hexdigest()[:16]
+
+
+def is_bootstrap_call(tool_call_id: str | None) -> bool:
+    return bool(tool_call_id) and tool_call_id in _bootstrap_calls
+
+
+def claim_bootstrap_replay(tool_call_id: str) -> bool:
+    """Return True exactly once per bootstrap call: the original turn runs once."""
+    if tool_call_id in _replayed_bootstraps:
+        return False
+    _replayed_bootstraps.add(tool_call_id)
+    return True
 
 
 def new_conversation_id() -> str:
@@ -94,11 +116,13 @@ def get_session(conversation_id: str | None) -> IdeMcpSession | None:
             for call_id, owner in list(_bootstrap_calls.items()):
                 if owner == key:
                     _bootstrap_calls.pop(call_id, None)
+                    _replayed_bootstraps.discard(call_id)
     session = _sessions.get(conversation_id)
     if session is None:
         return None
     refreshed = IdeMcpSession(
-        session.conversation_id, session.client, session.tools, now + SESSION_TTL_SECONDS
+        session.conversation_id, session.client, session.tools, now + SESSION_TTL_SECONDS,
+        session.project_id,
     )
     _sessions[conversation_id] = refreshed
     _sessions.move_to_end(conversation_id)
@@ -132,7 +156,8 @@ async def configure_session(conversation_id: str, raw_config: str) -> IdeMcpSess
     client = JetBrainsMcpClient(url=url, headers={"IJ_MCP_SERVER_PROJECT_PATH": project_path})
     tools = await DirectIdeTools.discover(client)
     session = IdeMcpSession(
-        conversation_id, client, tools, time.monotonic() + SESSION_TTL_SECONDS
+        conversation_id, client, tools, time.monotonic() + SESSION_TTL_SECONDS,
+        project_id_for(project_path),
     )
     _sessions[conversation_id] = session
     _sessions.move_to_end(conversation_id)
@@ -141,6 +166,7 @@ async def configure_session(conversation_id: str, raw_config: str) -> IdeMcpSess
         for call_id, owner in list(_bootstrap_calls.items()):
             if owner == evicted_id:
                 _bootstrap_calls.pop(call_id, None)
+                _replayed_bootstraps.discard(call_id)
     log.info("ide_mcp_session_configured conversation_id=%s discovered_tool_count=%d",
              conversation_id, len(tools.specs))
     return session

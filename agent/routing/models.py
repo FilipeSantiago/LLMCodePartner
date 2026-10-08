@@ -54,6 +54,8 @@ class ExecutionContext:
     use_gateway: bool = False
     started_at: float = 0.0
     direct_tool_handlers: dict[str, Any] = field(default_factory=dict)
+    # Owner identity (implementation job/position) stamped on the run at creation.
+    owner_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,16 @@ class ImplementationJob:
     def create(cls, selectors: list[str], task_ids: list[str],
                instruction: str = "") -> "ImplementationJob":
         return cls(str(uuid4()), tuple(selectors), tuple(task_ids), instruction=instruction)
+
+
+# Job-level statuses. Active jobs may still change project files; a halted job
+# must never advance, even if a cancelled run's request finishes later.
+ACTIVE_JOB_STATUSES = frozenset({
+    "queued", "running", "waiting", "reviewing", "implemented",
+    "stopping", "pending_switch",
+})
+HALTED_JOB_STATUSES = frozenset({"stopping", "stopped", "cancelled"})
+TERMINAL_JOB_STATUSES = frozenset({"completed", "failed", "stopped", "undone", "cancelled"})
 
 
 @dataclass(frozen=True)

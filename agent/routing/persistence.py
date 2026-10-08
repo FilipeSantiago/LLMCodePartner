@@ -9,7 +9,78 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from agent.routing.models import ExecutionDecision, ImplementationJob, ImplementationJobTask
+from agent.routing.models import (
+    ACTIVE_JOB_STATUSES, HALTED_JOB_STATUSES, ExecutionDecision, ImplementationJob,
+    ImplementationJobTask,
+)
+
+from agent.workflow.states import PAUSED_STATES
+
+_ACTIVE_SQL = ", ".join(f"'{status}'" for status in sorted(ACTIVE_JOB_STATUSES))
+_HALTED_SQL = ", ".join(f"'{status}'" for status in sorted(HALTED_JOB_STATUSES))
+# Canonical proposal schema. Rows are always read by these column names, so a
+# table created by an older version cannot be mis-mapped by position.
+_PROPOSAL_COLUMNS = (
+    "proposal_id", "confirmation_token", "conversation_id", "action",
+    "target_job_id", "target_position", "target_task_id", "expected_status",
+    "expected_revision", "payload_json", "request_fingerprint", "confidence",
+    "ambiguities_json", "interpreter_model", "interpretation_source",
+    "corrected_from", "status", "created_at", "expires_at", "transition_result",
+)
+_PROPOSAL_SELECT = "SELECT " + ", ".join(_PROPOSAL_COLUMNS) + " FROM workflow_action_proposals"
+_PROPOSALS_DDL = """
+                CREATE TABLE IF NOT EXISTS workflow_action_proposals (
+                  proposal_id TEXT PRIMARY KEY, confirmation_token TEXT UNIQUE NOT NULL,
+                  conversation_id TEXT NOT NULL, action TEXT NOT NULL,
+                  target_job_id TEXT, target_position INTEGER, target_task_id TEXT,
+                  expected_status TEXT, expected_revision INTEGER,
+                  payload_json TEXT NOT NULL, request_fingerprint TEXT NOT NULL,
+                  confidence TEXT NOT NULL, ambiguities_json TEXT NOT NULL,
+                  interpreter_model TEXT, interpretation_source TEXT NOT NULL,
+                  corrected_from TEXT, status TEXT NOT NULL,
+                  created_at REAL NOT NULL, expires_at REAL NOT NULL,
+                  transition_result TEXT
+                );
+                CREATE INDEX IF NOT EXISTS workflow_proposals_conversation
+                  ON workflow_action_proposals(conversation_id, status, created_at);
+"""
+
+
+def _migrate_workflow_proposals(db: sqlite3.Connection) -> None:
+    """Rebuild a proposals table created by an older version (idempotent).
+
+    Earlier builds added NOT NULL columns the current insert does not fill
+    (`updated_at`) and used another column order. SQLite cannot drop a NOT NULL
+    constraint, so the table is copied into the canonical schema in one savepoint.
+    """
+    existing = [row[1] for row in db.execute("PRAGMA table_info(workflow_action_proposals)")]
+    if not existing or tuple(existing) == _PROPOSAL_COLUMNS:
+        return
+    present = set(existing)
+    defaults = {"interpretation_source": "'deterministic'", "ambiguities_json": "'[]'"}
+    select = ", ".join(
+        (f"COALESCE({column}, {defaults[column]})" if column in defaults else column)
+        if column in present else defaults.get(column, "NULL")
+        for column in _PROPOSAL_COLUMNS)
+    db.execute("SAVEPOINT migrate_workflow_proposals")
+    try:
+        db.execute("DROP INDEX IF EXISTS workflow_proposals_conversation")
+        db.execute("ALTER TABLE workflow_action_proposals "
+                   "RENAME TO workflow_action_proposals_legacy")
+        for statement in filter(str.strip, _PROPOSALS_DDL.split(";")):
+            db.execute(statement)
+        db.execute(f"""INSERT INTO workflow_action_proposals ({", ".join(_PROPOSAL_COLUMNS)})
+          SELECT {select} FROM workflow_action_proposals_legacy""")
+        db.execute("DROP TABLE workflow_action_proposals_legacy")
+    except Exception:
+        db.execute("ROLLBACK TO migrate_workflow_proposals")
+        db.execute("RELEASE migrate_workflow_proposals")
+        raise
+    db.execute("RELEASE migrate_workflow_proposals")
+
+
+# Switch states that have not reached a final outcome yet.
+UNFINISHED_SWITCH_STATES = ("switch_requested", "stopping", "stopped")
 
 
 class RoutingPersistence:
@@ -114,12 +185,29 @@ class RoutingPersistence:
                   metadata_json TEXT,
                   created_at REAL NOT NULL
                 );
+""" + _PROPOSALS_DDL + """
+                CREATE TABLE IF NOT EXISTS workflow_switches (
+                  switch_id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL UNIQUE,
+                  conversation_id TEXT NOT NULL, project_id TEXT,
+                  displaced_json TEXT NOT NULL, new_job_id TEXT,
+                  state TEXT NOT NULL, detail TEXT,
+                  reported INTEGER NOT NULL DEFAULT 0,
+                  created_at REAL NOT NULL, updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS conversation_offered_choices (
+                  conversation_id TEXT NOT NULL, option_number INTEGER NOT NULL,
+                  choice_text TEXT NOT NULL, status TEXT NOT NULL,
+                  created_at REAL NOT NULL, expires_at REAL NOT NULL,
+                  PRIMARY KEY(conversation_id, option_number)
+                );
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(implementation_jobs)")}
             if "instruction" not in columns:
                 db.execute("ALTER TABLE implementation_jobs ADD COLUMN instruction TEXT NOT NULL DEFAULT ''")
             if "conversation_id" not in columns:
                 db.execute("ALTER TABLE implementation_jobs ADD COLUMN conversation_id TEXT")
+            if "project_id" not in columns:
+                db.execute("ALTER TABLE implementation_jobs ADD COLUMN project_id TEXT")
             task_columns = {row[1] for row in db.execute("PRAGMA table_info(implementation_job_tasks)")}
             if "coder_report" not in task_columns:
                 db.execute("ALTER TABLE implementation_job_tasks ADD COLUMN coder_report TEXT")
@@ -178,6 +266,9 @@ class RoutingPersistence:
             review_columns = {row[1] for row in db.execute("PRAGMA table_info(implementation_reviews)")}
             if "details_json" not in review_columns:
                 db.execute("ALTER TABLE implementation_reviews ADD COLUMN details_json TEXT")
+            _migrate_workflow_proposals(db)
+            from agent.workflow.migration import migrate_paused_states
+            migrate_paused_states(db)
 
     async def record_decision(self, decision: ExecutionDecision) -> None:
         await asyncio.to_thread(self._record_decision, decision)
@@ -248,17 +339,20 @@ class RoutingPersistence:
 
     async def create_implementation_job(self, job: ImplementationJob,
                                         tasks: list[ImplementationJobTask],
-                                        conversation_id: str | None = None) -> None:
-        await asyncio.to_thread(self._create_implementation_job, job, tasks, conversation_id)
+                                        conversation_id: str | None = None,
+                                        project_id: str | None = None) -> None:
+        await asyncio.to_thread(self._create_implementation_job, job, tasks,
+                                conversation_id, project_id)
 
-    def _create_implementation_job(self, job, tasks, conversation_id) -> None:
+    def _create_implementation_job(self, job, tasks, conversation_id, project_id=None) -> None:
         now = time.time()
         with self._database() as db:
             db.execute("""INSERT INTO implementation_jobs
-              (job_id, selectors_json, instruction, conversation_id, status, created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?)""", (
+              (job_id, selectors_json, instruction, conversation_id, project_id, status,
+               created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (
                 job.job_id, json.dumps(job.selectors), job.instruction, conversation_id,
-                job.status, now, now,
+                project_id, job.status, now, now,
             ))
             db.executemany("""INSERT INTO implementation_job_tasks
               (job_id, position, change_id, task_id, status, decision_id, error,
@@ -321,11 +415,13 @@ class RoutingPersistence:
               WHERE job_id=? AND position=?""", (
                 status, decision_id, error, job_id, position,
             ))
-            db.execute("UPDATE implementation_jobs SET status=?, updated_at=?, error=? WHERE job_id=?", (
+            # A halted job keeps its status: late writes from a cancelled run's
+            # request must not make it look active again.
+            db.execute(f"""UPDATE implementation_jobs SET status=?, updated_at=?, error=?
+              WHERE job_id=? AND status NOT IN ({_HALTED_SQL})""", (
                 status if status in {"failed", "awaiting_confirmation", "review_pending",
-                                     "awaiting_review_resolution", "awaiting_user_decision",
-                                     "awaiting_coder_recovery", "recovery_required",
-                                     "undone"} else "running",
+                                     "awaiting_user_decision", "undone",
+                                     *PAUSED_STATES} else "running",
                 time.time(), error, job_id,
             ))
 
@@ -340,8 +436,9 @@ class RoutingPersistence:
             result = db.execute("""UPDATE implementation_job_tasks
               SET status='reviewing', review_started_at=?, error=NULL, review_question=NULL
               WHERE job_id=? AND position=? AND (
-                status IN ('running', 'waiting', 'implemented', 'review_pending') OR
-                (status='awaiting_confirmation' AND ?) OR
+                status IN ('running', 'waiting', 'implemented', 'review_pending',
+                           'awaiting_evidence_resolution') OR
+                (status IN ('awaiting_confirmation', 'awaiting_human_confirmation') AND ?) OR
                 (status='reviewing' AND review_started_at<?))""",
                 (now, job_id, position, int(allow_confirmation_retry), now - 15 * 60))
             if result.rowcount:
@@ -947,3 +1044,438 @@ class RoutingPersistence:
         with self._database() as db:
             db.execute("UPDATE refinement_sessions SET status=?, updated_at=? WHERE session_id=?",
                        (status, time.time(), session_id))
+
+    async def paused_tasks(self, conversation_id: str | None,
+                           referenced_job_ids: tuple[str, ...] = ()) -> list[dict]:
+        return await asyncio.to_thread(self._paused_tasks, conversation_id,
+                                       referenced_job_ids)
+
+    async def running_jobs(self, conversation_id: str | None) -> tuple[str, ...]:
+        if not conversation_id:
+            return ()
+        return await asyncio.to_thread(self._running_jobs, conversation_id)
+
+    async def record_offered_choices(self, conversation_id: str,
+                                     choices: dict[int, str]) -> None:
+        if choices:
+            await asyncio.to_thread(self._record_offered_choices, conversation_id, choices)
+
+    def _record_offered_choices(self, conversation_id, choices):
+        now = time.time()
+        with self._database() as db:
+            db.execute("UPDATE conversation_offered_choices SET status='superseded' "
+                       "WHERE conversation_id=? AND status='active'", (conversation_id,))
+            db.executemany("""INSERT INTO conversation_offered_choices
+              (conversation_id, option_number, choice_text, status, created_at, expires_at)
+              VALUES (?, ?, ?, 'active', ?, ?)
+              ON CONFLICT(conversation_id, option_number) DO UPDATE SET
+                choice_text=excluded.choice_text, status='active',
+                created_at=excluded.created_at, expires_at=excluded.expires_at""",
+              [(conversation_id, number, label[:500], now, now + 30 * 60)
+               for number, label in choices.items()])
+
+    async def offered_choice(self, conversation_id: str, number: int) -> str | None:
+        return await asyncio.to_thread(self._offered_choice, conversation_id, number)
+
+    def _offered_choice(self, conversation_id, number):
+        with self._database() as db:
+            row = db.execute("""SELECT choice_text FROM conversation_offered_choices
+              WHERE conversation_id=? AND option_number=? AND status='active'
+                AND expires_at>?""", (conversation_id, number, time.time())).fetchone()
+        return row[0] if row else None
+
+    async def implementation_job_status(self, job_id: str) -> str | None:
+        return await asyncio.to_thread(self._implementation_job_status, job_id)
+
+    def _implementation_job_status(self, job_id):
+        with self._database() as db:
+            row = db.execute("SELECT status FROM implementation_jobs WHERE job_id=?",
+                             (job_id,)).fetchone()
+        return row[0] if row else None
+
+    @staticmethod
+    def _scope_clause(project_id: str | None) -> str:
+        """Jobs in this project, plus this conversation's jobs from before projects."""
+        if project_id:
+            return "(j.project_id=? OR (j.project_id IS NULL AND j.conversation_id=?))"
+        return "j.conversation_id=?"
+
+    @staticmethod
+    def _scope_args(project_id: str | None, conversation_id: str | None) -> tuple:
+        return (project_id, conversation_id) if project_id else (conversation_id,)
+
+    async def project_jobs(self, project_id: str | None,
+                           conversation_id: str | None) -> list[dict]:
+        """Unfinished jobs in the project (active or paused), from any conversation."""
+        if not project_id and not conversation_id:
+            return []
+        return await asyncio.to_thread(self._project_jobs, project_id, conversation_id)
+
+    def _project_jobs(self, project_id, conversation_id):
+        statuses = (*ACTIVE_JOB_STATUSES, *PAUSED_STATES, "review_pending",
+                    "awaiting_confirmation", "awaiting_user_decision")
+        with self._database() as db:
+            rows = db.execute(f"""SELECT j.job_id, j.conversation_id, j.project_id, j.status,
+                j.selectors_json, j.updated_at,
+                (SELECT t.task_id FROM implementation_job_tasks t
+                 WHERE t.job_id=j.job_id AND t.status NOT IN ('completed', 'queued', 'undone')
+                 ORDER BY t.position LIMIT 1)
+              FROM implementation_jobs j
+              WHERE j.status IN ({",".join("?" for _ in statuses)})
+                AND {self._scope_clause(project_id)}
+              ORDER BY j.updated_at DESC""",
+              (*statuses, *self._scope_args(project_id, conversation_id))).fetchall()
+        return [{"job_id": row[0], "conversation_id": row[1], "project_id": row[2],
+                 "status": row[3], "selectors": tuple(json.loads(row[4])),
+                 "updated_at": row[5], "task_id": row[6]} for row in rows]
+
+    def _active_job_ids(self, db, project_id, conversation_id, exclude_job_id=None):
+        rows = db.execute(f"""SELECT j.job_id FROM implementation_jobs j
+          WHERE j.status IN ({_ACTIVE_SQL}) AND j.job_id != ?
+            AND {self._scope_clause(project_id)}""",
+          (exclude_job_id or "", *self._scope_args(project_id, conversation_id))).fetchall()
+        return {row[0] for row in rows}
+
+    # --- flow switches (stop one job, then start another) -------------------
+
+    async def switch_for_proposal(self, proposal_id: str) -> dict | None:
+        return await asyncio.to_thread(self._switch_for_proposal, proposal_id)
+
+    def _switch_for_proposal(self, proposal_id):
+        with self._database() as db:
+            row = db.execute("SELECT * FROM workflow_switches WHERE proposal_id=?",
+                             (proposal_id,)).fetchone()
+            columns = [item[0] for item in db.execute(
+                "SELECT * FROM workflow_switches LIMIT 0").description]
+        return self._switch_dict(columns, row)
+
+    @staticmethod
+    def _switch_dict(columns, row) -> dict | None:
+        if row is None:
+            return None
+        value = dict(zip(columns, row))
+        value["displaced"] = json.loads(value.pop("displaced_json"))
+        return value
+
+    async def advance_switch(self, switch_id: str, from_states: tuple[str, ...],
+                             state: str, detail: str | None = None) -> bool:
+        """Move a switch forward only from an expected state, so retries are idempotent."""
+        return await asyncio.to_thread(self._advance_switch, switch_id, from_states,
+                                       state, detail)
+
+    def _advance_switch(self, switch_id, from_states, state, detail):
+        with self._database() as db:
+            result = db.execute(f"""UPDATE workflow_switches
+              SET state=?, detail=COALESCE(?, detail), updated_at=?
+              WHERE switch_id=? AND state IN ({",".join("?" for _ in from_states)})""",
+              (state, detail, time.time(), switch_id, *from_states))
+        return bool(result.rowcount)
+
+    async def unfinished_switches(self) -> list[dict]:
+        return await asyncio.to_thread(self._unfinished_switches)
+
+    def _unfinished_switches(self):
+        with self._database() as db:
+            rows = db.execute(f"""SELECT * FROM workflow_switches WHERE state IN
+              ({",".join("?" for _ in UNFINISHED_SWITCH_STATES)})""",
+              UNFINISHED_SWITCH_STATES).fetchall()
+            columns = [item[0] for item in db.execute(
+                "SELECT * FROM workflow_switches LIMIT 0").description]
+        return [self._switch_dict(columns, row) for row in rows]
+
+    async def take_switch_notices(self, conversation_id: str) -> list[dict]:
+        """Interrupted switches this conversation has not been told about yet."""
+        return await asyncio.to_thread(self._take_switch_notices, conversation_id)
+
+    def _take_switch_notices(self, conversation_id):
+        with self._database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("""SELECT * FROM workflow_switches WHERE conversation_id=?
+              AND state='interrupted' AND reported=0""", (conversation_id,)).fetchall()
+            columns = [item[0] for item in db.execute(
+                "SELECT * FROM workflow_switches LIMIT 0").description]
+            db.execute("""UPDATE workflow_switches SET reported=1 WHERE conversation_id=?
+              AND state='interrupted' AND reported=0""", (conversation_id,))
+        return [self._switch_dict(columns, row) for row in rows]
+
+    async def mark_job_stopping(self, job_id: str) -> str | None:
+        """Mark an active job as stopping; return its status before the change."""
+        return await asyncio.to_thread(self._mark_job_stopping, job_id)
+
+    def _mark_job_stopping(self, job_id):
+        with self._database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status FROM implementation_jobs WHERE job_id=?",
+                             (job_id,)).fetchone()
+            if row is None:
+                return None
+            if row[0] in ACTIVE_JOB_STATUSES and row[0] != "stopping":
+                db.execute("UPDATE implementation_jobs SET status='stopping', updated_at=? "
+                           "WHERE job_id=?", (time.time(), job_id))
+            return row[0]
+
+    async def finalize_stopped_job(self, job_id: str, reason: str) -> None:
+        """Record a stopped job. Files are left as they are; nothing is rolled back."""
+        await asyncio.to_thread(self._finalize_stopped_job, job_id, reason)
+
+    def _finalize_stopped_job(self, job_id, reason):
+        now = time.time()
+        with self._database() as db:
+            db.execute("""UPDATE implementation_job_tasks SET status='stopped', error=?
+              WHERE job_id=? AND status IN ('running', 'waiting', 'reviewing', 'undoing')""",
+              (reason, job_id))
+            db.execute(f"""UPDATE implementation_jobs SET status='stopped', error=?, updated_at=?
+              WHERE job_id=? AND status IN ({_ACTIVE_SQL})""", (reason, now, job_id))
+
+    async def set_switched_job_status(self, job_id: str, status: str) -> None:
+        """Release (`queued`) or cancel (`cancelled`) a job created by a switch."""
+        await asyncio.to_thread(self._set_switched_job_status, job_id, status)
+
+    def _set_switched_job_status(self, job_id, status):
+        with self._database() as db:
+            db.execute("""UPDATE implementation_jobs SET status=?, updated_at=?
+              WHERE job_id=? AND status='pending_switch'""", (status, time.time(), job_id))
+            if status == "cancelled":
+                db.execute("""UPDATE implementation_job_tasks SET status='cancelled'
+                  WHERE job_id=? AND status='queued'""", (job_id,))
+
+    def _running_jobs(self, conversation_id):
+        with self._database() as db:
+            rows = db.execute("""SELECT job_id FROM implementation_jobs
+              WHERE conversation_id=? AND status IN ('queued', 'running', 'waiting',
+                'reviewing', 'implemented') ORDER BY updated_at DESC""",
+              (conversation_id,)).fetchall()
+        return tuple(row[0] for row in rows)
+
+    def _paused_tasks(self, conversation_id, referenced_job_ids):
+        from agent.workflow.states import PAUSED_STATES
+        if not conversation_id and not referenced_job_ids:
+            return []
+        statuses = (*PAUSED_STATES, "review_pending", "awaiting_confirmation")
+        placeholders = ",".join("?" for _ in statuses)
+        with self._database() as db:
+            rows = db.execute(f"""SELECT t.job_id, t.position, t.task_id,
+              CASE t.status WHEN 'review_pending' THEN 'awaiting_evidence_resolution'
+                WHEN 'reviewing' THEN 'awaiting_evidence_resolution'
+                WHEN 'awaiting_confirmation' THEN 'awaiting_human_confirmation'
+                ELSE t.status END,
+              t.error, t.review_question, j.instruction,
+              (SELECT r.verdict FROM implementation_reviews r
+               WHERE r.job_id=t.job_id AND r.position=t.position
+               ORDER BY r.id DESC LIMIT 1) AS latest_verdict
+              FROM implementation_job_tasks t JOIN implementation_jobs j
+              ON j.job_id=t.job_id
+              WHERE (t.status IN ({placeholders}) OR
+                     (t.status='reviewing' AND t.review_started_at<?)) AND
+              (j.conversation_id=? OR t.job_id IN ({','.join('?' for _ in referenced_job_ids) or "''"}))
+              ORDER BY j.updated_at DESC, t.position""",
+              (*statuses, time.time() - 15 * 60, conversation_id,
+               *referenced_job_ids)).fetchall()
+        return [dict(zip(("job_id", "position", "task_id", "status", "error",
+                          "review_question", "instruction", "latest_verdict"), row))
+                for row in rows]
+
+    async def implementation_job_instruction(self, job_id: str | None) -> str:
+        if not job_id:
+            return ""
+        return await asyncio.to_thread(self._implementation_job_instruction, job_id)
+
+    def _implementation_job_instruction(self, job_id):
+        with self._database() as db:
+            row = db.execute("SELECT instruction FROM implementation_jobs WHERE job_id=?",
+                             (job_id,)).fetchone()
+        return row[0] if row else ""
+
+    @staticmethod
+    def _proposal_dict(row):
+        if row is None:
+            return None
+        columns = ("proposal_id", "confirmation_token", "conversation_id", "action",
+                   "target_job_id", "target_position", "target_task_id",
+                   "expected_status", "expected_revision", "payload", "request_fingerprint",
+                   "confidence", "ambiguities", "interpreter_model",
+                   "interpretation_source", "corrected_from", "status", "created_at",
+                   "expires_at", "transition_result")
+        result = dict(zip(columns, row))
+        result["payload"] = json.loads(result["payload"])
+        result["ambiguities"] = json.loads(result["ambiguities"])
+        return result
+
+    async def create_workflow_proposal(self, value: dict) -> list[dict]:
+        return await asyncio.to_thread(self._create_workflow_proposal, value)
+
+    def _create_workflow_proposal(self, value):
+        now = time.time()
+        with self._database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(_PROPOSAL_SELECT + " WHERE conversation_id=? "
+                              "AND status='pending'", (value["conversation_id"],)).fetchall()
+            db.execute("UPDATE workflow_action_proposals SET status='superseded' "
+                       "WHERE conversation_id=? AND status='pending'",
+                       (value["conversation_id"],))
+            db.execute("""INSERT INTO workflow_action_proposals
+              (proposal_id, confirmation_token, conversation_id, action,
+               target_job_id, target_position, target_task_id, expected_status,
+               expected_revision, payload_json, request_fingerprint, confidence,
+               ambiguities_json, interpreter_model, interpretation_source,
+               corrected_from, status, created_at, expires_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+              (value["proposal_id"], value["confirmation_token"],
+               value["conversation_id"], value["action"], value["target_job_id"],
+               value["target_position"], value["target_task_id"],
+               value["expected_status"], value["expected_revision"],
+               json.dumps(value["payload"]), value["request_fingerprint"],
+               value["confidence"], json.dumps(value["ambiguities"]),
+               value["interpreter_model"], value["interpretation_source"],
+               value["corrected_from"], now, value["expires_at"]))
+        return [self._proposal_dict(row) for row in rows]
+
+    async def workflow_proposal_by_token(self, conversation_id: str | None,
+                                         token: str) -> dict | None:
+        if not conversation_id:
+            return None
+        return await asyncio.to_thread(self._workflow_proposal_by_token,
+                                       conversation_id, token)
+
+    def _workflow_proposal_by_token(self, conversation_id, token):
+        with self._database() as db:
+            row = db.execute(_PROPOSAL_SELECT + " "
+                             "WHERE conversation_id=? AND confirmation_token=?",
+                             (conversation_id, token)).fetchone()
+        return self._proposal_dict(row)
+
+    async def pending_workflow_proposals(self, conversation_id: str | None) -> list[dict]:
+        if not conversation_id:
+            return []
+        return await asyncio.to_thread(self._pending_workflow_proposals, conversation_id)
+
+    def _pending_workflow_proposals(self, conversation_id):
+        with self._database() as db:
+            rows = db.execute(_PROPOSAL_SELECT + " "
+                              "WHERE conversation_id=? AND status='pending' "
+                              "ORDER BY created_at DESC", (conversation_id,)).fetchall()
+        return [self._proposal_dict(row) for row in rows]
+
+    async def expire_workflow_proposals(self, conversation_id: str | None) -> list[dict]:
+        return await asyncio.to_thread(self._expire_workflow_proposals, conversation_id)
+
+    def _expire_workflow_proposals(self, conversation_id):
+        if not conversation_id:
+            return []
+        with self._database() as db:
+            rows = db.execute(_PROPOSAL_SELECT + " "
+                              "WHERE conversation_id=? AND status='pending' AND expires_at<=?",
+                              (conversation_id, time.time())).fetchall()
+            db.execute("UPDATE workflow_action_proposals SET status='expired' "
+                       "WHERE conversation_id=? AND status='pending' AND expires_at<=?",
+                       (conversation_id, time.time()))
+        return [self._proposal_dict(row) for row in rows]
+
+    async def resolve_workflow_proposal(self, proposal_id: str, status: str) -> bool:
+        return await asyncio.to_thread(self._resolve_workflow_proposal,
+                                       proposal_id, status)
+
+    def _resolve_workflow_proposal(self, proposal_id, status):
+        with self._database() as db:
+            result = db.execute("UPDATE workflow_action_proposals SET status=? "
+                                "WHERE proposal_id=? AND status='pending'",
+                                (status, proposal_id))
+        return bool(result.rowcount)
+
+    async def claim_workflow_proposal(self, proposal_id: str,
+                                      job: ImplementationJob | None = None,
+                                      tasks: list[ImplementationJobTask] | None = None) -> str:
+        """Claim a proposal once. Mutating proposals also re-check, in the same
+        transaction, that the project's active jobs are exactly the ones the user
+        agreed to stop; a displacing claim records a durable switch."""
+        return await asyncio.to_thread(self._claim_workflow_proposal,
+                                       proposal_id, job, tasks)
+
+    def _claim_workflow_proposal(self, proposal_id, job, tasks):
+        with self._database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(_PROPOSAL_SELECT + " WHERE proposal_id=?",
+                             (proposal_id,)).fetchone()
+            proposal = self._proposal_dict(row)
+            if proposal is None:
+                return "missing"
+            if proposal["status"] != "pending":
+                return proposal["status"]
+            if proposal["expires_at"] <= time.time():
+                db.execute("UPDATE workflow_action_proposals SET status='expired' "
+                           "WHERE proposal_id=?", (proposal_id,))
+                return "expired"
+            if proposal["target_job_id"] is not None:
+                task = db.execute("SELECT status, review_started_at FROM implementation_job_tasks "
+                                  "WHERE job_id=? AND position=?",
+                                  (proposal["target_job_id"],
+                                   proposal["target_position"])).fetchone()
+                actual_status = ({"review_pending": "awaiting_evidence_resolution",
+                                  "reviewing": "awaiting_evidence_resolution",
+                                  "awaiting_confirmation": "awaiting_human_confirmation"}
+                                 .get(task[0], task[0]) if task else None)
+                stale_review = (task is not None and task[0] == "reviewing" and
+                                (task[1] is None or task[1] >= time.time() - 15 * 60))
+                if task is None or actual_status != proposal["expected_status"] or stale_review:
+                    db.execute("UPDATE workflow_action_proposals SET status='stale' "
+                               "WHERE proposal_id=?", (proposal_id,))
+                    return "stale"
+                if proposal["expected_revision"] is not None:
+                    revision = db.execute("SELECT MAX(revision) FROM task_contracts "
+                                          "WHERE job_id=? AND position=?",
+                                          (proposal["target_job_id"],
+                                           proposal["target_position"])).fetchone()[0]
+                    if revision != proposal["expected_revision"]:
+                        db.execute("UPDATE workflow_action_proposals SET status='stale' "
+                                   "WHERE proposal_id=?", (proposal_id,))
+                        return "stale"
+            refinement_id = proposal["payload"].get("refinement_session_id")
+            if refinement_id:
+                draft = db.execute("SELECT status FROM refinement_sessions "
+                                   "WHERE session_id=? AND conversation_id=?",
+                                   (refinement_id, proposal["conversation_id"])).fetchone()
+                if draft is None or draft[0] != "active":
+                    db.execute("UPDATE workflow_action_proposals SET status='stale' "
+                               "WHERE proposal_id=?", (proposal_id,))
+                    return "stale"
+            parameters = proposal["payload"].get("parameters") or {}
+            project_id = parameters.get("project_id")
+            displaced = parameters.get("displace") or []
+            if parameters.get("conflict_checked"):
+                active = self._active_job_ids(db, project_id, proposal["conversation_id"],
+                                              proposal["target_job_id"])
+                if active != {item["job_id"] for item in displaced}:
+                    db.execute("UPDATE workflow_action_proposals SET status='stale' "
+                               "WHERE proposal_id=?", (proposal_id,))
+                    return "stale"
+            now = time.time()
+            if job is not None:
+                db.execute("""INSERT INTO implementation_jobs
+                  (job_id, selectors_json, instruction, conversation_id, project_id, status,
+                   created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (job.job_id, json.dumps(job.selectors), job.instruction,
+                   proposal["conversation_id"], project_id,
+                   "pending_switch" if displaced else job.status, now, now))
+                db.executemany("""INSERT INTO implementation_job_tasks
+                  (job_id, position, change_id, task_id, status, decision_id, error,
+                   revision_budget) VALUES (?, ?, ?, ?, ?, ?, ?, 3)""",
+                  [(task.job_id, task.position, task.change_id, task.task_id,
+                    task.status, task.decision_id, task.error) for task in tasks or []])
+            if displaced:
+                db.execute("""INSERT INTO workflow_switches
+                  (switch_id, proposal_id, conversation_id, project_id, displaced_json,
+                   new_job_id, state, created_at, updated_at)
+                  VALUES (?, ?, ?, ?, ?, ?, 'switch_requested', ?, ?)""",
+                  ("switch_" + proposal_id, proposal_id, proposal["conversation_id"],
+                   project_id, json.dumps(displaced), job.job_id if job else None, now, now))
+            db.execute("UPDATE workflow_action_proposals SET status='confirmed' "
+                       "WHERE proposal_id=?", (proposal_id,))
+            return "claimed"
+
+    async def record_workflow_transition(self, proposal_id: str, result: str) -> None:
+        await asyncio.to_thread(self._record_workflow_transition, proposal_id, result)
+
+    def _record_workflow_transition(self, proposal_id, result):
+        with self._database() as db:
+            db.execute("UPDATE workflow_action_proposals SET transition_result=? "
+                       "WHERE proposal_id=?", (result, proposal_id))

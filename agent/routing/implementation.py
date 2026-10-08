@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator
 from dataclasses import asdict, replace
 
 from agent.routing.config import load_routing_config
-from agent.routing.models import ImplementationJob, ImplementationJobTask
+from agent.routing.models import HALTED_JOB_STATUSES, ImplementationJob, ImplementationJobTask
 from agent.routing.persistence import RoutingPersistence
 from agent.routing.review import (ReviewDecision, ReviewError, ReviewFinding,
                                   ReviewFormatError, ReviewService, _finding_owner,
@@ -21,6 +21,8 @@ from agent.routing.task_execution import TaskExecutionService
 from agent.spec.artifact_store import ArtifactStore
 from agent.spec.models import (CompletionReview, Task, ValidationContract,
                                WorkPackage, WorkPackageReview)
+from agent.task_contracts.contractor import TaskContractor, requested_paths, USER_RESOLUTION_REASON
+from agent.task_contracts.persistence import TaskContractPersistence
 from mcp_bridge import bridge
 from mcp_bridge.models import DoneEvent, ErrorEvent, Event, Run, TextEvent, ToolCallEvent
 from mcp_bridge.registry import ToolSpec
@@ -53,11 +55,15 @@ class ImplementationService:
     def __init__(self, artifacts: ArtifactStore,
                  task_execution: TaskExecutionService | None = None,
                  persistence: RoutingPersistence | None = None,
-                 reviewer: ReviewService | None = None):
+                 reviewer: ReviewService | None = None,
+                 contract_persistence: TaskContractPersistence | None = None):
         self.artifacts = artifacts
         self.task_execution = task_execution or TaskExecutionService()
         self.persistence = persistence or self.task_execution.persistence
         self.reviewer = reviewer or ReviewService(getattr(self.task_execution, "config", None))
+        self.contract_persistence = contract_persistence or TaskContractPersistence(
+            self.persistence.path)
+        self.contractor = TaskContractor()
         self.config = (getattr(self.reviewer, "config", None)
                        or getattr(self.task_execution, "config", None)
                        or load_routing_config())
@@ -280,15 +286,21 @@ class ImplementationService:
         return self._resolution_options(item.task_id, latest["verdict"], job_id)
 
     async def create_job(self, selectors: list[str], instruction: str = "",
-                         conversation_id: str | None = None) -> ImplementationJob:
+                         conversation_id: str | None = None,
+                         project_id: str | None = None) -> ImplementationJob:
         targets = await self.artifacts.tasks_for_selectors(selectors)
         job = ImplementationJob.create(selectors, [task.id for _, task in targets], instruction)
         queued = [
             ImplementationJobTask(job.job_id, position, change.id, task.id)
             for position, (change, task) in enumerate(targets)
         ]
-        await self.persistence.create_implementation_job(job, queued, conversation_id)
+        await self.persistence.create_implementation_job(job, queued, conversation_id,
+                                                         project_id)
         return job
+
+    async def _halted(self, job_id: str) -> bool:
+        """A stopped (or stopping) job must not advance, review, or record failures."""
+        return await self.persistence.implementation_job_status(job_id) in HALTED_JOB_STATUSES
 
     async def start(self, job: ImplementationJob, messages: list[dict],
                     specs: list[ToolSpec], direct_tool_handlers: dict | None = None) -> AsyncIterator[Event]:
@@ -324,6 +336,12 @@ class ImplementationService:
         await self.persistence.save_coder_report(job_id, position, report)
         if paused:
             return
+        if await self._halted(job_id):
+            yield TextEvent(f"Job {job_id} was stopped; {run.metadata.get('implementation_task_id') or 'the task'} "
+                            "was not reviewed and no further tasks will run.")
+            if terminal is not None:
+                yield terminal
+            return
         if failed:
             yield TextEvent(await self._coder_failed(job_id, position, failed))
         else:
@@ -353,6 +371,9 @@ class ImplementationService:
     async def _advance(self, job_id: str, messages: list[dict], specs: list[ToolSpec],
                        instruction: str = "", direct_tool_handlers: dict | None = None
                        ) -> AsyncIterator[Event]:
+        if await self._halted(job_id):
+            yield TextEvent(f"Job {job_id} was stopped; no further tasks will run.")
+            return
         item = await self.persistence.next_implementation_task(job_id)
         if item is None:
             await self.persistence.finish_implementation_job(job_id)
@@ -367,6 +388,10 @@ class ImplementationService:
                         direct_tool_handlers: dict,
                         exclude_models: frozenset[str] = frozenset()) -> AsyncIterator[Event]:
         change, task = await self.artifacts.task_by_id(item.task_id)
+        contract = await self.contract_persistence.latest(item.job_id, item.position)
+        if contract is None:
+            contract = self.contractor.initial_contract(task, specs, instruction)
+            await self.contract_persistence.save(item.job_id, item.position, contract)
         await self.persistence.update_implementation_task(item.job_id, item.position, "running")
         yield TextEvent(f"Starting {task.id} ({task.complexity}) from {change.id}.")
         failure: str | None = None
@@ -388,7 +413,12 @@ class ImplementationService:
         async for event in self.task_execution.execute(
                 task, change.id, messages, specs, on_decision=record_decision,
                 execution_instruction=instruction,
-                direct_tool_handlers=tracked_handlers, exclude_models=exclude_models):
+                direct_tool_handlers=tracked_handlers, exclude_models=exclude_models,
+                contract=contract, owner_metadata={
+                    "implementation_job_id": item.job_id,
+                    "implementation_position": item.position,
+                    "implementation_task_id": task.id,
+                }):
             if isinstance(event, TextEvent):
                 report_parts.append(event.text)
             if isinstance(event, ToolCallEvent):
@@ -412,6 +442,10 @@ class ImplementationService:
         report = "".join(report_parts)
         await self.persistence.save_coder_report(item.job_id, item.position, report)
         if paused:
+            return
+        if await self._halted(item.job_id):
+            yield TextEvent(f"Job {item.job_id} was stopped; {task.id} was not reviewed "
+                            "and no further tasks will run.")
             return
         if failure:
             yield TextEvent(await self._coder_failed(item.job_id, item.position, failure))
@@ -585,7 +619,8 @@ class ImplementationService:
                     "`retry review` is unavailable.",
                 )))
                 return
-            changed_paths = await journal.changed_paths()
+            journal_manifest = await journal.review_manifest()
+            changed_paths = [entry["path"] for entry in journal_manifest]
             if wp_boundary and _requires_test_run(package):
                 async for event in self._ensure_required_test_run(
                         job_id, package_rows, journal, specs, direct_tool_handlers):
@@ -628,6 +663,9 @@ class ImplementationService:
             if extra_context:
                 review_task = replace(
                     task, context="\n".join(filter(None, [task.context, *extra_context])))
+            # Keep authoritative metadata out of task text: OpenSpec context is
+            # untrusted and can mention files, but cannot fabricate journal records.
+            object.__setattr__(review_task, "_review_journal_manifest", journal_manifest)
             decision = await self.reviewer.review(
                 change, review_task, report, coder_model, specs, direct_tool_handlers)
             review = CompletionReview(
@@ -828,7 +866,8 @@ class ImplementationService:
                       direct_tool_handlers: dict | None = None,
                       instruction: str = "") -> AsyncIterator[Event]:
         item = await self.persistence.implementation_task(job_id, position)
-        if item is None or item.status != "awaiting_confirmation":
+        if item is None or item.status not in {"awaiting_confirmation",
+                                               "awaiting_human_confirmation"}:
             yield ErrorEvent("This task is no longer awaiting confirmation.")
             return
         if approved:
@@ -937,7 +976,8 @@ class ImplementationService:
                            ) -> AsyncIterator[Event]:
         item = await self.persistence.implementation_task(job_id, position)
         if item is None or item.status not in {
-                "review_pending", "reviewing", "awaiting_confirmation"}:
+                "review_pending", "awaiting_evidence_resolution", "reviewing",
+                "awaiting_confirmation", "awaiting_human_confirmation"}:
             yield ErrorEvent("This task is no longer pending review.")
             return
         latest = await self.persistence.latest_review(job_id, position)
@@ -960,6 +1000,54 @@ class ImplementationService:
                 direct_tool_handlers, report, coder_model,
                 allow_confirmation_retry=True):
             yield event
+
+    async def _record_contract_escalation(self, job_id: str, position: int,
+                                          contract, reason: str,
+                                          exhausted_limit: str) -> None:
+        await self.contract_persistence.save_escalation(job_id, position, {
+            "task_id": contract.task_id, "contract_id": contract.contract_id,
+            "reason": reason, "exhausted_limit": exhausted_limit,
+        })
+
+    async def retry_contract(self, job_id: str, position: int,
+                             messages: list[dict], specs: list[ToolSpec],
+                             instruction: str, direct_tool_handlers: dict,
+                             guidance: str, add_files: tuple[str, ...] = ()
+                             ) -> AsyncIterator[Event]:
+        item = await self.persistence.implementation_task(job_id, position)
+        if item is None or item.status != "awaiting_contract_resolution":
+            yield ErrorEvent("This task is no longer awaiting contract resolution.")
+            return
+        previous = await self.contract_persistence.latest(job_id, position)
+        if previous is None:
+            yield ErrorEvent("The previous TaskContract was not found.")
+            return
+        revised = self.contractor.revise_after_escalation(
+            previous, guidance, specs, add_files,
+            requested_paths(item.error or ""))
+        await self.contract_persistence.save(job_id, position, revised)
+        scope_decision = revised.known_context[-1].attributes.get("scope_decision")
+        await self.persistence.record_resolution_action(
+            job_id, position, "retry_contract", {
+                "guidance": guidance, "scope_decision": scope_decision,
+                "contract_id": revised.contract_id,
+            })
+        yield TextEvent(f"TaskContract revision {revised.revision} confirmed for {item.task_id}.")
+        async for event in self._run_item(
+                item, messages, specs, "\n".join(filter(None, (instruction, guidance))),
+                direct_tool_handlers):
+            yield event
+
+    async def stop_job(self, job_id: str, position: int,
+                       expected_status: str) -> AsyncIterator[Event]:
+        item = await self.persistence.implementation_task(job_id, position)
+        if item is None or item.status != expected_status:
+            yield ErrorEvent("The job state changed; it was not stopped.")
+            return
+        await self.persistence.update_implementation_task(job_id, position, "stopped")
+        await self.persistence.finish_implementation_job(job_id, "stopped")
+        yield TextEvent(f"Stopped job {job_id} at {item.task_id}. Files were left as they "
+                        "are; nothing was rolled back.")
 
     @staticmethod
     def _stored_findings(latest: dict | None) -> tuple[ReviewFinding, ...]:
@@ -1255,7 +1343,12 @@ class ImplementationService:
         async for event in self.task_execution.execute(
                 queued_task, change.id, messages, specs, on_decision=record_decision,
                 execution_instruction=undo_instruction,
-                direct_tool_handlers=direct_tool_handlers):
+                direct_tool_handlers=direct_tool_handlers, owner_metadata={
+                    "implementation_job_id": job_id,
+                    "implementation_position": position,
+                    "implementation_task_id": item.task_id,
+                    "implementation_action": "undo",
+                }):
             if isinstance(event, ErrorEvent):
                 failure = event.message
             if isinstance(event, ToolCallEvent):

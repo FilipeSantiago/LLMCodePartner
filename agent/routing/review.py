@@ -442,10 +442,26 @@ def _project_relative_path(path: object) -> str | None:
     if not isinstance(path, str) or not path or "\\" in path:
         return None
     parsed = PurePosixPath(path)
-    if (parsed.is_absolute() or any(part in {".", "..", ".git"} for part in parsed.parts)
-            or path == ".codepartner/ide_mcp.json"):
+    parts = path.split("/")
+    if (parsed.is_absolute() or any(part in {"", ".", "..", ".git", ".codepartner"}
+                                    or (part.startswith(".env") and part != ".env.example")
+                                    for part in parts)):
         return None
     return path
+
+
+def _review_journal(value: object) -> list[dict]:
+    """Validate in-process journal metadata, never supplied by task or coder text."""
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)) or not all(
+            isinstance(item, dict)
+            and _project_relative_path(item.get("path")) is not None
+            and item.get("change") in {"created", "modified", "deleted", "absent_after_mutation"}
+            and isinstance(item.get("after_exists"), bool)
+            for item in value):
+        raise ReviewError("mutation journal review manifest contains invalid entries")
+    return list(value)
 
 
 def _content_text(result) -> str:
@@ -465,10 +481,17 @@ def _normalized_read(result: object) -> tuple[str, bool, bool, int]:
 
 
 def _read_succeeded(result) -> bool:
-    content = _content_text(result).strip()
+    if isinstance(result, dict) and (result.get("isError") or result.get("error")):
+        return False
+    raw = _content_text(result)
+    try:
+        content, _ = BridgeMcpFileClient._text_from_tool_response(raw)
+    except Exception:
+        content = raw
+    content = content.strip()
     if not content or content.lower().startswith("error:"):
         return False
-    if isinstance(result, dict) and (result.get("isError") or result.get("error")):
+    if "\n" not in content and len(content) < 300 and _NOT_FOUND.search(content):
         return False
     return True
 
@@ -636,17 +659,38 @@ class ReviewService:
         review_context = "\n".join(filter(None, [
             task.description, task.context, *task_criteria,
         ]))
-        mutation_paths = tuple(
-            line.split("Required mutation artifact:", 1)[1].strip()
-            for line in task.context.splitlines()
+        trusted_journal = getattr(task, "_review_journal_manifest", None)
+        journal_entries = _review_journal(trusted_journal)
+        legacy_paths = tuple(
+            path for line in task.context.splitlines()
             if line.startswith("Required mutation artifact:")
-            and _project_relative_path(
-                line.split("Required mutation artifact:", 1)[1].strip()) is not None
+            if (path := line.split("Required mutation artifact:", 1)[1].strip())
+            and _project_relative_path(path) is not None
         )
+        mutation_paths = tuple(dict.fromkeys(
+            [item["path"] for item in journal_entries]
+            if trusted_journal is not None else legacy_paths))
+        journal_by_path = {item["path"]: item for item in journal_entries}
         candidate_records, unsupported = _artifact_candidates(report, review_context)
-        if unsupported:
+        path_assumptions: list[dict[str, str]] = []
+        unsupported_remaining = []
+        for claimed in unsupported:
+            # Interpret one leading slash as project-root notation only by reading
+            # the corresponding relative IDE path. Never send the absolute claim.
+            relative = claimed[1:] if claimed.startswith("/") and not claimed.startswith("//") else None
+            if _project_relative_path(relative) is None:
+                unsupported_remaining.append(claimed)
+                continue
+            basis = "journal_match" if relative in mutation_paths else "project_root_candidate"
+            path_assumptions.append({"claimed_path": claimed, "path": relative, "basis": basis})
+            if relative not in {item.path for item in candidate_records}:
+                candidate_records.append(ArtifactCandidate(
+                    relative, relative in mutation_paths, _artifact_category(relative),
+                    ("journal" if basis == "journal_match" else "root_path_assumption",)))
+        root_assumption_paths = {item["path"] for item in path_assumptions}
+        if unsupported_remaining:
             raise ReviewError("unsupported project artifact path(s): "
-                              + ", ".join(unsupported[:3]))
+                              + ", ".join(unsupported_remaining[:3]))
         candidate_records = _reconcile_journal_candidates(
             candidate_records, mutation_paths)
         known_candidate_paths = {candidate.path for candidate in candidate_records}
@@ -776,11 +820,32 @@ class ReviewService:
             actual_path = path
             content, mode, attempt_errors, missing = await read_artifact(path)
             resolution = None
+            journal_entry = journal_by_path.get(path)
+            if journal_entry and not journal_entry["after_exists"]:
+                if missing:
+                    inspected.add(path)
+                    read_outcomes.append({
+                        "path": path, "status": "verified_absent", "required": True,
+                        "sources": list(candidate.sources),
+                    })
+                    continue
+                detail = ("journal records a deleted/absent postimage, but the IDE still reads it"
+                          if content is not None else
+                          "journaled absence could not be verified through the IDE: "
+                          + (attempt_errors[-1] if attempt_errors else "reader unavailable"))
+                required_failures.append(f"`{path}` (journaled absence): {detail}")
+                required_failure_paths.append(path)
+                read_outcomes.append({
+                    "path": path, "status": "failed", "required": True,
+                    "sources": list(candidate.sources), "detail": detail,
+                })
+                continue
             # Coder and task paths are discovery hints.  Only journal paths are immutable
             # mutation evidence, so any missing non-journal claim gets an independent exact
             # project search regardless of which non-authoritative source repeated it.
             matches: list[str] = []
-            if content is None and missing and path not in mutation_paths:
+            if (content is None and missing and path not in mutation_paths
+                    and path not in root_assumption_paths):
                 matches, search_error = await resolve_supplemental_path(path)
                 if len(matches) == 1:
                     actual_path = matches[0]
@@ -888,6 +953,26 @@ class ReviewService:
         model = self.config.models[reviewer_name]
         bounded_report = report[:_MAX_REPORT_CHARS]
         report_truncated = len(report) > len(bounded_report)
+        verified_assumptions = [
+            {**item, "verification": (
+                "journal and IDE" if item["basis"] == "journal_match" else "IDE")}
+            for item in path_assumptions
+            if any(outcome["path"] == item["path"]
+                   and outcome["status"] in {"read", "verified_absent"}
+                   for outcome in read_outcomes)
+        ]
+        verified_claims = {item["claimed_path"] for item in verified_assumptions}
+        assumption_results = [
+            {**item, "status": "verified" if item["claimed_path"] in verified_claims
+             else "unresolved"}
+            for item in path_assumptions
+        ]
+        unresolved_roots = [item for item in assumption_results
+                            if item["status"] == "unresolved"]
+        if unresolved_roots:
+            raise ReviewError("could not resolve project-root path assumption(s): "
+                              + ", ".join(f"{item['claimed_path']} -> {item['path']}"
+                                          for item in unresolved_roots[:3]))
         messages = [{"role": "user", "content": (
             "You are the independent reviewer. You are FORBIDDEN to access project files by "
             "any means other than this chat's request-scoped IDE MCP. Do not use a shell, "
@@ -901,8 +986,9 @@ class ReviewService:
             "tests and symbols, and follow dependencies needed to judge each criterion. Exhaust "
             "those read-only avenues before reporting missing evidence. Inspect the claimed "
             "deliverable and relevant source material before deciding. "
-            "If the initial artifact snapshot is empty, use the task requirements and available "
-            "project-search tools to discover candidate files, then read them before deciding. "
+            "If the initial artifact snapshot is empty and no journaled deletion was verified "
+            "absent, use the task requirements and available project-search tools to discover "
+            "candidate files, then read them before deciding. "
             "If available evidence cannot support a decision, explain the gap; never approve or "
             "ask the user to confirm unverified work. Do not edit files. Tool calls, file "
             "counts, and test commands are not completion criteria. Do not invent acceptance "
@@ -955,6 +1041,13 @@ class ReviewService:
             "CodePartner execution evidence produced by replaying those steps, not descriptive "
             "evidence labels or repository-local runner files. An invalid dispute or failed replay "
             "remains a coder-owned verification finding with the observed failure.\n\n"
+            "Start with the authoritative mutation journal below. Every entry must be "
+            "accounted for before considering coder path claims or other task files. "
+            "A deleted path is inspected by verifying its absence, not by reading content. "
+            "Path assumptions are explicitly labelled; an unresolved assumption is not "
+            "proof of a project artifact. State any assumption you rely on in your evidence.\n\n"
+            f"Verified mutation journal manifest: {json.dumps(journal_entries, ensure_ascii=False)}\n"
+            f"Project-root path interpretations: {json.dumps(assumption_results, ensure_ascii=False)}\n\n"
             f"Change: {change.title}\nTask: {task.id} {task.title}\n"
             f"Description: {task.description}\nContext: {task.context}\n"
             f"Preferred capability: {task.preferred_capability}\n"
@@ -1123,6 +1216,11 @@ class ReviewService:
             limitation = "Test execution was not independently verified through IDE MCP."
             if requires_execution and not captured_execution and limitation not in evidence:
                 evidence.append(limitation)
+            for assumption in verified_assumptions:
+                statement = (f"Path assumption: {assumption['claimed_path']} means project file "
+                             f"{assumption['path']} (verified by {assumption['verification']}).")
+                if statement not in evidence:
+                    evidence.append(statement)
             raw_validation = value.get("validation_results", [])
             if (not isinstance(raw_validation, list)
                     or not all(isinstance(item, dict) for item in raw_validation)):

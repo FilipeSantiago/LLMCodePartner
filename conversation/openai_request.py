@@ -135,5 +135,19 @@ def advertised_names(request: ChatCompletionRequest) -> list[str]:
 
 
 def tool_results(request: ChatCompletionRequest) -> list[ChatMessage]:
-    """`role:"tool"` messages carrying a tool_call_id (client tool results)."""
+    """Every `role:"tool"` message with a tool_call_id anywhere in the history."""
     return [m for m in request.messages if m.role == "tool" and m.tool_call_id]
+
+
+def trailing_tool_results(request: ChatCompletionRequest) -> list[ChatMessage]:
+    """Tool results that end the history: only these make a request a continuation.
+
+    Clients resend the whole conversation, so results from earlier turns stay in
+    the history. A fresh user message after them is a new turn, not a resume.
+    """
+    trailing = []
+    for message in reversed(request.messages):
+        if message.role != "tool":
+            break
+        trailing.append(message)
+    return [m for m in reversed(trailing) if m.tool_call_id]

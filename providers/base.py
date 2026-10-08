@@ -80,8 +80,13 @@ class Provider(ABC):
         return prompt, system
 
     def _trailing_tool_results(self, messages: list[dict]) -> list[dict]:
-        """`role:"tool"` messages carrying a tool_call_id (client tool results)."""
-        return [m for m in messages if m.get("role") == "tool" and m.get("tool_call_id")]
+        """Tool results that end the history (earlier turns' results are not a resume)."""
+        trailing = []
+        for message in reversed(messages):
+            if message.get("role") != "tool":
+                break
+            trailing.append(message)
+        return [m for m in reversed(trailing) if m.get("tool_call_id")]
 
     async def _drain_queue(self, run: Run) -> AsyncIterator[Event]:
         """Yield a Run's neutral events until it stops for this request: a ToolCallEvent

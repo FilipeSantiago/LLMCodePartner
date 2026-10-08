@@ -788,15 +788,13 @@ class HandlerAndController(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(catalog["changes"][1]["follow_up_for"], ["WP1-T1"])
 
     async def test_controller_requires_streaming_for_bridge_backed_planning(self):
-        with self.assertRaises(HTTPException) as raised:
-            await dialog_controller.chat_completions(
-                ChatCompletionRequest(
-                    model="test",
-                    messages=[ChatMessage(role="user", content="/spec add authentication")],
-                )
+        response = await dialog_controller.chat_completions(
+            ChatCompletionRequest(
+                model="test",
+                messages=[ChatMessage(role="user", content="/spec add authentication")],
             )
-        self.assertEqual(raised.exception.status_code, 400)
-        self.assertIn("requires a streaming request", raised.exception.detail)
+        )
+        self.assertIn("streaming IDE MCP session", response.choices[0].message.content)
 
     async def test_unknown_update_returns_400(self):
         old_handler = dialog_controller.spec_handler
@@ -804,21 +802,15 @@ class HandlerAndController(unittest.IsolatedAsyncioTestCase):
             FakeAdapter(), OpenSpecArtifactStore(FakeMcpClient())
         )
         try:
-            with self.assertRaises(HTTPException) as raised:
-                await dialog_controller.chat_completions(
-                    ChatCompletionRequest(
-                        model="test",
-                        messages=[
-                            ChatMessage(
-                                role="user",
-                                content="/update WP99-T1: change it",
-                            )
-                        ],
-                    )
+            response = await dialog_controller.chat_completions(
+                ChatCompletionRequest(
+                    model="test",
+                    messages=[ChatMessage(role="user", content="/update WP99-T1: change it")],
                 )
+            )
         finally:
             dialog_controller.spec_handler = old_handler
-        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("Nothing was executed", response.choices[0].message.content)
 
     async def test_implementation_bootstraps_ide_mcp_before_task_execution(self):
         response = await dialog_controller.chat_completions(
@@ -890,32 +882,13 @@ class ModeRouting(unittest.TestCase):
         self.assertIsNone(self.route("codepartner-review", "/explain EPIC1"))
         self.assertIsNone(self.route("codepartner-spec", "/apply"))
 
-    def test_review_mode_uses_and_reuses_scope(self):
-        self.assertEqual(self.route("codepartner-review", "wp1, WP2-T1: are tests missing?").content,
-                         "/review wp1 WP2-T1: are tests missing?")
-        self.assertEqual(self.route("codepartner-review", "WP3 check naming").content,
-                         "/review WP3: check naming")
-        self.assertEqual(self.route("codepartner-review", "WP1-T2").content, "/review WP1-T2")
-        sticky = self.route("codepartner-review", "WP1: first", "answer", "what about errors?")
-        self.assertEqual(sticky.content, "/review WP1: what about errors?")
-        sticky = self.route("codepartner-review", "/review WP4", "answer", "and tests?")
-        self.assertEqual(sticky.content, "/review WP4: and tests?")
-        self.assertIn("needs a scope", self.route("codepartner-review", "anything wrong?").reply)
-
-    def test_review_parses_rewritten_command(self):
-        command = self.route("codepartner-review", "wp1 WP2-T1: why?").content
-        self.assertEqual(extract_scoped_request(command, "review"), (["WP1", "WP2-T1"], "why?"))
-
-    def test_implement_mode_requires_scope_in_each_message(self):
-        self.assertEqual(self.route("codepartner-implement", "WP1-T1: add tests").content,
-                         "/implement WP1-T1: add tests")
-        self.assertIn("Nothing was executed",
-                      self.route("codepartner-implement", "WP1", "done", "now add logging").reply)
+    def test_modes_do_not_rewrite_or_reject_free_form_messages(self):
+        self.assertIsNone(self.route("codepartner-review", "WP1: are tests missing?"))
+        self.assertIsNone(self.route("codepartner-review", "anything wrong?"))
+        self.assertIsNone(self.route("codepartner-implement", "WP1-T1: add tests"))
+        self.assertIsNone(self.route("codepartner-implement", "now add logging"))
+        self.assertIsNone(self.route("codepartner-spec", "add authentication"))
         self.assertIsNone(split_scope("WP1x: nope"))
-
-    def test_spec_mode_drafts_plain_messages(self):
-        self.assertEqual(self.route("codepartner-spec", "add authentication").draft_request,
-                         "add authentication")
 
     def test_help_and_model_list_advertise_modes(self):
         self.assertIn("codepartner-review", help_text())
@@ -957,12 +930,13 @@ class SpecModeDrafts(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await persistence.active_refinement("conv"))
             self.assertEqual(client.files, {})
 
-    async def test_implement_mode_without_scope_replies_with_hint(self):
+    async def test_implement_mode_without_session_explains_required_transport(self):
         response = await dialog_controller.chat_completions(ChatCompletionRequest(
             model="codepartner-implement",
             messages=[ChatMessage(role="user", content="make it faster")],
         ))
-        self.assertIn("needs an explicit scope", response.choices[0].message.content)
+        self.assertIn("streaming IDE MCP session", response.choices[0].message.content)
+        self.assertIn("Nothing was executed", response.choices[0].message.content)
 
 
 class JsonReplyTolerance(unittest.IsolatedAsyncioTestCase):

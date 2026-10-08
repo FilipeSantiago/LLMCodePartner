@@ -2,11 +2,14 @@
 
 import hashlib
 import re
+import shlex
 
 from agent.routing.persistence import RoutingPersistence
 from agent.routing.evidence import (is_verification_call, normalize_dispatcher_call,
                                     store_execution_payload, verification_succeeded)
+from mcp_bridge.edit_validation import ValidatedResult, validate_postimages
 from agent.spec.bridge_client import BridgeMcpFileClient
+from mcp_bridge.adapters import mutation_targets
 from mcp_bridge.registry import (
     DOMAIN_SOURCE,
     OP_FILE_CREATE,
@@ -78,6 +81,35 @@ def _normalize_read(result: str) -> str:
     return text
 
 
+_DISPATCHER_MUTATIONS = {
+    "apply_patch": "patch", "create_new_file": "create",
+    "create_new_file_with_text": "create", "replace_file_text_by_path": "replace",
+    "replace_specific_text": "replace", "replace_text_in_file": "replace",
+    "delete_file": "delete", "delete_file_by_path": "delete",
+    "rename_refactoring": "rename", "reformat_file": "format",
+    "edit_notebook": "notebook_edit",
+}
+
+
+def _nested_mutation(name: str, arguments: dict) -> tuple[str | None, dict]:
+    if name.rsplit("__", 1)[-1] != "execute_tool":
+        return None, {}
+    command = arguments.get("command")
+    if not isinstance(command, str):
+        return None, {}
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None, {}
+    if not tokens or tokens[0] not in _DISPATCHER_MUTATIONS:
+        return None, {}
+    parsed = {}
+    for index, token in enumerate(tokens[:-1]):
+        if token.startswith("--"):
+            parsed[token[2:]] = tokens[index + 1]
+    return _DISPATCHER_MUTATIONS[tokens[0]], parsed
+
+
 def _arguments_for_path(spec: ToolSpec, path: str, content: str | None = None) -> dict:
     properties = spec.schema.get("properties", {}) if isinstance(spec.schema, dict) else {}
     key = next((name for name in ("file_path", "filePath", "pathInProject", "path")
@@ -103,6 +135,7 @@ class RollbackJournal:
         self.registry.register(specs)
         self.handlers = handlers
         self.allowed_artifacts = allowed_artifacts
+        self._last_postimages: dict[str, str | None] = {}
         self.read_spec = next((spec for spec in self.registry.candidates(
             OP_FILE_READ, DOMAIN_SOURCE) if spec.name in handlers), None)
 
@@ -131,10 +164,12 @@ class RollbackJournal:
 
     async def before_mutation(self, name: str, arguments: dict) \
             -> tuple[int, list[str], list[tuple[str, dict]]]:
-        paths = list(self.registry.mutation_targets(name, arguments))
+        effective, nested = _nested_mutation(name, arguments)
+        paths = (list(mutation_targets(effective, nested)) if effective
+                 else list(self.registry.mutation_targets(name, arguments)))
         mutation_id = await self.persistence.plan_mutation(
             self.job_id, self.position, name,
-            self.registry.mutation_operation(name), paths)
+            effective or self.registry.mutation_operation(name), paths)
         if not paths:
             await self.persistence.advance_mutation(
                 mutation_id, "planned", "target_resolution",
@@ -194,6 +229,7 @@ class RollbackJournal:
     async def after_mutation(self, mutation_id: int, paths: list[str],
                              issues: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
         await self.persistence.advance_mutation(mutation_id, "applied")
+        self._last_postimages = {}
         postimage_issues = list(issues)
         for path in paths:
             exists, content, error = await self._read(path)
@@ -208,6 +244,7 @@ class RollbackJournal:
             await self.persistence.update_rollback_hash(
                 self.job_id, self.position, path,
                 _hash(content) if exists and content is not None else _MISSING_HASH)
+            self._last_postimages[path] = content if exists else None
         if postimage_issues:
             await self.persistence.advance_mutation(
                 mutation_id, "applied", "postimage",
@@ -257,6 +294,23 @@ class RollbackJournal:
                     # Coders often send `pytest ...` or a positional terminal command;
                     # the dispatcher rejects both before running anything.
                     arguments, normalized_from = normalize_dispatcher_call(arguments)
+                    effective, _ = _nested_mutation(_name, arguments)
+                    if effective:
+                        existing = await self.integrity_issues()
+                        if existing:
+                            return "Error: mutation blocked because journal recovery is required."
+                        mutation_id, paths, issues = await self.before_mutation(_name, arguments)
+                        if issues:
+                            return await self._record_blocked(_name, issues)
+                        try:
+                            result = await _handler(arguments)
+                        except Exception:
+                            await self.after_mutation(mutation_id, paths, issues)
+                            raise
+                        postimage_issues = await self.after_mutation(mutation_id, paths, issues)
+                        if postimage_issues:
+                            return "Error: mutation postimage could not be verified; journal recovery is required."
+                        return ValidatedResult(str(result), validate_postimages(self._last_postimages))
                     if not is_verification_call(arguments):
                         return await _handler(arguments)
                     try:
@@ -307,7 +361,7 @@ class RollbackJournal:
                     await self.persistence.advance_mutation(
                         mutation_id, "postimage_verified", "handler_result",
                         str(result)[:500])
-                return result
+                return ValidatedResult(str(result), validate_postimages(self._last_postimages))
 
             wrapped[name] = call
         return wrapped
@@ -365,6 +419,41 @@ class RollbackJournal:
     async def changed_paths(self) -> list[str]:
         entries = await self.persistence.rollback_files(self.job_id, self.position)
         return [entry["path"] for entry in entries if entry["expected_hash"]]
+
+    async def review_manifest(self) -> list[dict]:
+        """Bounded metadata for review; rollback preimages never leave persistence."""
+        entries = await self.persistence.rollback_files(self.job_id, self.position)
+        mutations = await self.persistence.mutations(self.job_id, self.position)
+        operations: dict[str, list[str]] = {}
+        rename_peers: dict[str, str] = {}
+        for mutation in mutations:
+            if mutation["stage"] not in {"applied", "postimage_verified"}:
+                continue
+            for path in mutation["targets"]:
+                operations.setdefault(path, []).append(mutation["operation"])
+            if mutation["operation"] == "rename" and len(mutation["targets"]) == 2:
+                source, destination = mutation["targets"]
+                rename_peers[source] = destination
+                rename_peers[destination] = source
+        manifest = []
+        for entry in entries:
+            if not entry["expected_hash"]:
+                continue
+            before = entry["before_exists"]
+            after = entry["expected_hash"] != _MISSING_HASH
+            change = ("created" if not before and after else
+                      "deleted" if before and not after else
+                      "modified" if before and after else "absent_after_mutation")
+            item = {
+                "path": entry["path"], "change": change,
+                "before_exists": before, "after_exists": after,
+                "operations": list(dict.fromkeys(operations.get(entry["path"], ()))),
+                "postimage_verified": True,
+            }
+            if entry["path"] in rename_peers:
+                item["rename_peer"] = rename_peers[entry["path"]]
+            manifest.append(item)
+        return manifest
 
     async def integrity_issues(self) -> list[dict]:
         return await self.persistence.rollback_integrity_issues(

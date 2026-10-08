@@ -1452,6 +1452,23 @@ class RollbackJournalTests(unittest.IsolatedAsyncioTestCase):
                 await RollbackJournal(persistence, "job", 0, specs, handlers).changed_paths(),
                 ["src/a.py", "src/b.py"])
 
+    async def test_review_manifest_describes_rename_and_deletion_without_preimages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            await persistence.record_rollback_file("job", 0, "old.py", True, "private old", "__missing__")
+            await persistence.record_rollback_file("job", 0, "new.py", False, None, "new-hash")
+            mutation = await persistence.plan_mutation(
+                "job", 0, "rename_refactoring", "rename", ["old.py", "new.py"])
+            await persistence.advance_mutation(mutation, "postimage_verified")
+            journal = RollbackJournal(persistence, "job", 0, [], {})
+            manifest = await journal.review_manifest()
+            self.assertEqual({item["path"]: item["change"] for item in manifest},
+                             {"old.py": "deleted", "new.py": "created"})
+            self.assertEqual({item["path"]: item["rename_peer"] for item in manifest},
+                             {"old.py": "new.py", "new.py": "old.py"})
+            self.assertNotIn("private old", json.dumps(manifest))
+            self.assertCountEqual(await journal.changed_paths(), ["old.py", "new.py"])
+
 
 class _RecordingReviewer:
     """Fake reviewer provider: records its prompt, optionally reads one file, returns a verdict."""
@@ -2357,13 +2374,116 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError("review model must not run for an unsupported path")
 
         change = SimpleNamespace(title="Trainer contract", work_packages=[])
+        read_file = mock.AsyncMock(return_value="Error: File outside.py does not exist")
         with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
-            with self.assertRaisesRegex(ReviewError, "unsupported project artifact path.*outside.py"):
+            with self.assertRaisesRegex(
+                    ReviewError, r"could not resolve project-root path assumption.*"
+                                 r"/outside\.py -> outside\.py"):
                 await ReviewService().review(
                     change, task(), "Created `/outside.py`.", "claude-haiku",
                     [ToolSpec("read_file", "Read a file", {"type": "object",
                      "properties": {"file_path": {"type": "string"}}})],
-                    {"read_file": mock.AsyncMock(return_value="must not be read")})
+                    {"read_file": read_file})
+        self.assertEqual(read_file.call_args.args[0]["file_path"], "outside.py")
+
+    async def test_root_notation_uses_journal_first_and_discloses_assumption(self):
+        provider = _RecordingReviewer(verdict={
+            "verdict": "done", "rationale": "Root Dockerfile was inspected",
+            "evidence": ["Dockerfile has the required base image"],
+            "inspected_paths": ["Dockerfile"], "findings": [],
+        })
+        manifest = [{"path": "Dockerfile", "change": "modified",
+                     "before_exists": True, "after_exists": True,
+                     "operations": ["replace"], "postimage_verified": True}]
+        queued = replace(task(), context="\n".join((
+            "Required mutation artifact: Dockerfile",
+        )))
+        object.__setattr__(queued, "_review_journal_manifest", manifest)
+        read_file = mock.AsyncMock(return_value="FROM python:3.13")
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                SimpleNamespace(title="Container", work_packages=[]), queued,
+                'Changed `/Dockerfile`.', "claude-haiku",
+                [ToolSpec("read_file", "Read a file", {"type": "object",
+                 "properties": {"file_path": {"type": "string"}}})],
+                {"read_file": read_file})
+        self.assertEqual(read_file.call_args.args[0]["file_path"], "Dockerfile")
+        self.assertIn("Verified mutation journal manifest:", provider.prompt)
+        self.assertLess(provider.prompt.index("Verified mutation journal manifest:"),
+                        provider.prompt.index("Coder's result"))
+        self.assertTrue(any("/Dockerfile means project file Dockerfile" in item
+                            for item in decision.evidence))
+
+    async def test_root_notation_without_journal_requires_exact_ide_read(self):
+        provider = _RecordingReviewer(verdict={
+            "verdict": "done", "rationale": "Root file inspected",
+            "evidence": ["Dockerfile content was inspected"],
+            "inspected_paths": ["Dockerfile"], "findings": [],
+        })
+        read_file = mock.AsyncMock(return_value="FROM python:3.13")
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                SimpleNamespace(title="Container", work_packages=[]), task(),
+                'Changed `/Dockerfile`.', "claude-haiku",
+                [ToolSpec("read_file", "Read a file", {"type": "object",
+                 "properties": {"file_path": {"type": "string"}}})],
+                {"read_file": read_file})
+        self.assertEqual(read_file.call_args.args[0]["file_path"], "Dockerfile")
+        self.assertTrue(any("verified by IDE" in item for item in decision.evidence))
+
+    async def test_protected_root_claim_is_never_read(self):
+        read_file = mock.AsyncMock(return_value="secret")
+        report = json.dumps({"schema_version": 1, "changed_files": [
+            {"path": "/config/.env", "change": "modified"}]})
+        with self.assertRaisesRegex(ReviewError, "unsupported project artifact path"):
+            await ReviewService().review(
+                SimpleNamespace(title="Secrets", work_packages=[]), task(),
+                report, "claude-haiku",
+                [ToolSpec("read_file", "Read a file", {"type": "object",
+                 "properties": {"file_path": {"type": "string"}}})],
+                {"read_file": read_file})
+        read_file.assert_not_called()
+
+    async def test_journaled_deletion_is_verified_as_absent(self):
+        provider = _RecordingReviewer(verdict={
+            "verdict": "done", "rationale": "Obsolete file is absent",
+            "evidence": ["IDE confirmed the deleted file is absent"],
+            "inspected_paths": ["obsolete.py"], "findings": [],
+        })
+        manifest = [{"path": "obsolete.py", "change": "deleted",
+                     "before_exists": True, "after_exists": False,
+                     "operations": ["delete"], "postimage_verified": True}]
+        queued = replace(task(), context="\n".join((
+            "Required mutation artifact: obsolete.py",
+        )))
+        object.__setattr__(queued, "_review_journal_manifest", manifest)
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                SimpleNamespace(title="Cleanup", work_packages=[]), queued,
+                "Deleted `obsolete.py`.", "claude-haiku",
+                [ToolSpec("read_file", "Read a file", {"type": "object",
+                 "properties": {"file_path": {"type": "string"}}})],
+                {"read_file": mock.AsyncMock(
+                    return_value=json.dumps({"content": [{"type": "text",
+                        "text": "File obsolete.py doesn't exist or can't be opened"}]}))})
+        self.assertEqual(decision.verdict, "done")
+        self.assertIn('"status": "verified_absent"', provider.prompt)
+
+    async def test_journaled_deletion_still_present_blocks_review(self):
+        manifest = [{"path": "obsolete.py", "change": "deleted",
+                     "before_exists": True, "after_exists": False,
+                     "operations": ["delete"], "postimage_verified": True}]
+        queued = replace(task(), context="\n".join((
+            "Required mutation artifact: obsolete.py",
+        )))
+        object.__setattr__(queued, "_review_journal_manifest", manifest)
+        with self.assertRaisesRegex(ReviewError, "still reads it"):
+            await ReviewService().review(
+                SimpleNamespace(title="Cleanup", work_packages=[]), queued,
+                "Deleted `obsolete.py`.", "claude-haiku",
+                [ToolSpec("read_file", "Read a file", {"type": "object",
+                 "properties": {"file_path": {"type": "string"}}})],
+                {"read_file": mock.AsyncMock(return_value="still here")})
 
     async def test_review_snapshot_content_and_file_count_are_bounded(self):
         class FakeProvider:

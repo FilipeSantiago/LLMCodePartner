@@ -1,6 +1,7 @@
 """OpenSpec task execution with persisted, same-tier fallback decisions."""
 
 import time
+import os
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable, Callable
 
@@ -34,6 +35,7 @@ class TaskExecutionService:
                       execution_instruction: str = "",
                       direct_tool_handlers: dict | None = None,
                       exclude_models: frozenset[str] = frozenset(),
+                      contract=None, owner_metadata: dict | None = None,
                       ) -> AsyncIterator[Event]:
         # The active project belongs to the IDE request that advertised `specs`.
         # Never route through a process-wide IDE/project setting.
@@ -43,13 +45,14 @@ class TaskExecutionService:
         if on_decision is not None:
             await on_decision(decision)
         async for event in self._run(
-                task, decision, self._execution_messages(task, messages, execution_instruction),
-                specs, direct_tool_handlers or {}):
+                task, decision, self._execution_messages(task, messages, execution_instruction,
+                                                         contract),
+                specs, direct_tool_handlers or {}, owner_metadata or {}):
             yield event
 
     @staticmethod
     def _execution_messages(task: Task, messages: list[dict],
-                            execution_instruction: str = "") -> list[dict]:
+                            execution_instruction: str = "", contract=None) -> list[dict]:
         """Replace the transport command with the actual OpenSpec task objective."""
         task_prompt = "\n".join(filter(None, [
             f"Implement OpenSpec task {task.id}: {task.title}",
@@ -59,7 +62,17 @@ class TaskExecutionService:
             f"Preferred capability: {task.preferred_capability}",
             (f"Additional execution instruction: {execution_instruction}"
              if execution_instruction else ""),
+            (f"TaskContract revision {contract.revision}: {contract.goal}. "
+             f"Expected files: {', '.join(contract.primary_files) or 'none named'}. "
+             "These are guidance, not a file allowlist."
+             if contract is not None else ""),
             "Use the IDE MCP tools as needed to complete the task's actual objective.",
+            ("Use codepartner_read_file for 100-line windows and codepartner_search_in_file "
+             "to locate text within one file. Repository searches return locations; request "
+             "only the source windows you need. Tool results include observation IDs that "
+             "codepartner_get_observation can expand when diagnostics require more detail."
+             if os.getenv("CODEPARTNER_ACI_ENABLED", "true").lower() != "false"
+             else "Use the advertised IDE file tools to inspect relevant source."),
             "Change existing files with focused patches (apply_patch) instead of re-creating "
             "whole files, and keep each tool call's arguments small; very large tool-call "
             "payloads can fail to parse and stop the task.",
@@ -111,7 +124,8 @@ class TaskExecutionService:
             yield event
 
     async def _run(self, task, decision, messages, specs,
-                   direct_tool_handlers: dict) -> AsyncIterator[Event]:
+                   direct_tool_handlers: dict,
+                   owner_metadata: dict | None = None) -> AsyncIterator[Event]:
         attempts = (decision.recommended_model, *decision.fallback_models)
         last_error = None
         for index, model_name in enumerate(attempts):
@@ -124,6 +138,7 @@ class TaskExecutionService:
                     gateway_url=self.config.agentgateway_url, use_gateway=gateway_used,
                     started_at=started,
                     direct_tool_handlers=direct_tool_handlers,
+                    owner_metadata=owner_metadata or {},
                 )
                 executor = self.executors.get(model.executor)
                 failed_before_write = False
