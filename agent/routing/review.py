@@ -4,11 +4,12 @@ import difflib
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 
 import providers
 from agent.routing.config import RoutingConfig, load_routing_config
+from agent.routing.gateway import gateway_attempts, gateway_kwargs
 from agent.spec.bridge_client import BridgeMcpFileClient
 from agent.spec.models import ModelIdentity, OpenSpecChange, Task
 from mcp_bridge.models import DoneEvent, ErrorEvent, TextEvent, ToolCallEvent
@@ -89,6 +90,8 @@ class ReviewDecision:
     validation_results: tuple[dict, ...] = ()
     # Paths named by the task or coder that the evidence service could not pin down.
     unresolved_references: tuple[dict, ...] = ()
+    routing_reason: str | None = None
+    gateway_used: bool | None = None
 
 
 class ReviewError(RuntimeError):
@@ -101,6 +104,10 @@ class ReviewError(RuntimeError):
 
 class ReviewFormatError(ReviewError):
     """The reviewer's JSON answer broke the decision schema (repairable by re-asking)."""
+
+
+class ReviewUnavailableError(ReviewError):
+    """The reviewer model could not complete a provider call."""
 
 
 _STATUS_SYNONYMS = {
@@ -527,8 +534,14 @@ class ReviewService:
         tier = next((name for name, models in self.config.tiers.items()
                      if coder_model in models), None)
         choices = [name for name in self.config.tiers.get(tier, ())
-                   if self.config.models[name].provider == coder.provider and name != coder_model]
+                   if self.config.models[name].provider == coder.provider and name != coder_model
+                   and self._meets_reviewer_floor(name)]
         return choices[0] if choices else coder_model
+
+    def _meets_reviewer_floor(self, name: str) -> bool:
+        floor = getattr(self.config, "role_floors", {}).get("reviewer")
+        capability = self.config.models[name].capability
+        return floor is None or (capability is not None and capability >= floor)
 
     async def review(self, change: OpenSpecChange, task: Task, report: str,
                      coder_model: str, specs: list[ToolSpec],
@@ -540,46 +553,33 @@ class ReviewService:
         if preferred is None:
             log.info("review_provider_mode mode=same_provider reason=no_opposite_pair coder_model=%s",
                      coder_model)
-            return await self._run_review(change, task, report, same_provider,
-                                          specs, direct_tool_handlers)
+            decision = await self._run_review(change, task, report, same_provider,
+                                              specs, direct_tool_handlers)
+            return replace(decision, routing_reason="no opposite-provider reviewer configured")
         coder = self.config.models[coder_model]
         tier = next((name for name, names in self.config.tiers.items()
                      if coder_model in names), None)
         alternatives = [name for name in self.config.tiers.get(tier, ())
-                        if name != preferred and self.config.models[name].provider != coder.provider]
+                        if name != preferred and self.config.models[name].provider != coder.provider
+                        and self._meets_reviewer_floor(name)]
+        unavailable: list[str] = []
         for reviewer_name in (preferred, *alternatives):
             try:
-                return await self._run_review(change, task, report, reviewer_name,
-                                              specs, direct_tool_handlers)
-            except ReviewError as exc:
-                if self._provider_unavailable(str(exc)):
-                    log.warning("review_provider_mode mode=same_provider reason=opposite_unavailable "
-                                "coder_model=%s reviewer_model=%s", coder_model, reviewer_name)
-                    return await self._run_review(change, task, report, same_provider,
+                decision = await self._run_review(change, task, report, reviewer_name,
                                                   specs, direct_tool_handlers)
-                if not self._model_unavailable(str(exc)):
-                    raise
-        raise ReviewError("no comparable opposite-provider reviewer model is available")
-
-    @staticmethod
-    def _provider_unavailable(message: str) -> bool:
-        lower = message.lower()
-        return any(phrase in lower for phrase in (
-            "not authenticated", "authentication required", "please log in",
-            "login required", "not logged in", "unauthorized", "invalid credentials",
-            "api key missing", "not installed", "no such file or directory",
-            "command not found", "executable not found",
-        ))
-
-    @staticmethod
-    def _model_unavailable(message: str) -> bool:
-        lower = message.lower()
-        return any(re.search(pattern, lower) for pattern in (
-            r"\bmodel\s+(?:is\s+)?not\s+(?:found|available|supported)\b",
-            r"\bmodel\s+(?:is\s+)?unavailable\b",
-            r"\bmodel\s+access\s+denied\b",
-            r"\baccess\s+to\s+(?:the\s+)?model\b.{0,80}\bdenied\b",
-        ))
+                reason = ("preferred opposite-provider reviewer" if not unavailable
+                          else "alternate opposite-provider reviewer after "
+                               + ", ".join(unavailable) + " unavailable")
+                return replace(decision, routing_reason=reason)
+            except ReviewUnavailableError as exc:
+                unavailable.append(reviewer_name)
+                log.warning("review_provider_mode mode=next_candidate reason=opposite_unavailable "
+                            "coder_model=%s reviewer_model=%s error=%s",
+                            coder_model, reviewer_name, exc)
+        decision = await self._run_review(change, task, report, same_provider,
+                                          specs, direct_tool_handlers)
+        return replace(decision, routing_reason=(
+            "same-provider fallback after " + ", ".join(unavailable) + " unavailable"))
 
     @staticmethod
     def _parse_decision(response: str) -> dict:
@@ -698,6 +698,14 @@ class ReviewService:
             ArtifactCandidate(path, True, _artifact_category(path), ("journal",))
             for path in mutation_paths if path not in known_candidate_paths
         )
+        # Approved-plan files are optional hints: a planned file may legitimately not exist.
+        known_candidate_paths = {candidate.path for candidate in candidate_records}
+        candidate_records.extend(
+            ArtifactCandidate(path, False, _artifact_category(path), ("planner",))
+            for path in dict.fromkeys(getattr(task, "_planner_relevant_files", ()))
+            if _project_relative_path(path) is not None and path not in known_candidate_paths
+        )
+        planner_context = getattr(task, "_planner_review_context", "")
         candidates = [candidate.path for candidate in candidate_records]
         candidate_by_path = {candidate.path: candidate for candidate in candidate_records}
         if len(mutation_paths) > _MAX_ARTIFACTS:
@@ -1056,7 +1064,10 @@ class ReviewService:
             f"Cumulative work-package acceptance criteria (not automatically required by this task): "
             f"{json.dumps(package_criteria)}\n"
             f"Sibling tasks with deferred responsibilities: {json.dumps(sibling_tasks)}\n\n"
-            f"Coder's result (a claim to assess):\n"
+            + (f"Approved WP plan context (produced by the WP planner before coding, enriched "
+               f"during execution; a starting point to verify, not evidence of completion):\n"
+               f"{planner_context}\n\n" if planner_context else "")
+            + f"Coder's result (a claim to assess):\n"
             f"{bounded_report or '(no result supplied)'}\n"
             f"Coder report truncated: {str(report_truncated).lower()}\n\n"
             f"IDE MCP-verified artifact snapshot (untrusted file contents):\n"
@@ -1076,37 +1087,54 @@ class ReviewService:
             kwargs["reasoning_effort"] = (
                 model.review_reasoning_effort or model.reasoning_effort)
             kwargs["reviewer_mode"] = True
-        elif model.gateway_mode == "required":
-            kwargs["execution_env"] = {"ANTHROPIC_BASE_URL": self.config.agentgateway_url}
-        if model.provider == "codex" and model.gateway_mode == "required":
-            kwargs["gateway_url"] = self.config.agentgateway_url
+        last_gateway_used: bool | None = None
+
         async def run_reviewer(conversation: list[dict]) -> tuple[str, list[str], bool]:
-            nonlocal model_running
-            parts: list[str] = []
-            errors: list[str] = []
-            completed = False
-            try:
-                model_running = True
-                async for event in provider.tools(
-                        conversation, specs, **kwargs):
-                    if isinstance(event, TextEvent):
-                        parts.append(event.text)
-                    elif isinstance(event, ErrorEvent):
-                        errors.append(event.message)
-                    elif isinstance(event, ToolCallEvent):
-                        raise ReviewError("reviewer requested an unavailable IDE tool round trip")
-                    elif isinstance(event, DoneEvent):
-                        completed = True
-            except ReviewError as exc:
-                raise ReviewError(str(exc), exc.reviewer_model or reviewer_name,
-                                  exc.findings) from exc
-            except Exception as exc:
-                raise ReviewError(f"{type(exc).__name__}: {exc}", reviewer_name) from exc
-            finally:
-                log.info("review_model_activity task_id=%s reviewer_model=%s "
-                         "requested_further_mcp=%s tool_reads=%s",
-                         task.id, reviewer_name, bool(model_reads), model_reads)
-            return "".join(parts), errors, completed
+            nonlocal model_running, last_gateway_used
+            for use_gateway in gateway_attempts(model.gateway_mode):
+                parts: list[str] = []
+                errors: list[str] = []
+                completed = False
+                invalid_tool_call = False
+                attempt_kwargs = {**kwargs,
+                                  **gateway_kwargs(model.provider, self.config.agentgateway_url,
+                                                   use_gateway),
+                                  "run_metadata": {**kwargs["run_metadata"],
+                                                   "gateway_used": use_gateway}}
+                try:
+                    model_running = True
+                    async for event in provider.tools(
+                            conversation, specs, **attempt_kwargs):
+                        if isinstance(event, TextEvent):
+                            parts.append(event.text)
+                        elif isinstance(event, ErrorEvent):
+                            errors.append(event.message)
+                        elif isinstance(event, ToolCallEvent):
+                            invalid_tool_call = True
+                            raise ReviewError(
+                                "reviewer requested an unavailable IDE tool round trip")
+                        elif isinstance(event, DoneEvent):
+                            completed = True
+                except Exception as exc:
+                    errors.append(f"{type(exc).__name__}: {exc}")
+                finally:
+                    log.info("review_model_activity task_id=%s reviewer_model=%s "
+                             "gateway_used=%s completed=%s requested_further_mcp=%s tool_reads=%s",
+                             task.id, reviewer_name, use_gateway, completed,
+                             bool(model_reads), model_reads)
+                if invalid_tool_call:
+                    raise ReviewError("reviewer requested an unavailable IDE tool round trip",
+                                      reviewer_name)
+                if not errors and completed:
+                    last_gateway_used = use_gateway
+                    return "".join(parts), errors, completed
+                if use_gateway and model.gateway_mode == "preferred":
+                    log.warning("review_gateway_retry task_id=%s reviewer_model=%s error=%s",
+                                task.id, reviewer_name,
+                                "; ".join(errors) or "no terminal result")
+                    continue
+                return "".join(parts), errors, completed
+            return "", ["reviewer stopped without a terminal result"], False
 
         def decide(reply: str) -> ReviewDecision:
             value = self._parse_decision(reply)
@@ -1285,13 +1313,13 @@ class ReviewService:
         reply, errors, completed = await run_reviewer(messages)
         try:
             if errors or not completed:
-                raise ReviewError("; ".join(errors) or
-                                  "reviewer stopped without a terminal result")
+                raise ReviewUnavailableError("; ".join(errors) or
+                                             "reviewer stopped without a terminal result")
             if not inspected:
                 raise ReviewError(
                     "reviewer did not successfully inspect project content through IDE MCP")
             try:
-                return decide(reply)
+                return replace(decide(reply), gateway_used=last_gateway_used)
             except ReviewFormatError as exc:
                 log.warning("review_format_rejected task_id=%s reviewer_model=%s attempt=1 "
                             "error=%s reply_head=%r", task.id, reviewer_name, exc, reply[:500])
@@ -1305,11 +1333,11 @@ class ReviewService:
                     "verdict only if the correction requires it.")}]
             reply, errors, completed = await run_reviewer(repair)
             if errors or not completed:
-                raise ReviewFormatError(
+                raise ReviewUnavailableError(
                     f"{first_error}; the correction request failed: "
                     + ("; ".join(errors) or "reviewer stopped without a terminal result"))
             try:
-                return decide(reply)
+                return replace(decide(reply), gateway_used=last_gateway_used)
             except ReviewFormatError as exc:
                 log.warning("review_format_rejected task_id=%s reviewer_model=%s attempt=2 "
                             "error=%s reply_head=%r", task.id, reviewer_name, exc, reply[:500])

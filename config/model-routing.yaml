@@ -33,14 +33,49 @@ routing:
         - claude-opus
         - codex-sol-high
 
+# Per-role capability floors. Each role (coder, reviewer, planner) routes from
+# its own table; a model's `capability` is a role-independent strength rank.
+roles:
+  coder:
+    min_capability: 1
+  reviewer:
+    min_capability: 1
+  planner:
+    min_capability: 3
+
+# Work Package planner (codepartner-plan mode). Routed by WP complexity, which
+# is role-relative: a `low` planner still outranks every `simple` coder.
+planner:
+  tiers:
+    low:
+      - claude-sonnet
+      - codex-sol-medium
+    medium:
+      - claude-opus
+      - codex-sol-high
+    high:
+      - claude-opus
+      - codex-sol-high
+    complex:
+      - claude-opus
+      - codex-sol-high
+  reasoning_effort:
+    complex: xhigh
+  max_tool_calls: 60
+  # One short "what I'm checking and why" line before each tool call
+  # (~15-25 output tokens per call). Turn off to compare planner cost.
+  narrate: true
+
 models:
   claude-haiku:
+    capability: 1
     provider: claude
     executor: claude-cli
     cli_model: haiku
     gateway_mode: preferred
 
   codex-luna-low:
+    capability: 1
     provider: codex
     executor: codex-cli
     cli_model: gpt-5.6-luna
@@ -49,12 +84,14 @@ models:
     gateway_mode: preferred
 
   claude-sonnet:
+    capability: 3
     provider: claude
     executor: claude-cli
     cli_model: sonnet
     gateway_mode: preferred
 
   codex-luna-medium:
+    capability: 2
     provider: codex
     executor: codex-cli
     cli_model: gpt-5.6-luna
@@ -62,6 +99,7 @@ models:
     gateway_mode: preferred
 
   codex-sol-medium:
+    capability: 3
     provider: codex
     executor: codex-cli
     cli_model: gpt-6.1-sol
@@ -69,12 +107,14 @@ models:
     gateway_mode: preferred
 
   claude-opus:
+    capability: 5
     provider: claude
     executor: claude-cli
     cli_model: opus
     gateway_mode: preferred
 
   codex-sol-high:
+    capability: 5
     provider: codex
     executor: codex-cli
     cli_model: gpt-6.1-sol

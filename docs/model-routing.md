@@ -15,21 +15,43 @@ there is no parallel executor workflow.
 - `routing.tiers` defines the only allowed model aliases for each complexity.
 - `models` maps each alias to a provider, executor, configurable CLI model, and
   gateway policy.
-- `gateway_mode: preferred` attempts agentgateway then retries direct execution
-  with the same authenticated CLI session.
+- `gateway_mode: preferred` attempts agentgateway first, then retries the same
+  model directly after an operational gateway failure. This applies to coding,
+  WP planning, and review calls.
 - `gateway_mode: required` never bypasses the gateway; `disabled` never uses it.
 
 The vLLM configuration in `infra/semantic-router/config.yaml` mirrors these
 aliases. At runtime Code Partner calls vLLM's route-preview management endpoint,
 then rejects any selected alias outside the local tier.
 
+### Roles and capability floors
+
+Coder, reviewer, and WP planner route from separate tables. Each model carries a
+role-independent `capability` rank, and `roles.<role>.min_capability` sets a floor
+per role:
+
+- **Coder:** `routing.tiers`, keyed by task complexity (`simple|medium|complex`).
+- **Reviewer:** the `reviewers` pairing table; fallbacks below the reviewer floor
+  are skipped. The opposite provider is preferred; if its eligible models cannot
+  run, an eligible same-provider model reviews with the same evidence requirements.
+- **Planner:** `planner.tiers`, keyed by Work Package complexity
+  (`low|medium|high|complex`), with optional `reasoning_effort` overrides and a
+  `max_tool_calls` investigation budget.
+
+Complexity is role-relative. The loader rejects a config whose `low` planner
+candidates are not strictly more capable than every `simple` coder. A config
+without `roles` or `planner` still loads; only `codepartner-plan` needs the planner
+section. See `docs/wp-planner.md`.
+
 ## Safety and fallback
 
 The router uses configured order as a deterministic fallback when Semantic Router
 is unavailable or returns an invalid selection. Failed gateway attempts retry the
-same model directly before the next candidate is tried. A different model is not
-started after a successful JetBrains write tool result, preventing a fallback
-agent from replaying partial edits.
+same model directly before the next candidate is tried. A different coding model
+is not started after a successful JetBrains write tool result, preventing a
+fallback agent from replaying partial edits. Reviewer fallback is only for
+provider execution failure, not unfavorable findings or failed evidence checks.
+If no reviewer can run, review remains pending/UNVERIFIED.
 
 ## Operations
 

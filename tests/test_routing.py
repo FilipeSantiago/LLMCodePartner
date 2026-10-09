@@ -17,7 +17,8 @@ from agent.routing.implementation import ImplementationService
 from agent.routing.models import ModelRef
 from agent.routing.persistence import RoutingPersistence
 from agent.routing.review import (ReviewDecision, ReviewError, ReviewFinding,
-                                  ReviewFormatError, ReviewService, _artifact_candidates,
+                                  ReviewFormatError, ReviewService, ReviewUnavailableError,
+                                  _artifact_candidates,
                                   _candidate_paths)
 from agent.routing.rollback import RollbackJournal, journal_handlers
 from agent.routing.semantic_router import SemanticRouterError
@@ -102,6 +103,34 @@ class ExecutorDispatchTests(unittest.TestCase):
 
 
 class PersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unfinished_job_lookup_is_scoped_to_wp_and_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            with store._database() as db:
+                for job_id, project_id, status, task_id in (
+                    ("other-wp", "project-a", "running", "WP10-T1"),
+                    ("other-project", "project-b", "running", "WP1-T1"),
+                    ("finished", "project-a", "completed", "WP1-T1"),
+                    ("active", "project-a", "awaiting_review_resolution", "WP1-T2"),
+                ):
+                    db.execute("""INSERT INTO implementation_jobs
+                      (job_id, selectors_json, instruction, conversation_id, project_id,
+                       status, created_at, updated_at)
+                      VALUES (?, '[]', '', 'conversation-a', ?, ?, 1, 1)""",
+                      (job_id, project_id, status))
+                    db.execute("""INSERT INTO implementation_job_tasks
+                      (job_id, position, change_id, task_id, status)
+                      VALUES (?, 0, 'CHG1', ?, 'queued')""", (job_id, task_id))
+            self.assertEqual(
+                await store.unfinished_job_for_wp("project-a", "conversation-a", "WP1"),
+                "active")
+            self.assertIsNone(
+                await store.unfinished_job_for_wp("project-a", "conversation-a", "WP2"))
+            with store._database() as db:
+                db.execute("UPDATE implementation_jobs SET status='stopped' WHERE job_id='active'")
+            self.assertIsNone(
+                await store.unfinished_job_for_wp("project-a", "conversation-a", "WP1"))
+
     async def test_verification_evidence_is_scoped_to_current_revision_attempt(self):
         with tempfile.TemporaryDirectory() as directory:
             store = RoutingPersistence(Path(directory) / "routing.sqlite3")
@@ -382,7 +411,7 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any("Do you consider" in event.text
                                 for event in events if isinstance(event, TextEvent)))
             decision_index = next(i for i, event in enumerate(events)
-                                  if isinstance(event, TextEvent) and "Reviewer decision:" in event.text)
+                                  if isinstance(event, TextEvent) and "**Why**" in event.text)
             question_index = next(i for i, event in enumerate(events)
                                   if isinstance(event, TextEvent) and "Reviewer question:" in event.text)
             self.assertLess(decision_index, question_index)
@@ -419,7 +448,7 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await persistence.revision_state(job.job_id, 0), (0, 3))
             self.assertEqual(reviewer.reports,
                              ["Task result with supporting evidence."] * 2)
-            self.assertTrue(any("Reviewer decision:" in event.text
+            self.assertTrue(any("**Why**" in event.text
                                 for event in events if isinstance(event, TextEvent)))
 
     async def test_unrelated_write_does_not_override_review_gaps(self):
@@ -461,7 +490,7 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(execution.started), 2)
             self.assertEqual(len(artifacts.reviews), 0)
             self.assertEqual(await persistence.review_count(job.job_id, 0), 2)
-            self.assertTrue(any("Implementation findings:" in event.text
+            self.assertTrue(any("**Implementation findings**" in event.text
                                 and "Requested outcome missing" in event.text
                                 for event in events if isinstance(event, TextEvent)))
             self.assertTrue(any("approval_criteria" in instruction
@@ -489,7 +518,7 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(artifacts.reviews[0].coder.label,
                              "Codex GPT-6.1 Sol (high effort)")
             self.assertEqual(artifacts.reviews[0].reviewer.label, "Claude Opus")
-            self.assertTrue(any("Reviewed by: Claude Opus" in event.text
+            self.assertTrue(any("reviewer: Claude Opus" in event.text
                                 for event in events if isinstance(event, TextEvent)))
 
     async def test_submit_again_and_accept_use_latest_review(self):
@@ -509,7 +538,7 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
                 job.job_id, 0, [], [], "", {}, "add coverage")]
             self.assertEqual(artifacts.completed, [])
             self.assertEqual(len(execution.started), 2)
-            self.assertTrue(any("Reviewed by: Claude Haiku" in event.text
+            self.assertTrue(any("reviewer: Claude Haiku" in event.text
                                 for event in events if isinstance(event, TextEvent)))
             [event async for event in service.accept_anyway(
                 job.job_id, 0, [], [], "", {})]
@@ -532,8 +561,8 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
             job = await service.create_job(["WP1-T1"])
             events = [event async for event in service.start(job, [], [])]
             self.assertEqual(artifacts.completed, [])
-            self.assertTrue(any("Coded by: Claude Haiku" in event.text
-                                and "Reviewer: not run" in event.text
+            self.assertTrue(any("coder: Claude Haiku" in event.text
+                                and "reviewer: not run" in event.text
                                 for event in events if isinstance(event, TextEvent)))
 
     async def test_review_error_identifies_reviewer_that_ran_but_could_not_verify(self):
@@ -557,7 +586,7 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
             events = [event async for event in service.start(job, [], [])]
             self.assertEqual(artifacts.completed, [])
             self.assertTrue(any(
-                "Reviewer: Codex GPT-6.1 Sol (medium effort) "
+                "reviewer: Codex GPT-6.1 Sol (medium effort) "
                 "(ran, verification incomplete)" in event.text
                 for event in events if isinstance(event, TextEvent)))
 
@@ -721,8 +750,8 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(latest["verdict"], "review_pending")
             self.assertEqual(latest["details"]["run_status"], "ran_incomplete")
             self.assertEqual(latest["details"]["findings"][0]["kind"], "verification")
-            self.assertTrue(any("```json" in event.text
-                                and '"problem": "Integration tests could not be read"' in event.text
+            self.assertTrue(any("**Verification incomplete**" in event.text
+                                and "**Integration tests could not be read**" in event.text
                                 for event in events if isinstance(event, TextEvent)))
 
     async def test_coder_owned_verification_finding_starts_revision(self):
@@ -1520,9 +1549,9 @@ class _SelectingReviewer(ReviewService):
     async def _run_review(self, change, queued_task, report, reviewer_name, specs, handlers):
         self.selected.append(reviewer_name)
         if self.unavailable and len(self.selected) == 1:
-            raise ReviewError("authentication required")
+            raise ReviewUnavailableError("authentication required")
         if self.model_unavailable and len(self.selected) == 1:
-            raise ReviewError("model not available")
+            raise ReviewUnavailableError("model not available")
         return ReviewDecision("done", "Task outcome reviewed", reviewer_name)
 
 
@@ -1622,10 +1651,122 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
         await reviewer.review(None, task(), "result", "claude-haiku", [], {})
         self.assertEqual(reviewer.selected, ["codex-luna-low", "claude-haiku"])
 
+    async def test_codex_coder_uses_codex_if_claude_is_unavailable(self):
+        reviewer = _SelectingReviewer(load_routing_config(), unavailable=True)
+        decision = await reviewer.review(None, task(), "result", "codex-sol-high", [], {})
+        self.assertEqual(reviewer.selected, ["claude-opus", "codex-sol-high"])
+        self.assertEqual(decision.reviewer_model, "codex-sol-high")
+        self.assertIn("same-provider fallback", decision.routing_reason)
+
     async def test_unavailable_model_tries_other_opposite_model_in_same_tier(self):
         reviewer = _SelectingReviewer(load_routing_config(), model_unavailable=True)
         await reviewer.review(None, task(), "result", "claude-sonnet", [], {})
         self.assertEqual(reviewer.selected, ["codex-sol-medium", "codex-luna-medium"])
+
+    async def test_all_opposite_models_unavailable_then_same_provider(self):
+        class UnavailableReviewer(_SelectingReviewer):
+            async def _run_review(self, change, queued_task, report, reviewer_name, specs, handlers):
+                self.selected.append(reviewer_name)
+                if reviewer_name.startswith("codex"):
+                    raise ReviewUnavailableError("model not available")
+                return ReviewDecision("done", "Reviewed", reviewer_name)
+
+        reviewer = UnavailableReviewer(load_routing_config())
+        decision = await reviewer.review(None, task(), "result", "claude-sonnet", [], {})
+        self.assertEqual(reviewer.selected,
+                         ["codex-sol-medium", "codex-luna-medium", "claude-sonnet"])
+        self.assertEqual(decision.reviewer_model, "claude-sonnet")
+
+    async def test_substantive_review_error_does_not_switch_provider(self):
+        class EvidenceFailure(_SelectingReviewer):
+            async def _run_review(self, change, queued_task, report, reviewer_name, specs, handlers):
+                self.selected.append(reviewer_name)
+                raise ReviewError("required project evidence is unreadable")
+
+        reviewer = EvidenceFailure(load_routing_config())
+        with self.assertRaisesRegex(ReviewError, "evidence is unreadable"):
+            await reviewer.review(None, task(), "result", "codex-sol-high", [], {})
+        self.assertEqual(reviewer.selected, ["claude-opus"])
+
+    async def test_no_available_reviewer_still_reports_failure(self):
+        class NoProvider(_SelectingReviewer):
+            async def _run_review(self, change, queued_task, report, reviewer_name, specs, handlers):
+                self.selected.append(reviewer_name)
+                raise ReviewUnavailableError("authentication required", reviewer_name)
+
+        reviewer = NoProvider(load_routing_config())
+        with self.assertRaises(ReviewUnavailableError):
+            await reviewer.review(None, task(), "result", "codex-sol-high", [], {})
+        self.assertEqual(reviewer.selected, ["claude-opus", "codex-sol-high"])
+
+    async def test_reviewer_preferred_gateway_failure_retries_same_model_direct(self):
+        class Provider:
+            def __init__(self):
+                self.calls = []
+
+            async def tools(self, messages, specs, **kwargs):
+                self.calls.append(kwargs)
+                if kwargs.get("execution_env"):
+                    yield ErrorEvent("HTTP 503 service unavailable")
+                    yield DoneEvent("endTurn")
+                else:
+                    await kwargs["direct_tool_handlers"]["read_file"]({"file_path": "report.md"})
+                    yield TextEvent(json.dumps({
+                        "verdict": "done", "rationale": "Inspected the report",
+                        "evidence": ["report.md confirms the outcome"],
+                        "inspected_paths": ["report.md"], "findings": [],
+                    }))
+                    yield DoneEvent("endTurn")
+
+        async def read_file(_arguments):
+            return "The implemented report."
+
+        provider = Provider()
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                SimpleNamespace(title="Review", work_packages=[]), task(),
+                "Implemented `report.md`.", "codex-sol-medium",
+                [ToolSpec("read_file", "Read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}}})], {"read_file": read_file})
+        self.assertEqual(decision.reviewer_model, "claude-sonnet")
+        self.assertFalse(decision.gateway_used)
+        self.assertEqual(provider.calls[0]["execution_env"],
+                         {"ANTHROPIC_BASE_URL": load_routing_config().agentgateway_url})
+        self.assertNotIn("execution_env", provider.calls[1])
+
+    async def test_reviewer_required_and_disabled_gateway_modes(self):
+        class Provider:
+            def __init__(self):
+                self.calls = []
+
+            async def tools(self, messages, specs, **kwargs):
+                self.calls.append(kwargs)
+                await kwargs["direct_tool_handlers"]["read_file"]({"file_path": "report.md"})
+                yield TextEvent(json.dumps({
+                    "verdict": "done", "rationale": "Inspected the report",
+                    "evidence": ["report.md confirms the outcome"],
+                    "inspected_paths": ["report.md"], "findings": [],
+                }))
+                yield DoneEvent("endTurn")
+
+        async def read_file(_arguments):
+            return "The implemented report."
+
+        config = load_routing_config()
+        for mode in ("required", "disabled"):
+            with self.subTest(mode=mode):
+                models = {**config.models, "claude-sonnet": replace(
+                    config.models["claude-sonnet"], gateway_mode=mode)}
+                provider = Provider()
+                with mock.patch("agent.routing.review.providers.get", return_value=provider):
+                    decision = await ReviewService(replace(config, models=models)).review(
+                        SimpleNamespace(title="Review", work_packages=[]), task(),
+                        "Implemented `report.md`.", "codex-sol-medium",
+                        [ToolSpec("read_file", "Read", {"type": "object", "properties": {
+                            "file_path": {"type": "string"}}})], {"read_file": read_file})
+                self.assertEqual(len(provider.calls), 1)
+                self.assertEqual("execution_env" in provider.calls[0], mode == "required")
+                self.assertEqual(decision.gateway_used, mode == "required")
 
     async def test_reviewer_runs_with_read_only_role_and_structured_verdict(self):
         class FakeProvider:
@@ -1655,7 +1796,8 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(provider.reviewer_mode)
         self.assertEqual(provider.reasoning_effort, "medium")
         self.assertEqual(provider.run_metadata,
-                         {"reviewer": True, "reviewer_model": "codex-luna-low"})
+                         {"reviewer": True, "reviewer_model": "codex-luna-low",
+                          "gateway_used": True})
         self.assertEqual(decision.verdict, "done")
         self.assertEqual(decision.reviewer_model, "codex-luna-low")
         self.assertEqual(decision.evidence, ("Inspected report.md",))
@@ -2739,7 +2881,7 @@ class CoderRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Coding interrupted", text)
             self.assertIn("could not be parsed", text)
             self.assertIn("try coder again", text)
-            self.assertIn(f"job {job.job_id}", text)
+            self.assertIn(f"job {job.job_id[:8]}", text)
             item = await persistence.implementation_task(job.job_id, 0)
             self.assertEqual(item.status, "awaiting_coder_recovery")
             self.assertIsNotNone(await persistence.pending_resolution("conv-recovery"))
@@ -2777,7 +2919,7 @@ class CoderRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 directory, _InterruptedTaskExecution("all simple routing candidates failed: boom"))
             self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
                              "failed")
-            self.assertTrue(any("Reviewer: not run" in event.text
+            self.assertTrue(any("reviewer: not run" in event.text
                                 for event in events if isinstance(event, TextEvent)))
 
     async def test_routing_excludes_models_but_never_empties_the_tier(self):

@@ -20,6 +20,8 @@ class ModelRef:
     gateway_mode: str = "preferred"
     reasoning_effort: str | None = None
     review_reasoning_effort: str | None = None
+    # Role-independent strength rank used by per-role capability floors.
+    capability: int | None = None
 
 
 @dataclass(frozen=True)
@@ -76,11 +78,14 @@ class ImplementationJob:
     task_ids: tuple[str, ...]
     instruction: str = ""
     status: str = "queued"
+    # The approved WP plan whose context this job's coders and reviewer receive.
+    plan_id: str | None = None
 
     @classmethod
     def create(cls, selectors: list[str], task_ids: list[str],
-               instruction: str = "") -> "ImplementationJob":
-        return cls(str(uuid4()), tuple(selectors), tuple(task_ids), instruction=instruction)
+               instruction: str = "", plan_id: str | None = None) -> "ImplementationJob":
+        return cls(str(uuid4()), tuple(selectors), tuple(task_ids), instruction=instruction,
+                   plan_id=plan_id)
 
 
 # Job-level statuses. Active jobs may still change project files; a halted job
