@@ -10,7 +10,7 @@ import json
 import re
 import shlex
 import time
-from collections import Counter, OrderedDict
+from collections import Counter
 from pathlib import PurePosixPath
 from typing import Awaitable, Callable
 
@@ -18,12 +18,9 @@ from mcp_bridge.adapters import mutation_targets
 from mcp_bridge.edit_validation import validate_postimages, validator_for
 from mcp_bridge.registry import DEFINITIONS, ToolSpec, is_mutating_tool
 
-WINDOW = 100
-MAX_WINDOW = 200
-MAX_BYTES = 4000
-SEARCH_MATCHES = 30
-MAX_SAVED = 128
-MAX_SAVED_BYTES = 2_000_000
+# The IDE's read_file tool rejects a single request above 5,000 lines. This is
+# a transport constraint, not a limit on what the coder may request.
+IDE_READ_PAGE = 5000
 _NUMBERED = re.compile(r"^L(\d+): ?(.*)$")
 _TRUNCATED = re.compile(r"…\d+ lines truncated…")
 _PATH_KEYS = frozenset({
@@ -58,20 +55,23 @@ def tool_failed(raw: str | None) -> bool:
 def tool_specs() -> list[ToolSpec]:
     return [
         ToolSpec("codepartner_read_file",
-                 "Read a contiguous, numbered window of a project file. Defaults to 100 lines; "
-                 "returns total lines and a continuation. Search first for large files.",
+                 "Read a complete project file by default, or exactly the requested line range. "
+                 "Repeated reads reuse the run-local result; refresh=true rereads the IDE.",
                  {"type": "object", "properties": {
                      "path": {"type": "string"},
                      "start_line": {"type": "integer", "minimum": 1},
                      "end_line": {"type": "integer", "minimum": 1},
+                     "refresh": {"type": "boolean"},
                  }, "required": ["path"]}),
         ToolSpec("codepartner_search_in_file",
-                 "Find a literal in one project file. Returns line numbers and short previews.",
+                 "Find a literal in one project file. Returns all IDE-provided matches unless "
+                 "a limit is supplied.",
                  {"type": "object", "properties": {
                      "path": {"type": "string"}, "query": {"type": "string"},
+                     "limit": {"type": "integer", "minimum": 1},
                  }, "required": ["path", "query"]}),
         ToolSpec("codepartner_get_observation",
-                 "Reload a bounded page of an earlier authorized result by id. "
+                 "Reload the complete earlier authorized result by id. "
                  "Use observation_id='index' to list observed ranges and edits.",
                  {"type": "object", "properties": {
                      "observation_id": {"type": "string"},
@@ -84,7 +84,9 @@ def _bare(name: str) -> str:
     return name.rsplit("__", 1)[-1]
 
 
-def _clip(text: str, limit: int = MAX_BYTES) -> tuple[str, bool]:
+def _clip(text: str, limit: int | None = None) -> tuple[str, bool]:
+    if limit is None:
+        return text, False
     data = text.encode("utf-8", errors="replace")
     if len(data) <= limit:
         return text, False
@@ -158,13 +160,13 @@ def _paths(arguments: dict) -> tuple[str, ...]:
     return tuple(dict.fromkeys(found))
 
 
-def _read_result(raw: str, path: str, start: int, count: int) -> tuple[str, int, str]:
+def _read_result(raw: str, path: str, start: int, count: int | None,
+                 total_hint: int | None = None) -> tuple[str, int, str]:
     text = _unwrap(raw)
     if (text.lstrip().lower().startswith("error")
             or re.search(r"\b(?:does not exist|doesn't exist|cannot be opened|can't be opened|not found)\b",
                          text, re.I)):
-        shown, _ = _clip(text)
-        return f"READ FAILED\n{path}\n{shown}", 0, ""
+        return f"READ FAILED\n{path}\n{text}", 0, ""
     numbered: list[tuple[int, str]] = []
     for line in text.splitlines():
         match = _NUMBERED.match(line)
@@ -175,13 +177,12 @@ def _read_result(raw: str, path: str, start: int, count: int) -> tuple[str, int,
             return "READ COMPLETE\n" + path + " — empty file (0 lines).\ntruncated=false", 0, ""
         if _TRUNCATED.search(text):
             return "READ ERROR\nIDE response contained no verifiable numbered lines.", 0, ""
-        # Legacy readers can provide plain whole-file text. Their observations
-        # are still windowed, though the IDE may have sent more internally.
+        # Legacy readers may provide plain whole-file text.
         lines = text.splitlines()
         numbered = list(enumerate(lines, 1))
-    total = numbered[-1][0]
+    total = total_hint if total_hint is not None else numbered[-1][0]
     by_number = {number: value for number, value in numbered}
-    stop = min(start + count - 1, total)
+    stop = min(start + count - 1, total) if count is not None else total
     if start > total:
         return (f"READ COMPLETE\n{path} — 0 lines returned; file has {total} lines.\n"
                 "truncated=false", 0, "")
@@ -189,42 +190,22 @@ def _read_result(raw: str, path: str, start: int, count: int) -> tuple[str, int,
     if missing:
         return (f"READ ERROR\n{path}: IDE omitted requested line {missing[0]}; "
                 "a contiguous window could not be verified.", 0, "")
-    rendered = [f"{number:>5} | {by_number[number]}" for number in range(start, stop + 1)]
-    displayed = []
-    used = 0
-    long_line = False
-    for line in rendered:
-        encoded = line.encode()
-        additional = len(encoded) + (1 if displayed else 0)
-        if used + additional > MAX_BYTES:
-            if not displayed:
-                displayed.append(encoded[:MAX_BYTES].decode("utf-8", errors="ignore"))
-                long_line = True
-            break
-        displayed.append(line)
-        used += additional
-    body = "\n".join(displayed)
-    clipped = len(displayed) < len(rendered) or long_line
-    returned = len(displayed)
+    body = "\n".join(f"{number:>5} | {by_number[number]}"
+                     for number in range(start, stop + 1))
+    returned = stop - start + 1
     actual_end = start + returned - 1 if returned else start - 1
     more = actual_end < total
     header = (f"READ COMPLETE\n{path} — lines {start}–{actual_end} of {total}\n"
-              f"truncated={'true' if more or clipped else 'false'}\n")
+              f"truncated={'true' if more else 'false'}\n")
     if more:
-        header += (f"Remaining: {actual_end + 1}–{total}\nSuggested continuation: "
-                   f"codepartner_read_file(path={path!r}, start_line={actual_end + 1}, "
-                   f"end_line={min(actual_end + WINDOW, total)})\n")
-    if long_line:
-        header += "The displayed line exceeds the byte limit; its text is clipped. Use observation expansion for more.\n"
+        header += f"Remaining: {actual_end + 1}–{total}\n"
     return header + body, returned, body
 
 
 def _search_result(raw: str, query: str, exclusions: tuple[str, ...]) -> tuple[str, int]:
     text = _unwrap(raw)
-    query = query[:160]
     if text.lstrip().lower().startswith("error"):
-        shown, _ = _clip(text)
-        return f"SEARCH FAILED\nquery={query!r}\n{shown}", 0
+        return f"SEARCH FAILED\nquery={query!r}\n{text}", 0
     try:
         payload = json.loads(text)
     except ValueError:
@@ -234,13 +215,12 @@ def _search_result(raw: str, query: str, exclusions: tuple[str, ...]) -> tuple[s
         safe = [item for item in items if isinstance(item, dict)
                 and not _path_reason(item.get("filePath"), exclusions=exclusions)]
         output = []
-        for item in safe[:SEARCH_MATCHES]:
+        for item in safe:
             path = item["filePath"]
             line = item.get("startLine") or item.get("line")
             output.append(f"{path}:{line}" if line else path)
-        more = bool(payload.get("more")) or len(safe) > SEARCH_MATCHES
-        listing, clipped = _clip("\n".join(output))
-        more = more or clipped
+        more = bool(payload.get("more"))
+        listing = "\n".join(output)
         heading = (f"SEARCH COMPLETE\nquery={query!r}\n{len(output)} matches returned"
                    + ("; more matches available" if more else "")
                    + f"\ntruncated={'true' if more else 'false'}")
@@ -249,11 +229,9 @@ def _search_result(raw: str, query: str, exclusions: tuple[str, ...]) -> tuple[s
         return heading + ("\n" + listing if output else "\n0 visible matches."), len(output)
     lines = [line for line in text.splitlines()
              if not _path_reason(line.split(":", 1)[0], exclusions=exclusions)]
-    output = "\n".join(lines[:SEARCH_MATCHES])
-    output, clipped = _clip(output)
-    more = clipped or len(lines) > SEARCH_MATCHES
-    return (f"SEARCH COMPLETE\nquery={query!r}\n{len(lines[:SEARCH_MATCHES])} matches returned\n"
-            f"truncated={'true' if more else 'false'}\n" + (output or "0 matches found.")), len(lines[:SEARCH_MATCHES])
+    output = "\n".join(lines)
+    return (f"SEARCH COMPLETE\nquery={query!r}\n{len(lines)} matches returned\n"
+            "truncated=false\n" + (output or "0 matches found.")), len(lines)
 
 
 def _safe_search_raw(raw: str, exclusions: tuple[str, ...]) -> str:
@@ -347,6 +325,16 @@ def _complete_source(raw: str) -> str | None:
     return None
 
 
+def _numbered_lines(raw: str) -> tuple[dict[int, str], bool]:
+    text = _unwrap(raw)
+    lines = {}
+    for line in text.splitlines():
+        match = _NUMBERED.match(line)
+        if match:
+            lines[int(match.group(1))] = match.group(2)
+    return lines, bool(_TRUNCATED.search(text))
+
+
 def _listing_result(raw: str, exclusions: tuple[str, ...]) -> str:
     text = _unwrap(raw)
     lines = text.splitlines()
@@ -356,11 +344,9 @@ def _listing_result(raw: str, exclusions: tuple[str, ...]) -> str:
             and not any(item in line for item in exclusions)]
     # A JSON tree can put every entry on one line. Hide that line if it names
     # a protected resource rather than forwarding its surrounding content.
-    visible = "\n".join(safe[:50])
-    visible, clipped = _clip(visible)
-    more = clipped or len(safe) > 50
-    return (f"LIST COMPLETE\n{len(safe[:50])} entries returned\n"
-            f"truncated={'true' if more else 'false'}\n"
+    visible = "\n".join(safe)
+    return (f"LIST COMPLETE\n{len(safe)} entries returned\n"
+            "truncated=false\n"
             + (visible or "No visible entries.")
             + (f"\n{len(lines) - len(safe)} protected entry line(s) omitted"
                if len(lines) != len(safe) else ""))
@@ -379,8 +365,9 @@ class AgentToolInterface:
     def __init__(self, run, *, compact: bool = True):
         self.run = run
         self.compact = compact
-        self.observations: OrderedDict[str, str] = OrderedDict()
+        self.observations: dict[str, str] = {}
         self.prior: dict[tuple, tuple[str, str]] = {}
+        self.complete_reads: dict[str, str] = {}
         self.prior_search: dict[tuple, str] = {}
         self.counter = 0
         self.metrics: Counter[str] = Counter()
@@ -398,12 +385,7 @@ class AgentToolInterface:
         key = f"obs-{self.counter}"
         self.metrics[f"{category}_calls"] += 1
         if raw and raw != result:
-            if len(raw.encode()) > MAX_SAVED_BYTES:
-                suffix = "\nFull output unavailable: it exceeded the observation retention limit."
-                return result + suffix
             self.observations[key] = raw
-            while len(self.observations) > MAX_SAVED or sum(map(len, self.observations.values())) > MAX_SAVED_BYTES:
-                self.observations.popitem(last=False)
             suffix = f"\nFull authorized output: codepartner_get_observation(observation_id={key!r})"
             return result + suffix
         return result
@@ -411,11 +393,9 @@ class AgentToolInterface:
     def _reload(self, arguments: dict) -> str:
         key = arguments.get("observation_id")
         if key == "index":
-            listing = "\n".join(self.observed[-50:]) or "No observations recorded yet."
-            shown, truncated = _clip(listing)
+            listing = "\n".join(self.observed) or "No observations recorded yet."
             return (f"OBSERVATION INDEX\n{len(self.observed)} entries recorded\n"
-                    f"truncated={'true' if truncated or len(self.observed) > 50 else 'false'}\n"
-                    + shown)
+                    "truncated=false\n" + listing)
         raw = self.observations.get(key)
         if raw is None:
             return "OBSERVATION UNAVAILABLE\nThis observation expired or belongs to another execution."
@@ -426,11 +406,59 @@ class AgentToolInterface:
         if offset < 0:
             return "OBSERVATION ERROR\noffset must be a nonnegative integer."
         data = raw.encode()
-        segment = data[offset:offset + MAX_BYTES].decode("utf-8", errors="replace")
-        next_offset = min(offset + MAX_BYTES, len(data))
-        return (f"OBSERVATION COMPLETE\nid={key}\nbytes={offset}–{next_offset} of {len(data)}\n"
-                f"truncated={'true' if next_offset < len(data) else 'false'}\n" + segment
-                + (f"\nContinue with offset={next_offset}" if next_offset < len(data) else ""))
+        segment = data[offset:].decode("utf-8", errors="replace")
+        return (f"OBSERVATION COMPLETE\nid={key}\nbytes={offset}–{len(data)} of {len(data)}\n"
+                "truncated=false\n" + segment)
+
+    async def _fetch_read(self, name: str, path: str, start: int, count: int | None,
+                          backend: Callable[[str, dict], Awaitable[str]],
+                          *, dispatcher: bool = False) -> tuple[str, str, int]:
+        lines: dict[int, str] = {}
+        offset = start
+        total: int | None = None
+        while True:
+            remaining = None if count is None else start + count - offset
+            limit = IDE_READ_PAGE if remaining is None else min(IDE_READ_PAGE, remaining * 2 + 2)
+            args = ({"command": shlex.join(["read_file", "--file_path", path,
+                                              "--offset", str(offset), "--limit", str(limit)])}
+                    if dispatcher else {"file_path": path, "offset": offset, "limit": limit})
+            try:
+                raw = await backend(name, args)
+            except Exception as exc:
+                return f"READ FAILED\n{path}: IDE request at line {offset} failed: {exc}", "", 0
+            if tool_failed(raw) or re.search(
+                    r"\b(?:does not exist|doesn't exist|cannot be opened|can't be opened|not found)\b",
+                    _unwrap(raw), re.I):
+                return f"READ FAILED\n{path}: IDE request at line {offset} failed:\n{_unwrap(raw)}", "", 0
+            page, truncated = _numbered_lines(raw)
+            if not page:
+                if not _unwrap(raw).strip() and offset == 1:
+                    total = 0
+                    break
+                if not _unwrap(raw).strip() and offset > 1:
+                    total = offset - 1
+                    break
+                return (f"READ ERROR\n{path}: IDE returned no verifiable numbered lines "
+                        f"at line {offset}.", "", 0)
+            if offset not in page:
+                return f"READ ERROR\n{path}: IDE omitted requested line {offset}.", "", 0
+            lines.update(page)
+            if truncated:
+                total = max(page)
+            elif len(page) < limit:
+                total = max(page)
+            cursor = offset
+            while cursor in lines:
+                cursor += 1
+            requested_end = start + count - 1 if count is not None else total
+            if requested_end is not None and (cursor > requested_end or total is not None and cursor > total):
+                break
+            if cursor <= offset:
+                return f"READ ERROR\n{path}: IDE made no progress beyond line {offset}.", "", 0
+            offset = cursor
+        assembled = "\n".join(f"L{number}: {lines[number]}" for number in sorted(lines))
+        result, returned, _ = _read_result(assembled, path, start, count, total)
+        return result, assembled, returned
 
     async def _validate_mutation(self, paths: list[str],
                                  backend: Callable[[str, dict], Awaitable[str]]) -> str:
@@ -513,12 +541,17 @@ class AgentToolInterface:
                               {"search_text", "find_text", "exact_search", "search_in_files_by_text"}), None)
             if candidate is None:
                 return "SEARCH UNAVAILABLE\nThe IDE advertised no literal content search."
-            search_args = {"q": query, "limit": SEARCH_MATCHES + 1, "paths": [path]}
+            requested_limit = arguments.get("limit")
+            if requested_limit is not None and (type(requested_limit) is not int or requested_limit < 1):
+                return "SEARCH ERROR\nlimit must be a positive integer."
+            search_args = {"q": query, "paths": [path]}
             props = candidate.schema.get("properties", {})
             if props and "paths" not in props:
                 return "SEARCH UNAVAILABLE\nThe IDE search tool cannot restrict results to one file."
-            if props and "limit" not in props:
-                search_args.pop("limit")
+            if requested_limit is not None:
+                if props and "limit" not in props:
+                    return "SEARCH UNAVAILABLE\nThe IDE search tool does not accept a match limit."
+                search_args["limit"] = requested_limit
             raw = await backend(candidate.name, search_args)
             result, _ = _search_result(raw, query, tuple(self.run.metadata.get("excluded_files", ())))
             self.observed.append(f"search {path}: {query!r}")
@@ -603,81 +636,78 @@ class AgentToolInterface:
             try:
                 if bare == "codepartner_read_file":
                     path = arguments["path"]
-                    start = int(arguments.get("start_line", 1))
-                    end = int(arguments.get("end_line", start + WINDOW - 1))
+                    start = arguments.get("start_line", 1)
+                    end = arguments.get("end_line")
+                    refresh = arguments.get("refresh", False)
                 else:
                     path = inner.get("file_path") or inner.get("path")
-                    start = int(inner.get("offset", 1))
-                    end = start + min(int(inner.get("limit", WINDOW)), MAX_WINDOW) - 1
+                    start = inner.get("offset", 1)
+                    limit = inner.get("limit")
+                    if isinstance(start, str) and start.isdecimal():
+                        start = int(start)
+                    if isinstance(limit, str) and limit.isdecimal():
+                        limit = int(limit)
+                    end = start + limit - 1 if isinstance(start, int) and isinstance(limit, int) else None
+                    refresh = inner.get("refresh", False)
             except (KeyError, TypeError, ValueError):
                 return "READ ERROR\nInvalid file path or line range."
-            if not isinstance(path, str) or start < 1 or end < start or end - start + 1 > MAX_WINDOW:
-                return f"READ ERROR\nRequest a range of 1–{MAX_WINDOW} lines."
+            if (not isinstance(path, str) or type(start) is not int or start < 1
+                    or end is not None and (type(end) is not int or end < start)
+                    or type(refresh) is not bool
+                    or bare != "codepartner_read_file" and inner.get("limit") is not None
+                    and (type(limit) is not int or limit < 1)):
+                return "READ ERROR\nInvalid file path or line range."
             reason = _path_reason(path, exclusions=tuple(self.run.metadata.get("excluded_files", ())))
             if reason:
                 return f"ACCESS DENIED\n{path}: {reason}. Do not retry this path."
-            count = end - start + 1
+            count = end - start + 1 if end is not None else None
+            signature = ("read", path, start, end)
+            if refresh:
+                self.prior = {key: value for key, value in self.prior.items() if key[1] != path}
+                self.complete_reads.pop(path, None)
+            elif signature in self.prior:
+                self.metrics["duplicate_calls"] += 1
+                return self._remember(self.prior[signature][1], "", category="read")
+            elif path in self.complete_reads:
+                result, returned, body = _read_result(self.complete_reads[path], path, start, count)
+                if result.startswith("READ COMPLETE"):
+                    self.prior[signature] = (body, result)
+                    self.metrics["duplicate_calls"] += 1
+                    self.metrics["lines_returned"] += returned
+                return self._remember(result, "", category="read")
             if bare == "codepartner_read_file":
                 candidate = next((s for s in self.run.registry.tools() if _bare(s.name) == "read_file"), None)
                 if candidate is None:
-                    return "READ UNAVAILABLE\nThe IDE advertised no window-capable file reader."
+                    return "READ UNAVAILABLE\nThe IDE advertised no file reader."
                 name = candidate.name
             if effective == "get_file_text_by_path":
                 candidate = next((s for s in self.run.registry.tools() if _bare(s.name) == "read_file"), None)
                 if candidate is not None:
-                    raw = await backend(candidate.name, {"file_path": path, "offset": start,
-                                                         "limit": min(5000, count * 2 + 2)})
+                    name = candidate.name
                 else:
                     raw = await backend(name, inner)
-            elif bare == "execute_tool":
-                command = " ".join(("read_file", "--file_path", shlex.quote(path),
-                                    "--offset", str(start), "--limit", str(min(5000, count * 2 + 2))))
-                raw = await backend(name, {"command": command})
-            else:
-                raw = await backend(name, {"file_path": path, "offset": start,
-                                           "limit": min(5000, count * 2 + 2)})
-            result, returned, body = _read_result(raw, path, start, count)
+                    result, returned, body = _read_result(raw, path, start, count)
+                    if result.startswith("READ COMPLETE"):
+                        self.prior[signature] = (body, result)
+                        self.metrics["lines_returned"] += returned
+                    return self._remember(result, raw, category="read")
+            result, raw, returned = await self._fetch_read(
+                name, path, start, count, backend, dispatcher=bare == "execute_tool")
             self.files_read.add(path)
             if result.startswith("READ COMPLETE"):
                 self.observed.append(f"read {path} lines {start}–{start + returned - 1}")
-            signature = ("read", path, start, end)
-            if result.startswith("READ COMPLETE"):
-                previous = self.prior.get(signature)
-                if previous and previous[1] == result:
-                    self.metrics["duplicate_calls"] += 1
-                    return self._remember(
-                        f"DUPLICATE READ\n{path} lines {start}–{start + returned - 1} "
-                        "were already returned and the IDE returned the same content again. "
-                        "Use the previous observation or request a different range.\ntruncated=false",
-                        raw, category="read")
+                body = result.split("\n", 3)[-1]
                 self.prior[signature] = (body, result)
                 self.metrics["lines_returned"] += returned
+                numbered, _ = _numbered_lines(raw)
+                if (count is None and numbered and min(numbered) == 1
+                        and len(numbered) == max(numbered)):
+                    self.complete_reads[path] = raw
             return self._remember(result, raw, category="read")
-        dispatch_arguments = arguments
-        if effective in _SEARCH:
-            if bare == "execute_tool":
-                try:
-                    tokens = shlex.split(arguments["command"])
-                    bounded = []
-                    index = 0
-                    while index < len(tokens):
-                        if tokens[index] == "--limit" and index + 1 < len(tokens):
-                            index += 2
-                            continue
-                        bounded.append(tokens[index])
-                        index += 1
-                    bounded.extend(("--limit", str(SEARCH_MATCHES + 1)))
-                    dispatch_arguments = {**arguments, "command": shlex.join(bounded)}
-                except (KeyError, ValueError):
-                    return "SEARCH ERROR\nInvalid dispatcher arguments."
-            else:
-                spec = next((item for item in self.run.registry.tools() if item.name == name), None)
-                props = spec.schema.get("properties", {}) if spec and isinstance(spec.schema, dict) else {}
-                if not props or "limit" in props:
-                    dispatch_arguments = {**arguments, "limit": SEARCH_MATCHES + 1}
-        raw = await backend(name, dispatch_arguments)
+        raw = await backend(name, arguments)
         if mutating:
             self.prior.clear()
+            self.complete_reads.clear()
             self.prior_search.clear()
             status = ("EDIT FAILED OR UNCERTAIN" if tool_failed(raw)
                       else "EDIT OUTCOME UNCERTAIN" if not raw.strip() and not getattr(raw, "validation", None)

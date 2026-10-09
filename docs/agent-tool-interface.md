@@ -7,31 +7,28 @@ trusted paths; only model-facing coder calls are shaped.
 
 ## Observations
 
-`codepartner_read_file(path, start_line?, end_line?)` returns up to 100 lines by
-default, with a maximum request of 200. It reports the actual line range, total
-line count, and continuation. The IDE reader returns the first and last portions
-when its limit is exceeded, so the interface requests a bounded larger slice and
-checks every line number before showing a contiguous window. An unverifiable
-window produces an explicit error.
+`codepartner_read_file(path, start_line?, end_line?, refresh?)` returns the whole
+file by default, or only the requested inclusive line range. The IDE reader accepts
+at most 5,000 lines per request and may return head/tail portions for longer files;
+the interface assembles distinct requests and verifies contiguous line numbers.
+An incomplete or denied read produces an explicit error, not a false complete result.
 
-Repository searches return locations, at most 30 visible matches by default.
+Repository searches return all IDE-provided locations unless the caller supplies a limit.
 `codepartner_search_in_file(path, query)` restricts discovery to one file when
-the IDE supports path filters. Raw authorized results can be paged through
+the IDE supports path filters. Raw authorized results can be retrieved through
 `codepartner_get_observation(observation_id, offset?)`. The special observation
-ID `index` lists recent observed ranges and edits. Observations are retained in
-one run's memory, up to 128 entries and 2 MB; an expired entry is reported as
-unavailable.
+ID `index` lists observed ranges and edits. Observations are retained for the run
+without a count or byte cap; an ID from another run is unavailable.
 
 Tool responses state completion, failure, truncation, and available expansion.
 Commands expose an exit code when the IDE reports one. Unknown exit codes remain
 unknown. Test output is reduced to totals and a small number of failure lines;
-the authorized original output can be paged if more detail is needed.
+the authorized original output can be retrieved if more detail is needed.
 
-Identical reads and searches are compared after the IDE responds again. The
-agent receives a short duplicate notice only when the current result matches
-the earlier one. The IDE currently exposes no reliable file revision token, so
-the interface does not skip a backend read based on an unverified cache claim.
-Mutations clear the previous read and search results.
+Repeated reads reuse the run-local result without another IDE request. Pass
+`refresh=true` to force a new read; mutations clear cached reads. The IDE does
+not expose a reliable file revision token, so external edits require refresh.
+Searches are compared after the IDE responds again.
 
 ## Mutations and boundaries
 

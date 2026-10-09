@@ -20,7 +20,9 @@ CODER_SYSTEM = (
     "You are a coding agent working inside the user's IDE project. You receive an "
     "objective. Treat mentioned files as hints, and inspect other ordinary project "
     "files when needed. Use codepartner_search_in_file and codepartner_read_file for "
-    "targeted discovery; read only the windows needed to act. Then ACTUALLY APPLY "
+    "targeted discovery; a path-only read returns the full file, and explicit line "
+    "ranges return only those lines. Reuse prior reads unless the file changed or "
+    "you need refresh=true. Then ACTUALLY APPLY "
     "the change by calling the "
     "available write tools — create files with the create-file tool and edit existing "
     "files with the replace/edit-file tool (or the rename-refactoring tool for symbol "
@@ -48,7 +50,9 @@ class Coder:
         if os.getenv("CODEPARTNER_ACI_ENABLED", "true").lower() == "false":
             system = system.replace(
                 "Use codepartner_search_in_file and codepartner_read_file for targeted discovery; "
-                "read only the windows needed to act.",
+                "a path-only read returns the full file, and explicit line "
+                "ranges return only those lines. Reuse prior reads unless the file changed or "
+                "you need refresh=true.",
                 "Use the advertised IDE tools to inspect relevant source.")
         augmented = [{"role": "system", "content": system}, *self._messages]
         # Read at call time (not import), like `pipeline.is_enabled` — `.env` may load

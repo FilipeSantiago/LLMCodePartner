@@ -108,12 +108,13 @@ into the image. `.dockerignore` excludes the local `.env` file.
 - Tool-call timeout: `.env` `MCP_TOOL_TIMEOUT=120` (seconds).
 - Coder tool observations: `CODEPARTNER_ACI_ENABLED=true` (default). Set it to
   `false` for a measured baseline of the legacy file reader; security checks
-  remain active. The shared bridge presents 100-line file
-  windows, concise search results, explicit command/edit outcomes, and bounded
-  observation reloads to Claude and Codex. `codepartner_read_file` accepts
-  `path`, `start_line`, and `end_line`; `codepartner_search_in_file` accepts a
-  project-relative `path` and `query`. `codepartner_get_observation` retrieves
-  a paginated earlier result, or an index with `observation_id="index"`.
+  remain active. The shared bridge presents full files by default (or explicit
+  line ranges), IDE-provided search matches, explicit command/edit outcomes, and
+  complete observation reloads to Claude and Codex. `codepartner_read_file`
+  accepts `path`, `start_line`, `end_line`, and `refresh`; `codepartner_search_in_file`
+  accepts a project-relative `path`, `query`, and optional `limit`.
+  `codepartner_get_observation` retrieves an earlier result, or an index with
+  `observation_id="index"`.
   Coding-run measurements are recorded in `telemetry_aci_attempts` in the
   routing database, including agent and backend calls, returned lines, output
   bytes, duplicates, edits, and provider-reported usage.

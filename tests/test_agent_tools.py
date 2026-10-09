@@ -32,11 +32,13 @@ class AgentToolInterfaceTests(unittest.IsolatedAsyncioTestCase):
         if name == "read_file":
             offset = arguments["offset"]
             limit = arguments["limit"]
-            # PyCharm returns the first and last half of an overlarge file.
-            first = range(offset, offset + limit // 2)
-            tail = range(337, 438)
+            remaining = list(range(offset, 438))
+            if len(remaining) <= limit:
+                return "\n".join(f"L{i}: line {i}" for i in remaining)
+            half = limit // 2
+            first, tail = remaining[:half], remaining[-half:]
             return ("\n".join(f"L{i}: line {i}" for i in first)
-                    + "\n…280 lines truncated…\n"
+                    + f"\n…{len(remaining) - 2 * half} lines truncated…\n"
                     + "\n".join(f"L{i}: line {i}" for i in tail))
         if name == "search_text":
             return json.dumps({"items": [
@@ -67,22 +69,69 @@ class AgentToolInterfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(_check_command("pytest | tee results.txt"))
         self.assertIsNotNone(_check_command("pytest\nenv"))
 
-    async def test_duplicate_read_is_verified_again_before_short_reply(self):
+    async def test_duplicate_read_uses_cache_without_backend_request(self):
         arguments = {"path": "src/app.py", "start_line": 1, "end_line": 10}
         await self.interface.execute("codepartner_read_file", arguments, self.backend)
         result = await self.interface.execute("codepartner_read_file", arguments, self.backend)
-        self.assertIn("DUPLICATE READ", result)
-        self.assertEqual(len(self.calls), 2)
+        self.assertIn("READ COMPLETE", result)
+        self.assertEqual(len(self.calls), 1)
 
-    async def test_large_ide_read_reaches_model_as_small_window(self):
+    async def test_path_only_read_returns_full_file(self):
         self.run.tool_interface = self.interface
         self.run.direct_tool_handlers = {"read_file": lambda arguments: self.backend("read_file", arguments)}
         result = await bridge.call_tool(
             self.run, "codepartner_read_file", {"path": "src/app.py"})
-        self.assertIn("lines 1–100 of 437", result)
-        self.assertGreater(self.interface.metrics["backend_output_bytes"],
-                           self.interface.metrics["model_output_bytes"])
-        self.assertEqual(self.interface.metrics["lines_returned"], 100)
+        self.assertIn("lines 1–437 of 437", result)
+        self.assertIn("  437 | line 437", result)
+        self.assertEqual(self.interface.metrics["lines_returned"], 437)
+
+    async def test_refresh_forces_new_read(self):
+        args = {"path": "src/app.py"}
+        await self.interface.execute("codepartner_read_file", args, self.backend)
+        await self.interface.execute("codepartner_read_file", {**args, "refresh": True}, self.backend)
+        self.assertEqual(len(self.calls), 2)
+
+    async def test_full_read_cache_serves_range(self):
+        await self.interface.execute("codepartner_read_file", {"path": "src/app.py"}, self.backend)
+        result = await self.interface.execute("codepartner_read_file", {
+            "path": "src/app.py", "start_line": 200, "end_line": 201}, self.backend)
+        self.assertIn("lines 200–201 of 437", result)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_large_file_is_assembled_without_repeating_ide_request(self):
+        async def backend(name, arguments):
+            self.calls.append((name, arguments))
+            offset, limit = arguments["offset"], arguments["limit"]
+            return "\n".join(f"L{i}: line {i}" for i in range(offset, min(offset + limit, 6201)))
+        result = await self.interface.execute("codepartner_read_file", {"path": "big.txt"}, backend)
+        self.assertIn("lines 1–6200 of 6200", result)
+        self.assertIn(" 6200 | line 6200", result)
+        self.assertEqual([call[1]["offset"] for call in self.calls], [1, 5001])
+
+    async def test_head_tail_ide_pages_are_filled_without_repeating_requests(self):
+        async def backend(name, arguments):
+            self.calls.append((name, arguments))
+            offset, limit = arguments["offset"], arguments["limit"]
+            remaining = list(range(offset, 8001))
+            if len(remaining) <= limit:
+                return "\n".join(f"L{i}: line {i}" for i in remaining)
+            half = limit // 2
+            return ("\n".join(f"L{i}: line {i}" for i in remaining[:half])
+                    + f"\n…{len(remaining) - 2 * half} lines truncated…\n"
+                    + "\n".join(f"L{i}: line {i}" for i in remaining[-half:]))
+        result = await self.interface.execute("codepartner_read_file", {"path": "big.txt"}, backend)
+        self.assertIn("lines 1–8000 of 8000", result)
+        self.assertIn(" 8000 | line 8000", result)
+        self.assertEqual([call[1]["offset"] for call in self.calls], [1, 2501, 5001])
+
+    async def test_denied_second_page_is_not_reported_complete(self):
+        async def backend(name, arguments):
+            if arguments["offset"] > 1:
+                return "Error: request denied"
+            return "\n".join(f"L{i}: line {i}" for i in range(1, 5001))
+        result = await self.interface.execute("codepartner_read_file", {"path": "big.txt"}, backend)
+        self.assertIn("READ FAILED", result)
+        self.assertNotIn("READ COMPLETE", result)
 
     async def test_protected_paths_never_reach_backend(self):
         for path in (".env", "config/.env.local", ".git/config", "../outside.py",
@@ -112,6 +161,28 @@ class AgentToolInterfaceTests(unittest.IsolatedAsyncioTestCase):
             self.backend)
         self.assertIn("src/app.py:12", result)
         self.assertEqual(self.calls[0][1]["paths"], ["src/app.py"])
+
+    async def test_search_has_no_implicit_match_limit(self):
+        async def backend(name, arguments):
+            self.calls.append((name, arguments))
+            return json.dumps({"items": [
+                {"filePath": "src/app.py", "startLine": line} for line in range(1, 41)
+            ], "more": False})
+        result = await self.interface.execute(
+            "codepartner_search_in_file", {"path": "src/app.py", "query": "item"}, backend)
+        self.assertIn("40 matches returned", result)
+        self.assertIn("src/app.py:40", result)
+        self.assertNotIn("limit", self.calls[0][1])
+
+    def test_observations_have_no_count_or_byte_retention_limit(self):
+        payload = "x" * 2_100_000
+        first = self.interface._remember("summary", payload, category="other")
+        for number in range(129):
+            self.interface._remember("summary", f"raw-{number}", category="other")
+        self.assertIn("obs-1", first)
+        expanded = self.interface._reload({"observation_id": "obs-1"})
+        self.assertIn(payload, expanded)
+        self.assertEqual(len(self.interface.observations), 130)
 
     async def test_patch_header_for_secret_is_blocked(self):
         result = await self.interface.execute(
