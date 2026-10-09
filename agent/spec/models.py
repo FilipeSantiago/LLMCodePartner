@@ -3,6 +3,10 @@
 from dataclasses import asdict, dataclass, field
 from datetime import date
 
+# Whole-package planning difficulty. Independent of task complexity
+# (simple/medium/complex), which routes coders; this one routes planners.
+WP_COMPLEXITIES = ("low", "medium", "high", "complex")
+
 
 @dataclass(frozen=True)
 class ModelIdentity:
@@ -106,6 +110,7 @@ class WorkPackage:
     status: str = "planned"
     planning_revision: int = 1
     review: WorkPackageReview | None = None
+    complexity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -364,6 +369,8 @@ def render_tasks(change: OpenSpecChange) -> str:
             f"**Objective:** {package.objective}",
             "",
         ])
+        if package.complexity:
+            lines.extend([f"**Complexity:** {package.complexity}", ""])
         for task in package.tasks:
             marker = "x" if task.completed or task.status == "completed" else " "
             lines.extend([

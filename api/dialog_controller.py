@@ -30,6 +30,7 @@ from agent.spec import (
     extract_object_id,
     extract_implementation_request,
     extract_run_task_id,
+    extract_reset_wp_id,
     extract_scoped_request,
     is_help_command,
     is_apply_command,
@@ -39,6 +40,7 @@ from agent.spec import (
     is_review_command,
     is_run_command,
     is_rework_command,
+    is_reset_command,
     is_refine_command,
     is_spec_command,
     is_update_command,
@@ -55,9 +57,14 @@ from agent.routing import ImplementationService, TaskExecutionService
 from agent.spec.implementation_intent import ImplementationIntent, selectors_in_text
 from agent.workflow.controller import (WorkflowController, parse_decision,
                                        BARE_CONFIRM, BARE_REJECT, PASSTHROUGH_ACTIONS,
-                                       COMMAND_SOURCE, fingerprint as workflow_fingerprint)
+                                       COMMAND_SOURCE, PLAN_APPROVAL, PLAN_DISCUSS,
+                                       fingerprint as workflow_fingerprint)
+from agent.planning.render import render_plan
+from agent.planning.service import PlanningError, WPPlannerService, with_progress
+from conversation.presentation import progress_line
+from agent.routing.config import RoutingConfigError
 from agent.workflow.states import WorkflowAction as WorkflowAction
-from agent.workflow.review_retry import offered_choice
+from agent.workflow.review_retry import menu_choices, offered_choice
 from agent.workflow.switching import mark_switch_started
 from conversation import openai_request as oreq
 from conversation.non_streaming_responder import NonStreamingResponder
@@ -68,7 +75,7 @@ from mcp_bridge.registry import (
 )
 from mcp_bridge import bridge
 from mcp_bridge import server as bridge_server
-from mcp_bridge.models import DoneEvent, Event, TextEvent, ToolCallEvent
+from mcp_bridge.models import DoneEvent, ErrorEvent, Event, TextEvent, ToolCallEvent
 from mcp_bridge.registry import ToolSpec
 from model.chat import ChatCompletionRequest, ChatCompletionResponse
 from logger.diagnostic import debug, new_trace_id
@@ -154,8 +161,41 @@ async def _conversation_workflow_turn(request, messages, conversation_id, sessio
         text = choice
     decision = parse_decision(text)
     snapshot = await workflow.snapshot(conversation_id)
-    bare = decision is None and text.lower() in BARE_CONFIRM | BARE_REJECT
     proposal = None
+    forced_verb = None
+    planning = (workflow.planning_route(text, snapshot)
+                if decision is None and request.model != "codepartner-review"
+                and not is_reset_command(text) else None)
+    if planning == "abandon":
+        closed = await WPPlannerService(
+            None, workflow.persistence,
+            config=getattr(task_execution, "config", None)).abandon(conversation_id)
+        workflow.record_turn(conversation_id, "user", "planning", text, outcome="abandoned")
+        return responder.reply(
+            f"Planning for {closed['wp_id'] if closed else 'the work package'} closed. "
+            "Nothing was implemented.", request.model, created)
+    if planning == "discuss":
+        if PLAN_DISCUSS.fullmatch(text):
+            return responder.reply(
+                f"What would you like to change in the {snapshot.context.planning_wp_id} plan? "
+                "You can adjust scope, assumptions, the implementation strategy, or task "
+                "boundaries, or ask me to investigate something further.",
+                request.model, created)
+        workflow.record_turn(conversation_id, "user", "planning", text, outcome="discuss")
+        return _plan_turn(request, workflow, session, active_specs, direct_handlers,
+                          conversation_id, created, text, snapshot.context.planning_wp_id,
+                          discuss=True)
+    if planning == "approve" or (snapshot.context.planning_session_id
+                                 and PLAN_APPROVAL.fullmatch(text) and decision is None):
+        proposal = _plan_approval(snapshot)
+        if proposal is None:
+            return responder.reply(
+                "This plan revision cannot be approved yet; it is incomplete or still being "
+                "revised. Tell me what to change, or ask me to investigate further. "
+                "Nothing was executed.", request.model, created)
+        forced_verb = "confirm"
+    bare = (forced_verb is None and decision is None
+            and text.lower() in BARE_CONFIRM | BARE_REJECT)
     if bare:
         # Protocol, not interpretation: a bare yes/no binds to exactly one waiting item.
         proposal, problem = workflow.resolve_bare_reply(text, snapshot)
@@ -167,7 +207,7 @@ async def _conversation_workflow_turn(request, messages, conversation_id, sessio
             proposal = await workflow.find(conversation_id, decision.token)
             verb = decision.verb
         else:
-            verb = "confirm" if text.lower() in BARE_CONFIRM else "reject"
+            verb = forced_verb or ("confirm" if text.lower() in BARE_CONFIRM else "reject")
         workflow.record_turn(conversation_id, "user", "protocol", text,
                              proposal_id=proposal["proposal_id"] if proposal else None,
                              outcome=verb if proposal else "unmatched")
@@ -259,7 +299,7 @@ async def _conversation_workflow_turn(request, messages, conversation_id, sessio
             is_implementation_command, is_run_command, is_review_command,
             is_rework_command, is_refine_command, is_apply_command,
             is_discard_command, is_spec_command, is_explain_command,
-            is_update_command))
+            is_update_command, is_reset_command))
         if not known_command:
             return responder.reply(
                 "That is not a registered CodePartner command. Nothing was executed.",
@@ -306,12 +346,17 @@ async def _conversation_workflow_turn(request, messages, conversation_id, sessio
         return responder.reply(proposal.render(), request.model, created)
 
     mode_hint = ("implement" if request.model == "codepartner-implement" else
+                 "plan" if request.model == PLAN_MODEL else
                  "review" if request.model == "codepartner-review" else
                  "spec" if request.model == "codepartner-spec" else "")
     artifacts = (_artifact_store(session.client, active_specs)
                  if session is not None else None)
     result = await workflow.route_turn(conversation_id, text, mode_hint, artifacts,
                                        snapshot, messages[:-1])
+    if result.kind == "plan_start":
+        return _plan_turn(request, workflow, session, active_specs, direct_handlers,
+                          conversation_id, created, text, result.wp_id,
+                          queued_wp_ids=result.queued_wp_ids)
     if result.kind == "answer":
         if request.stream and active_specs:
             return StreamingResponder().drain_events(
@@ -321,6 +366,68 @@ async def _conversation_workflow_turn(request, messages, conversation_id, sessio
         prompt, system = oreq.build_prompt(request)
         return await responder.build_completion(prompt, system, request.model, created)
     return responder.reply(result.render(), request.model, created)
+
+
+PLAN_MODEL = "codepartner-plan"
+
+
+def _plan_approval(snapshot) -> dict | None:
+    """The pending approval bound to the active planning session, if it is approvable."""
+    session_id = snapshot.context.planning_session_id
+    return next((row for row in snapshot.pending
+                 if row["action"] == WorkflowAction.APPROVE_WP_PLAN.value
+                 and (row["payload"].get("parameters") or {}).get("planning_session_id")
+                 == session_id), None)
+
+
+def _plan_turn(request, workflow, session, active_specs, direct_handlers,
+               conversation_id: str, created: int, text: str, wp_id: str,
+               discuss: bool = False, queued_wp_ids: tuple[str, ...] = ()):
+    """Run one planner turn (start or discuss) and offer Approve / Discuss more."""
+    responder = StreamingResponder() if request.stream else NonStreamingResponder()
+    if not request.stream or session is None:
+        return responder.reply(
+            "Work Package planning needs a streaming IDE MCP session. Nothing was executed.",
+            request.model, created)
+    artifacts = _artifact_store(session.client, active_specs)
+    planner = WPPlannerService(artifacts, workflow.persistence,
+                               config=getattr(task_execution, "config", None))
+
+    async def events():
+        def call(progress):
+            if discuss:
+                return planner.discuss(conversation_id, text, active_specs, direct_handlers,
+                                       progress=progress)
+            return planner.start(conversation_id, wp_id, text, active_specs, direct_handlers,
+                                 project_id=session.project_id, queued_wp_ids=queued_wp_ids,
+                                 progress=progress)
+
+        turn = None
+        try:
+            async for kind, value in with_progress(call):
+                if kind == "progress":
+                    yield TextEvent(value)
+                else:
+                    turn = value
+            proposal = (None if turn.gaps else
+                        await workflow.propose_plan_approval(conversation_id, turn, artifacts))
+        except (PlanningError, ArtifactSelectionError, ArtifactStoreError,
+                RoutingConfigError) as exc:
+            yield ErrorEvent(f"Nothing was executed. {exc}")
+            yield DoneEvent("endTurn")
+            return
+        reply = render_plan(turn.draft, wp_complexity=turn.wp_complexity,
+                            planner_label=turn.planner_label, gaps=turn.gaps,
+                            token=proposal.confirmation_token if proposal else None,
+                            queued_wp_ids=turn.queued_wp_ids)
+        if proposal is not None and proposal.intent.parameters.get("displace"):
+            reply += "\n\n" + proposal.render()
+        await workflow.persistence.record_offered_choices(conversation_id, menu_choices(reply))
+        yield TextEvent(progress_line("separator"))
+        yield TextEvent(reply + "\n")
+        yield DoneEvent("endTurn")
+
+    return StreamingResponder().drain_events(events(), request.model, created)
 
 
 async def _prefixed(text: str, events):
@@ -495,10 +602,20 @@ async def _resume_child_to_parent(child, parent, messages: list[dict], specs: li
 
 
 def _start_artifact_command(messages: list[dict], specs: list[ToolSpec], trace_id: str,
-                            client):
+                            client, project_id: str | None = None,
+                            conversation_id: str | None = None):
     """Run OpenSpec persistence through the conversation's configured MCP server."""
     async def strategy(run, _prompt, _system, _specs):
         store = _artifact_store(client, specs)
+        content = messages[-1].get("content") or ""
+        if is_reset_command(content):
+            wp_id = extract_reset_wp_id(content)
+            blocking_job = await task_execution.persistence.unfinished_job_for_wp(
+                project_id, conversation_id, wp_id)
+            if blocking_job:
+                raise ArtifactSelectionError(
+                    f"{wp_id} has unfinished implementation job {blocking_job}; "
+                    "finish or stop that job before resetting it")
         handler = SpecCommandHandler(CliOpenSpecAdapter(), store)
         result = await handler.handle(messages)
         await run.put(TextEvent(result.content))
@@ -766,7 +883,7 @@ async def chat_completions(request: ChatCompletionRequest):
     # Modes are interpretation hints. They no longer rewrite user messages.
     requires_mcp = (_requires_mcp(request, last)
                     or (request.model in {"codepartner-implement", "codepartner-review",
-                                          "codepartner-spec"}
+                                          "codepartner-spec", PLAN_MODEL}
                         and last.get("role") == "user" and bool(last.get("content"))))
     is_help = last.get("role") == "user" and is_help_command(last.get("content"))
     needs_mcp = session is None and not is_help and requires_mcp
@@ -924,6 +1041,7 @@ async def chat_completions(request: ChatCompletionRequest):
             is_spec_command(last.get("content"))
             or is_explain_command(last.get("content"))
             or is_update_command(last.get("content"))
+            or is_reset_command(last.get("content"))
     )
     if is_planning:
         if not request.stream:
@@ -932,7 +1050,8 @@ async def chat_completions(request: ChatCompletionRequest):
             log.info("spec_command_request %s", request_shape(last.get("content") or ""))
         return StreamingResponder().drain_events(
             _drain_run(_start_artifact_command(
-                messages, active_specs, trace_id, session.client)),
+                messages, active_specs, trace_id, session.client,
+                session.project_id, conversation_id)),
             request.model, created,
         )
 

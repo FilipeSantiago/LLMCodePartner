@@ -21,6 +21,9 @@ MODES = (
          "Read-only review conversation; name a task when several could match."),
     Mode("codepartner-implement", "implement",
          "Implementation-focused conversation; free-form requests are interpreted and confirmed."),
+    Mode("codepartner-plan", "plan",
+         "Plan, then implement: name a work package (\"Let's do WP4\") and a strong planner "
+         "investigates it and proposes a plan to approve or refine before any coding."),
 )
 
 _TOKEN = r"(?:EPIC|WP|US)\d+(?:-T(?:ASK)?\d+)?"

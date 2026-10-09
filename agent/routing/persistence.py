@@ -10,7 +10,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from agent.routing.models import (
-    ACTIVE_JOB_STATUSES, HALTED_JOB_STATUSES, ExecutionDecision, ImplementationJob,
+    ACTIVE_JOB_STATUSES, HALTED_JOB_STATUSES, TERMINAL_JOB_STATUSES,
+    ExecutionDecision, ImplementationJob,
     ImplementationJobTask,
 )
 
@@ -194,6 +195,37 @@ class RoutingPersistence:
                   reported INTEGER NOT NULL DEFAULT 0,
                   created_at REAL NOT NULL, updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS wp_planning_sessions (
+                  session_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL,
+                  project_id TEXT, change_id TEXT NOT NULL, wp_id TEXT NOT NULL,
+                  wp_fingerprint TEXT NOT NULL, wp_complexity TEXT NOT NULL,
+                  complexity_source TEXT NOT NULL, planner_model TEXT NOT NULL,
+                  planner_effort TEXT, status TEXT NOT NULL, revision INTEGER NOT NULL,
+                  draft_json TEXT, discussion_json TEXT NOT NULL DEFAULT '[]',
+                  gaps_json TEXT NOT NULL DEFAULT '[]',
+                  queued_wp_ids_json TEXT NOT NULL DEFAULT '[]', request TEXT,
+                  created_at REAL NOT NULL, updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS wp_planning_conversation_status
+                  ON wp_planning_sessions(conversation_id, status, updated_at);
+                CREATE TABLE IF NOT EXISTS wp_planning_turns (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                  revision INTEGER NOT NULL, kind TEXT NOT NULL, user_message TEXT,
+                  output_json TEXT, model TEXT NOT NULL, usage_json TEXT, cost_usd REAL,
+                  tool_metrics_json TEXT, latency_ms INTEGER, error TEXT,
+                  created_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS wp_approved_plans (
+                  plan_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                  change_id TEXT NOT NULL, wp_id TEXT NOT NULL, plan_json TEXT NOT NULL,
+                  fingerprint TEXT NOT NULL, approved_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS wp_reviewer_context_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id TEXT NOT NULL,
+                  job_id TEXT NOT NULL, position INTEGER NOT NULL, task_id TEXT NOT NULL,
+                  kind TEXT NOT NULL, summary TEXT NOT NULL, payload_json TEXT,
+                  created_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS conversation_offered_choices (
                   conversation_id TEXT NOT NULL, option_number INTEGER NOT NULL,
                   choice_text TEXT NOT NULL, status TEXT NOT NULL,
@@ -208,6 +240,15 @@ class RoutingPersistence:
                 db.execute("ALTER TABLE implementation_jobs ADD COLUMN conversation_id TEXT")
             if "project_id" not in columns:
                 db.execute("ALTER TABLE implementation_jobs ADD COLUMN project_id TEXT")
+            if "plan_id" not in columns:
+                db.execute("ALTER TABLE implementation_jobs ADD COLUMN plan_id TEXT")
+            planning_columns = {row[1] for row in db.execute(
+                "PRAGMA table_info(wp_planning_sessions)")}
+            if "queued_wp_ids_json" not in planning_columns:
+                db.execute("""ALTER TABLE wp_planning_sessions ADD COLUMN
+                  queued_wp_ids_json TEXT NOT NULL DEFAULT '[]'""")
+            if "request" not in planning_columns:
+                db.execute("ALTER TABLE wp_planning_sessions ADD COLUMN request TEXT")
             task_columns = {row[1] for row in db.execute("PRAGMA table_info(implementation_job_tasks)")}
             if "coder_report" not in task_columns:
                 db.execute("ALTER TABLE implementation_job_tasks ADD COLUMN coder_report TEXT")
@@ -349,10 +390,10 @@ class RoutingPersistence:
         with self._database() as db:
             db.execute("""INSERT INTO implementation_jobs
               (job_id, selectors_json, instruction, conversation_id, project_id, status,
-               created_at, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (
+               created_at, updated_at, plan_id)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
                 job.job_id, json.dumps(job.selectors), job.instruction, conversation_id,
-                project_id, job.status, now, now,
+                project_id, job.status, now, now, getattr(job, "plan_id", None),
             ))
             db.executemany("""INSERT INTO implementation_job_tasks
               (job_id, position, change_id, task_id, status, decision_id, error,
@@ -1045,6 +1086,202 @@ class RoutingPersistence:
             db.execute("UPDATE refinement_sessions SET status=?, updated_at=? WHERE session_id=?",
                        (status, time.time(), session_id))
 
+    # --- WP planning ---------------------------------------------------------
+
+    _PLANNING_COLUMNS = (
+        "session_id", "conversation_id", "project_id", "change_id", "wp_id",
+        "wp_fingerprint", "wp_complexity", "complexity_source", "planner_model",
+        "planner_effort", "status", "revision", "draft_json", "discussion_json",
+        "gaps_json", "queued_wp_ids_json", "request", "created_at", "updated_at",
+    )
+
+    async def create_planning(self, session: dict) -> None:
+        """Start a planning session; any other active one in the conversation is superseded."""
+        await asyncio.to_thread(self._create_planning, session)
+
+    def _create_planning(self, session):
+        now = time.time()
+        with self._database() as db:
+            db.execute("UPDATE wp_planning_sessions SET status='superseded', updated_at=? "
+                       "WHERE conversation_id=? AND status='active'",
+                       (now, session["conversation_id"]))
+            db.execute("""INSERT INTO wp_planning_sessions
+              (session_id, conversation_id, project_id, change_id, wp_id, wp_fingerprint,
+               wp_complexity, complexity_source, planner_model, planner_effort, status,
+               revision, draft_json, discussion_json, gaps_json, queued_wp_ids_json, request,
+               created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, NULL, '[]', '[]', ?, ?, ?, ?)""", (
+                session["session_id"], session["conversation_id"], session.get("project_id"),
+                session["change_id"], session["wp_id"], session["wp_fingerprint"],
+                session["wp_complexity"], session["complexity_source"],
+                session["planner_model"], session.get("planner_effort"),
+                json.dumps(list(session.get("queued_wp_ids") or ())), session.get("request"),
+                now, now,
+            ))
+
+    def _planning_row(self, row) -> dict | None:
+        if row is None:
+            return None
+        value = dict(zip(self._PLANNING_COLUMNS, row))
+        value["draft"] = json.loads(value.pop("draft_json")) if value["draft_json"] else None
+        value["discussion"] = json.loads(value.pop("discussion_json") or "[]")
+        value["gaps"] = json.loads(value.pop("gaps_json") or "[]")
+        value["queued_wp_ids"] = json.loads(value.pop("queued_wp_ids_json") or "[]")
+        return value
+
+    async def active_planning(self, conversation_id: str | None) -> dict | None:
+        if not conversation_id:
+            return None
+        return await asyncio.to_thread(self._active_planning, conversation_id)
+
+    def _active_planning(self, conversation_id):
+        with self._database() as db:
+            row = db.execute(
+                f"SELECT {', '.join(self._PLANNING_COLUMNS)} FROM wp_planning_sessions "
+                "WHERE conversation_id=? AND status='active' "
+                "ORDER BY updated_at DESC LIMIT 1", (conversation_id,)).fetchone()
+        return self._planning_row(row)
+
+    async def planning_session(self, session_id: str) -> dict | None:
+        return await asyncio.to_thread(self._planning_session, session_id)
+
+    def _planning_session(self, session_id):
+        with self._database() as db:
+            row = db.execute(
+                f"SELECT {', '.join(self._PLANNING_COLUMNS)} FROM wp_planning_sessions "
+                "WHERE session_id=?", (session_id,)).fetchone()
+        return self._planning_row(row)
+
+    async def update_planning(self, session_id: str, revision: int, draft: dict,
+                              discussion: list[dict], gaps: list[str]) -> None:
+        await asyncio.to_thread(self._update_planning, session_id, revision, draft,
+                                discussion, gaps)
+
+    def _update_planning(self, session_id, revision, draft, discussion, gaps):
+        with self._database() as db:
+            db.execute("""UPDATE wp_planning_sessions SET revision=?, draft_json=?,
+              discussion_json=?, gaps_json=?, updated_at=?
+              WHERE session_id=? AND status='active'""", (
+                revision, json.dumps(draft, ensure_ascii=False),
+                json.dumps(discussion, ensure_ascii=False), json.dumps(gaps),
+                time.time(), session_id,
+            ))
+
+    async def update_planning_model(self, session_id: str, previous: str,
+                                    model: str, effort: str | None) -> None:
+        """Save the provider that actually produced the plan before a repair turn."""
+        changed = await asyncio.to_thread(self._update_planning_model, session_id,
+                                          previous, model, effort)
+        if not changed:
+            raise RuntimeError("planning session changed while switching planner models")
+
+    def _update_planning_model(self, session_id, previous, model, effort):
+        with self._database() as db:
+            result = db.execute("""UPDATE wp_planning_sessions
+              SET planner_model=?, planner_effort=?, updated_at=?
+              WHERE session_id=? AND status='active' AND planner_model=?""",
+                                (model, effort, time.time(), session_id, previous))
+            return result.rowcount == 1
+
+    async def finish_planning(self, session_id: str, status: str) -> None:
+        await asyncio.to_thread(self._finish_planning, session_id, status)
+
+    def _finish_planning(self, session_id, status):
+        with self._database() as db:
+            db.execute("UPDATE wp_planning_sessions SET status=?, updated_at=? "
+                       "WHERE session_id=?", (status, time.time(), session_id))
+
+    async def record_planning_turn(self, turn: dict) -> None:
+        await asyncio.to_thread(self._record_planning_turn, turn)
+
+    def _record_planning_turn(self, turn):
+        with self._database() as db:
+            db.execute("""INSERT INTO wp_planning_turns
+              (session_id, revision, kind, user_message, output_json, model, usage_json,
+               cost_usd, tool_metrics_json, latency_ms, error, created_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+                turn["session_id"], turn["revision"], turn["kind"], turn.get("user_message"),
+                turn.get("output"), turn["model"],
+                json.dumps(turn["usage"]) if turn.get("usage") is not None else None,
+                turn.get("cost_usd"), json.dumps(turn.get("tool_metrics") or {}),
+                turn.get("latency_ms"), turn.get("error"), time.time(),
+            ))
+
+    async def planning_turns(self, session_id: str) -> list[dict]:
+        return await asyncio.to_thread(self._planning_turns, session_id)
+
+    def _planning_turns(self, session_id):
+        with self._database() as db:
+            rows = db.execute("""SELECT revision, kind, model, usage_json, cost_usd,
+              tool_metrics_json, latency_ms, error FROM wp_planning_turns
+              WHERE session_id=? ORDER BY id""", (session_id,)).fetchall()
+        return [{"revision": row[0], "kind": row[1], "model": row[2],
+                 "usage": json.loads(row[3]) if row[3] else None, "cost_usd": row[4],
+                 "tool_metrics": json.loads(row[5] or "{}"), "latency_ms": row[6],
+                 "error": row[7]} for row in rows]
+
+    async def save_approved_plan(self, plan: dict) -> None:
+        await asyncio.to_thread(self._save_approved_plan, plan)
+
+    def _save_approved_plan(self, plan):
+        with self._database() as db:
+            db.execute("""INSERT OR REPLACE INTO wp_approved_plans
+              (plan_id, session_id, change_id, wp_id, plan_json, fingerprint, approved_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?)""", (
+                plan["plan_id"], plan["session_id"], plan["change_id"], plan["wp_id"],
+                json.dumps(plan, ensure_ascii=False), plan["fingerprint"], plan["approved_at"],
+            ))
+
+    async def approved_plan(self, plan_id: str | None) -> dict | None:
+        if not plan_id:
+            return None
+        return await asyncio.to_thread(self._approved_plan, plan_id)
+
+    def _approved_plan(self, plan_id):
+        with self._database() as db:
+            row = db.execute("SELECT plan_json FROM wp_approved_plans WHERE plan_id=?",
+                             (plan_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    async def job_plan_id(self, job_id: str | None) -> str | None:
+        if not job_id:
+            return None
+        return await asyncio.to_thread(self._job_plan_id, job_id)
+
+    def _job_plan_id(self, job_id):
+        with self._database() as db:
+            row = db.execute("SELECT plan_id FROM implementation_jobs WHERE job_id=?",
+                             (job_id,)).fetchone()
+        return row[0] if row else None
+
+    async def record_reviewer_context_event(self, plan_id: str, job_id: str, position: int,
+                                            task_id: str, kind: str, summary: str,
+                                            payload=None) -> None:
+        await asyncio.to_thread(self._record_reviewer_context_event, plan_id, job_id,
+                                position, task_id, kind, summary, payload)
+
+    def _record_reviewer_context_event(self, plan_id, job_id, position, task_id, kind,
+                                       summary, payload):
+        with self._database() as db:
+            db.execute("""INSERT INTO wp_reviewer_context_events
+              (plan_id, job_id, position, task_id, kind, summary, payload_json, created_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (
+                plan_id, job_id, position, task_id, kind, summary,
+                json.dumps(payload, ensure_ascii=False) if payload is not None else None,
+                time.time(),
+            ))
+
+    async def reviewer_context_events(self, plan_id: str, job_id: str) -> list[dict]:
+        return await asyncio.to_thread(self._reviewer_context_events, plan_id, job_id)
+
+    def _reviewer_context_events(self, plan_id, job_id):
+        with self._database() as db:
+            rows = db.execute("""SELECT position, task_id, kind, summary, payload_json
+              FROM wp_reviewer_context_events WHERE plan_id=? AND job_id=?
+              ORDER BY id""", (plan_id, job_id)).fetchall()
+        return [{"position": row[0], "task_id": row[1], "kind": row[2], "summary": row[3],
+                 "payload": json.loads(row[4]) if row[4] else None} for row in rows]
+
     async def paused_tasks(self, conversation_id: str | None,
                            referenced_job_ids: tuple[str, ...] = ()) -> list[dict]:
         return await asyncio.to_thread(self._paused_tasks, conversation_id,
@@ -1110,6 +1347,28 @@ class RoutingPersistence:
         if not project_id and not conversation_id:
             return []
         return await asyncio.to_thread(self._project_jobs, project_id, conversation_id)
+
+    async def unfinished_job_for_wp(self, project_id: str | None,
+                                    conversation_id: str | None,
+                                    wp_id: str) -> str | None:
+        """Find an unfinished job containing any task owned by this work package."""
+        if not project_id and not conversation_id:
+            raise ValueError("a project or conversation is required to check active jobs")
+        return await asyncio.to_thread(
+            self._unfinished_job_for_wp, project_id, conversation_id, wp_id)
+
+    def _unfinished_job_for_wp(self, project_id, conversation_id, wp_id):
+        terminal = tuple(sorted(TERMINAL_JOB_STATUSES))
+        with self._database() as db:
+            row = db.execute(f"""SELECT j.job_id FROM implementation_jobs j
+              WHERE j.status NOT IN ({','.join('?' for _ in terminal)})
+                AND {self._scope_clause(project_id)}
+                AND EXISTS (SELECT 1 FROM implementation_job_tasks t
+                            WHERE t.job_id=j.job_id AND t.task_id LIKE ?)
+              ORDER BY j.updated_at DESC LIMIT 1""",
+              (*terminal, *self._scope_args(project_id, conversation_id),
+               wp_id + "-T%")).fetchone()
+        return row[0] if row else None
 
     def _project_jobs(self, project_id, conversation_id):
         statuses = (*ACTIVE_JOB_STATUSES, *PAUSED_STATES, "review_pending",
@@ -1439,6 +1698,18 @@ class RoutingPersistence:
                                "WHERE proposal_id=?", (proposal_id,))
                     return "stale"
             parameters = proposal["payload"].get("parameters") or {}
+            planning_id = parameters.get("planning_session_id")
+            if planning_id:
+                # Approval binds to one plan revision; a later revision or a closed
+                # session makes it stale.
+                planning = db.execute("SELECT status, revision FROM wp_planning_sessions "
+                                      "WHERE session_id=? AND conversation_id=?",
+                                      (planning_id, proposal["conversation_id"])).fetchone()
+                if (planning is None or planning[0] != "active"
+                        or planning[1] != parameters.get("planning_revision")):
+                    db.execute("UPDATE workflow_action_proposals SET status='stale' "
+                               "WHERE proposal_id=?", (proposal_id,))
+                    return "stale"
             project_id = parameters.get("project_id")
             displaced = parameters.get("displace") or []
             if parameters.get("conflict_checked"):
@@ -1452,10 +1723,11 @@ class RoutingPersistence:
             if job is not None:
                 db.execute("""INSERT INTO implementation_jobs
                   (job_id, selectors_json, instruction, conversation_id, project_id, status,
-                   created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   created_at, updated_at, plan_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                   (job.job_id, json.dumps(job.selectors), job.instruction,
                    proposal["conversation_id"], project_id,
-                   "pending_switch" if displaced else job.status, now, now))
+                   "pending_switch" if displaced else job.status, now, now,
+                   getattr(job, "plan_id", None)))
                 db.executemany("""INSERT INTO implementation_job_tasks
                   (job_id, position, change_id, task_id, status, decision_id, error,
                    revision_budget) VALUES (?, ?, ?, ?, ?, ?, ?, 3)""",

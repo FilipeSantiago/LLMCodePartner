@@ -16,6 +16,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from uuid import uuid4
 
+from agent.planning.models import plan_id_for
 from agent.routing.models import ImplementationJob, ImplementationJobTask
 from agent.routing.persistence import RoutingPersistence
 from agent.spec.implementation_intent import ImplementationIntent, selectors_in_text
@@ -35,6 +36,7 @@ from agent.workflow.reconciler import (
 from agent.workflow.review_retry import explicit_retry_request, menu_choices
 from agent.workflow.states import WorkflowAction as A, WorkflowState as S, action_allowed
 from mcp_bridge.models import ErrorEvent, Event, TextEvent
+from conversation.presentation import ensure_newline
 from telemetry.models import TurnEvent, WorkflowEvent
 from telemetry.recorder import TelemetryRecorder
 from telemetry.storage import TelemetryStorage
@@ -47,18 +49,39 @@ _TOKEN_LENGTH = 6
 _DECISION = re.compile(
     r"\s*(confirm|reject|change)\s+([A-Za-z0-9]{4,8})(?:\s*:\s*(.+))?\s*",
     re.IGNORECASE | re.DOTALL)
-BARE_CONFIRM = frozenset({"yes", "y", "confirm"})
+BARE_CONFIRM = frozenset({"yes", "y", "confirm", "approve"})
 BARE_REJECT = frozenset({"no", "n", "reject", "cancel"})
+# Natural approvals of the plan under discussion (only while a WP is being planned).
+PLAN_APPROVAL = re.compile(
+    r"\s*(?:approved?|approve and implement|approve the plan|lgtm|looks good"
+    r"(?:[,;]?\s*(?:go ahead|let'?s (?:implement|do) it|implement it|ship it))?"
+    r"|go ahead|ship it|let'?s (?:implement|do|build) it)[.!]*\s*",
+    re.IGNORECASE)
+PLAN_DISCUSS = re.compile(r"\s*discuss(?: more)?[.!]*\s*", re.IGNORECASE)
+PLAN_ABANDON = re.compile(
+    r"\s*(?:stop|abandon|drop|cancel|never ?mind)(?: (?:the )?(?:plan|planning))?[.!]*\s*",
+    re.IGNORECASE)
+_WP_ONLY = re.compile(r"WP\d+")
+_SPEC_MARKERS = {
+    "/__workflow_spec_draft__": "Draft a new OpenSpec change",
+    "/__workflow_spec_update__": "Revise the active OpenSpec draft",
+}
 # Actions the HTTP layer executes by replaying the confirmed command.
 PASSTHROUGH_ACTIONS = frozenset({A.CODING, A.EXECUTE_COMMAND,
                                  A.APPLY_SPEC, A.DISCARD_SPEC})
 # Actions that may change project files. Only one such flow may be active per
 # project; proposing one while another job is active asks to switch instead.
 MUTATING_ACTIONS = frozenset({
-    A.START_IMPLEMENTATION, A.CODING, A.RETRY_CONTRACT, A.EXPAND_CONTRACT_SCOPE,
+    A.START_IMPLEMENTATION, A.APPROVE_WP_PLAN, A.CODING, A.RETRY_CONTRACT, A.EXPAND_CONTRACT_SCOPE,
     A.RETRY_CODER_AFTER_REVIEW, A.ACCEPT_REVIEW, A.UNDO_IMPLEMENTATION,
     A.RESOLVE_CODER_RECOVERY, A.ANSWER_REVIEWER_QUESTION,
 })
+
+
+def _preview(text: str, limit: int = 200) -> str:
+    """One-line excerpt for proposal text; the full request is kept in the payload."""
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[:limit] + "…"
 
 
 def fingerprint(message: str) -> str:
@@ -67,7 +90,7 @@ def fingerprint(message: str) -> str:
 
 def _start_phrase(intent: WorkflowIntent) -> str:
     """How the switch question names the new work ("start implementing WP5 and WP6")."""
-    if intent.action == A.START_IMPLEMENTATION:
+    if intent.action in {A.START_IMPLEMENTATION, A.APPROVE_WP_PLAN}:
         return f"start implementing {switching.join_names(intent.selectors) or 'the selected tasks'}"
     if intent.action == A.CODING:
         return "start the requested coding change"
@@ -118,6 +141,7 @@ class ConversationPhase(StrEnum):
     PROPOSED = "proposed"
     PAUSED = "paused"
     RUNNING = "running"
+    PLANNING = "planning"
 
 
 @dataclass(frozen=True)
@@ -134,12 +158,26 @@ class ConversationSnapshot:
 class TurnResult:
     """How a fresh user turn was routed. Only `answer` reaches a model reply."""
 
-    kind: str  # "reply", "proposal", or "answer"
+    kind: str  # "reply", "proposal", "answer", or "plan_start"
     text: str = ""
     proposal: WorkflowActionProposal | None = None
+    wp_id: str = ""
+    queued_wp_ids: tuple[str, ...] = ()
 
     def render(self) -> str:
         return self.proposal.render() if self.proposal is not None else self.text
+
+
+@dataclass(frozen=True)
+class PlanStart:
+    """A WP implementation request starts interactive planning of its first WP.
+
+    The other WPs are planned one at a time, each after the previous one completes,
+    so every plan sees the code its predecessors actually produced.
+    """
+
+    wp_ids: tuple[str, ...]
+    instruction: str
 
 
 class ConversationWorkflow:
@@ -154,6 +192,18 @@ class ConversationWorkflow:
         self.telemetry = telemetry or TelemetryRecorder(TelemetryStorage(path))
         self._interpreter = interpreter
         self.project_id = project_id
+        self._planning_available: bool | None = None
+
+    @property
+    def planning_available(self) -> bool:
+        """WP implementation is planned first whenever a planner is configured."""
+        if self._planning_available is None:
+            try:
+                from agent.routing.config import load_routing_config
+                self._planning_available = load_routing_config().planner is not None
+            except Exception:
+                self._planning_available = False
+        return self._planning_available
 
     @property
     def interpreter(self) -> WorkflowInterpreter:
@@ -193,6 +243,9 @@ class ConversationWorkflow:
         if action == "START_IMPLEMENTATION":
             if artifacts is None:
                 return "An IDE MCP session is needed to identify the tasks. Nothing was executed."
+            if (self.planning_available and selectors
+                    and all(_WP_ONLY.fullmatch(selector) for selector in selectors)):
+                return PlanStart(tuple(selectors), message.strip())
             intent = ImplementationIntent(
                 selectors, instruction, classification["confidence"], (),
                 "conversation-intent")
@@ -204,7 +257,7 @@ class ConversationWorkflow:
             return await self.propose(WorkflowIntent(
                 conversation_id=conversation_id,
                 message_fingerprint=fingerprint(message), action=A.CODING,
-                expected_effects=(f"Ask the coding agent to: {message.strip()}",
+                expected_effects=(f"Ask the coding agent to: {_preview(message)}",
                                   "Project files may be changed through the guarded IDE tools"),
                 parameters={"command": "/__workflow_coding__ " + message.strip()},
                 confidence=classification["confidence"],
@@ -217,8 +270,10 @@ class ConversationWorkflow:
         if action == "SPEC_DRAFT":
             active = await self.persistence.active_refinement(conversation_id)
             operation = "update" if active else "draft"
+            # The spec is generated from the user's full text, never the classifier's
+            # paraphrase of it.
             return await self.propose(self.command_intent(
-                conversation_id, f"/__workflow_spec_{operation}__ " + instruction,
+                conversation_id, f"/__workflow_spec_{operation}__ " + message.strip(),
                 refinement_session_id=active["session_id"] if active else None))
         return "Nothing was executed. I could not identify an available action."
 
@@ -266,6 +321,9 @@ class ConversationWorkflow:
                                                free_value, artifacts)
             result = (TurnResult("answer") if outcome is None else
                       TurnResult("reply", outcome) if isinstance(outcome, str) else
+                      TurnResult("plan_start", outcome.instruction, wp_id=outcome.wp_ids[0],
+                                 queued_wp_ids=outcome.wp_ids[1:])
+                      if isinstance(outcome, PlanStart) else
                       TurnResult("proposal", proposal=outcome))
         elif decision.route == Route.QUESTION:
             result = TurnResult("answer")
@@ -298,6 +356,43 @@ class ConversationWorkflow:
                          proposal_id=result.proposal.proposal_id if result.proposal else None,
                          outcome=result.kind)
         return result
+
+    def planning_route(self, text: str, snapshot: ConversationSnapshot) -> str | None:
+        """While a WP is being planned: "approve", "discuss", "abandon", or None.
+
+        None means the turn is not about the current plan (it names another WP),
+        so ordinary routing applies and may start planning that WP instead.
+        """
+        context = snapshot.context
+        if context.planning_session_id is None:
+            return None
+        if PLAN_APPROVAL.fullmatch(text) or text.strip().lower() in BARE_CONFIRM:
+            return "approve"
+        if text.strip().lower() in BARE_REJECT:
+            return None  # an ordinary rejection of the pending approval closes planning
+        if PLAN_ABANDON.fullmatch(text):
+            return "abandon"
+        named = selectors_in_text(text)
+        if any(selector.split("-", 1)[0] != context.planning_wp_id for selector in named):
+            return None
+        return "discuss"
+
+    async def propose_plan_approval(self, conversation_id: str, turn, artifacts
+                                    ) -> WorkflowActionProposal:
+        """Bind "Approve and implement" to exactly this plan revision."""
+        targets = await artifacts.tasks_for_selectors([turn.wp_id])
+        task_ids = [task.id for _, task in targets]
+        return await self.propose(WorkflowIntent(
+            conversation_id=conversation_id,
+            message_fingerprint=fingerprint(f"{turn.session_id}:{turn.revision}"),
+            action=A.APPROVE_WP_PLAN, selectors=(turn.wp_id,), target_task=turn.wp_id,
+            expected_effects=(
+                f"Freeze revision {turn.revision} of the {turn.wp_id} plan as execution context",
+                *(f"Task {task.id}: {task.title}" for _, task in targets),
+                "Create one implementation job and run the tasks in order",
+            ),
+            parameters={"task_ids": task_ids, "planning_session_id": turn.session_id,
+                        "planning_revision": turn.revision}))
 
     def resolve_bare_reply(self, text: str, snapshot: ConversationSnapshot
                            ) -> tuple[dict | None, str | None]:
@@ -365,8 +460,11 @@ class ConversationWorkflow:
                 review_question=row["review_question"],
             ))
         refinement = await self.persistence.active_refinement(conversation_id)
+        planning = await self.persistence.active_planning(conversation_id)
         return WorkflowContext(conversation_id, tuple(paused),
-                               refinement["session_id"] if refinement else None)
+                               refinement["session_id"] if refinement else None,
+                               planning_session_id=planning["session_id"] if planning else None,
+                               planning_wp_id=planning["wp_id"] if planning else None)
 
     async def snapshot(self, conversation_id: str | None) -> ConversationSnapshot:
         await switching.recover_switches(self.persistence)
@@ -378,7 +476,8 @@ class ConversationWorkflow:
                 f"{latest['action']} for {latest.get('target_task_id') or 'the conversation'}; "
                 f"effects: {', '.join(latest['payload'].get('expected_effects', ()))[:200]}"))
         running_jobs = await self.persistence.running_jobs(conversation_id)
-        phase = (ConversationPhase.PROPOSED if pending else
+        phase = (ConversationPhase.PLANNING if context.planning_session_id else
+                 ConversationPhase.PROPOSED if pending else
                  ConversationPhase.PAUSED if context.paused else
                  ConversationPhase.RUNNING if running_jobs else ConversationPhase.READY)
         return ConversationSnapshot(phase, context, pending, running_jobs)
@@ -469,6 +568,16 @@ class ConversationWorkflow:
             A.APPLY_SPEC: ("Write the active draft into OpenSpec",),
             A.DISCARD_SPEC: ("Discard the active draft; OpenSpec is unchanged",),
         }.get(action, (f"Run `{label}`", f"Command: `{command.strip()}`"))
+        spec = _SPEC_MARKERS.get(label)
+        if spec is not None:
+            request = command.strip()[len(label):].strip()
+            effects = (f"{spec} from your request ({len(request):,} characters)",
+                       f"Starts: \"{_preview(request)}\"")
+        elif label.lower() == "/reset":
+            effects = (
+                f"Reset the selected OpenSpec Work Package and active tasks to pending: `{command.strip()}`",
+                "Clear their OpenSpec completion and review records; keep project files",
+            )
         parameters = {"command": command}
         if refinement_session_id:
             parameters["refinement_session_id"] = refinement_session_id
@@ -518,6 +627,11 @@ class ConversationWorkflow:
                 proposal["proposal_id"], "rejected"):
             self._event("rejected", WorkflowIntent.from_proposal(proposal),
                         proposal["proposal_id"], proposal=proposal)
+            session_id = (proposal["payload"].get("parameters") or {}).get("planning_session_id")
+            if proposal["action"] == A.APPROVE_WP_PLAN.value and session_id:
+                await self.persistence.finish_planning(session_id, "abandoned")
+                return ("Planning closed without implementing anything. "
+                        "Ask again whenever you want to plan this work package.")
             return f"Proposal {token} rejected. Nothing was executed."
         return f"Proposal {token} is {proposal['status']}; nothing was executed."
 
@@ -559,7 +673,8 @@ class ConversationWorkflow:
                 f"Proposal {token} is {proposal['status']}; nothing was executed."))
         intent = WorkflowIntent.from_proposal(proposal)
         job = tasks = None
-        if intent.action == A.START_IMPLEMENTATION and proposal["status"] == "pending":
+        if (intent.action in {A.START_IMPLEMENTATION, A.APPROVE_WP_PLAN}
+                and proposal["status"] == "pending"):
             if artifacts is None:
                 return ClaimResult("unavailable", proposal,
                                    "Confirming an implementation requires the IDE MCP session.")
@@ -568,7 +683,11 @@ class ConversationWorkflow:
             if current_ids != intent.parameters.get("task_ids"):
                 await self.persistence.resolve_workflow_proposal(proposal["proposal_id"], "stale")
                 return await self._refresh("stale", proposal, intent, artifacts)
-            job = ImplementationJob.create(list(intent.selectors), current_ids, intent.guidance)
+            plan_id = (plan_id_for(intent.parameters["planning_session_id"],
+                                   intent.parameters["planning_revision"])
+                       if intent.action == A.APPROVE_WP_PLAN else None)
+            job = ImplementationJob.create(list(intent.selectors), current_ids, intent.guidance,
+                                           plan_id=plan_id)
             tasks = [ImplementationJobTask(job.job_id, position, change.id, task.id)
                      for position, (change, task) in enumerate(targets)]
         status = (proposal["status"] if proposal["status"] == "expired"
@@ -592,6 +711,10 @@ class ConversationWorkflow:
         reason = ("This proposal expired." if status == "expired"
                   else "The workflow changed after this proposal was created.")
         message = f"Nothing was executed. {reason}"
+        if intent.action == A.APPROVE_WP_PLAN:
+            return ClaimResult(status, proposal, (
+                f"{message} That approval referred to an earlier revision of the plan, or "
+                "planning has ended. Approve the latest plan revision instead."))
         if intent.action == A.START_IMPLEMENTATION:
             if artifacts is None:
                 return ClaimResult(status, proposal, message)
@@ -645,6 +768,8 @@ class ConversationWorkflow:
         action, guidance = intent.action, intent.guidance
         if action == A.START_IMPLEMENTATION:
             events = service.start(job, messages, specs, handlers)
+        elif action == A.APPROVE_WP_PLAN:
+            events = self._approve_and_start(intent, service, job, messages, specs, handlers)
         elif action in {A.RETRY_CONTRACT, A.EXPAND_CONTRACT_SCOPE}:
             events = service.retry_contract(
                 job_id, position, messages, specs, instruction, handlers, guidance,
@@ -691,12 +816,83 @@ class ConversationWorkflow:
                     if choices:
                         await self.persistence.record_offered_choices(
                             intent.conversation_id, choices)
+                    # Streamed messages are concatenated as-is; never let two run together.
+                    event = TextEvent(ensure_newline(event.text))
                 yield event
         except Exception as exc:
             failure = f"{type(exc).__name__}: {exc}"
             raise
         finally:
             await self.transition_finished(proposal, failure)
+        if failure is None:
+            async for event in self._plan_next(intent.conversation_id,
+                                               job.job_id if job else job_id,
+                                               service, specs, handlers):
+                yield event
+
+    async def _approve_and_start(self, intent: WorkflowIntent, service, job: ImplementationJob,
+                                 messages: list[dict], specs: list, handlers: dict
+                                 ) -> AsyncIterator[Event]:
+        """Freeze the approved plan (no model call), then run the existing job pipeline."""
+        from agent.planning.service import PlanningError, WPPlannerService
+        planner = WPPlannerService(service.artifacts, self.persistence,
+                                   config=getattr(service, "config", None))
+        try:
+            plan = await planner.approve(intent.parameters["planning_session_id"],
+                                         intent.parameters["planning_revision"])
+        except PlanningError as exc:
+            await self.persistence.finish_implementation_job(job.job_id, "failed", str(exc))
+            yield ErrorEvent(f"Nothing was implemented: {exc}")
+            return
+        yield TextEvent(f"Plan {plan.plan_id} approved and frozen for {plan.wp_id}. "
+                        "Starting implementation with the planned context.\n\n")
+        async for event in service.start(job, messages, specs, handlers):
+            yield event
+
+    async def _plan_next(self, conversation_id: str, job_id: str | None, service,
+                         specs: list, handlers: dict) -> AsyncIterator[Event]:
+        """When a planned WP's job completes, plan the next WP from the same request."""
+        if not job_id or await self.persistence.implementation_job_status(job_id) != "completed":
+            return
+        plan = await self.persistence.approved_plan(await self.persistence.job_plan_id(job_id))
+        session = (await self.persistence.planning_session(plan["session_id"])
+                   if plan else None)
+        queued = list(session.get("queued_wp_ids") or ()) if session else []
+        if not queued:
+            return
+        from agent.planning.render import render_plan
+        from agent.planning.service import PlanningError, WPPlannerService, with_progress
+        from conversation.presentation import progress_line
+        planner = WPPlannerService(service.artifacts, self.persistence,
+                                   config=getattr(service, "config", None))
+
+        def call(progress):
+            return planner.start(
+                conversation_id, queued[0], session.get("request") or f"Implement {queued[0]}",
+                specs, handlers, project_id=self.project_id, queued_wp_ids=tuple(queued[1:]),
+                progress=progress,
+                heading=f"{plan['wp_id']} is complete — investigating {queued[0]}")
+
+        turn = None
+        try:
+            async for kind, value in with_progress(call):
+                if kind == "progress":
+                    yield TextEvent(value)
+                else:
+                    turn = value
+            approval = (None if turn.gaps else
+                        await self.propose_plan_approval(conversation_id, turn,
+                                                         service.artifacts))
+        except PlanningError as exc:
+            yield ErrorEvent(f"Planning {queued[0]} failed: {exc}. Ask again to plan it.")
+            return
+        text = render_plan(turn.draft, wp_complexity=turn.wp_complexity,
+                           planner_label=turn.planner_label, gaps=turn.gaps,
+                           token=approval.confirmation_token if approval else None,
+                           queued_wp_ids=turn.queued_wp_ids)
+        await self.persistence.record_offered_choices(conversation_id, menu_choices(text))
+        yield TextEvent(progress_line("separator"))
+        yield TextEvent(text + "\n")
 
     async def run_switch(self, proposal: dict) -> switching.SwitchOutcome | None:
         """Stop the jobs a confirmed proposal displaces. None when nothing is displaced."""

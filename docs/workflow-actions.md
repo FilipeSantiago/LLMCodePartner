@@ -112,6 +112,25 @@ model call. When a model-read continuation competes with a clearly requested new
 implementation, spec draft, or review, nothing is guessed: the user is asked to
 name the selector or prefix the task id.
 
+### Work Package planning
+
+In every mode except review, a WP implementation request ("Let's do WP4",
+"implement WP1 and WP2") starts an interactive planning session for the first WP
+instead of a `START_IMPLEMENTATION` proposal. Further WPs are planned one at a time,
+each after the previous WP's job completes.
+Planning is read-only, so it runs without a token. While the session is active,
+the conversation phase is `planning`, and:
+
+- an approval (`approve`, `1`, `yes`, "looks good, go ahead", or
+  `confirm <token>`) claims the pending `APPROVE_WP_PLAN` proposal for the
+  *current* revision;
+- `discuss` / `2` asks what to change; any other text is a discuss turn;
+- a request naming a different WP supersedes the session; `never mind` / `stop
+  planning` (or rejecting the proposal) abandons it.
+
+Each revision supersedes the previous approval proposal. The claim marks it stale
+unless the session is still active at the same revision. See `docs/wp-planner.md`.
+
 ## Interpretation of replies to paused tasks
 
 1. Recognized phrases are mapped deterministically, relative to the task's state.

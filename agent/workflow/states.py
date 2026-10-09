@@ -33,6 +33,8 @@ class WorkflowAction(StrEnum):
     DISCARD_SPEC = "DISCARD_SPEC"
     EXECUTE_COMMAND = "EXECUTE_COMMAND"
     STOP_JOB = "STOP_JOB"
+    # Approve one revision of an interactive WP plan and start implementing it.
+    APPROVE_WP_PLAN = "APPROVE_WP_PLAN"
     ANSWER = "ANSWER"
     ASK_CLARIFICATION = "ASK_CLARIFICATION"
 
@@ -77,6 +79,7 @@ ACTION_DESCRIPTIONS: dict[WorkflowAction, str] = {
     A.DISCARD_SPEC: "discard the active OpenSpec draft",
     A.EXECUTE_COMMAND: "run the workflow command",
     A.STOP_JOB: "stop the job and keep the current files for manual inspection",
+    A.APPROVE_WP_PLAN: "approve the current WP plan revision and start implementing it",
     A.ASK_CLARIFICATION: "ask which action is intended",
 }
 

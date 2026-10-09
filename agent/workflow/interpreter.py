@@ -20,8 +20,19 @@ from agent.workflow.states import (
     action_allowed,
 )
 
-_MAX_MESSAGE_CHARS = 4000
-_MAX_GUIDANCE_CHARS = 2000
+# User text is never length-limited (a spec request may be book-length). Only the
+# small classification model sees a bounded excerpt of it.
+_EXCERPT_HEAD_CHARS = 3000
+_EXCERPT_TAIL_CHARS = 500
+
+
+def classifier_excerpt(message: str) -> str:
+    """Head and tail of a long message for a classifier; the full text is kept elsewhere."""
+    if len(message) <= _EXCERPT_HEAD_CHARS + _EXCERPT_TAIL_CHARS:
+        return message
+    omitted = len(message) - _EXCERPT_HEAD_CHARS - _EXCERPT_TAIL_CHARS
+    return (f"{message[:_EXCERPT_HEAD_CHARS]}\n[… {omitted} characters omitted …]\n"
+            f"{message[-_EXCERPT_TAIL_CHARS:]}")
 
 
 @dataclass(frozen=True)
@@ -206,9 +217,9 @@ class WorkflowInterpreter:
             message_fingerprint=fingerprint, action=A.ASK_CLARIFICATION,
             workflow_context=context.render())
         text = message.strip()
-        if not text or len(text) > _MAX_MESSAGE_CHARS:
+        if not text:
             return replace(base, clarification=clarification_text(
-                context, "Replies must contain between 1 and 4000 characters."))
+                context, "The reply was empty."))
         if not context.paused:
             return replace(base, clarification=clarification_text(
                 context, "No paused workflow is waiting for a decision."))
@@ -263,7 +274,7 @@ class WorkflowInterpreter:
                 tuple(task for task, _ in candidates)))
         task, (action, parameters) = candidates[0]
         return self._finish(replace(
-            base, action=action, guidance=phrase.guidance[:_MAX_GUIDANCE_CHARS],
+            base, action=action, guidance=phrase.guidance,
             parameters=parameters, confidence="high",
             interpretation_source="deterministic"), context, task)
 
@@ -312,7 +323,8 @@ class WorkflowInterpreter:
                     "ANSWER_REVIEWER_QUESTION. Never invent tasks, files, actions, or claim "
                     "that a review happened. Do not plan the implementation. Return only JSON.")},
                 {"role": "user", "content": (
-                    f"Workflow state:\n{context.render()}\n\nUser reply: {message}")},
+                    f"Workflow state:\n{context.render()}\n\n"
+                    f"User reply: {classifier_excerpt(message)}")},
             ], schema, self.model)
         except Exception as exc:
             return replace(model_base, clarification=clarification_text(
@@ -329,7 +341,7 @@ class WorkflowInterpreter:
         mode = value.get("recovery_mode") or "none"
         if (action not in {*allowed, A.ANSWER.value, A.ASK_CLARIFICATION.value}
                 or value.get("target_task") not in {task.task_id, None}
-                or not isinstance(guidance, str) or len(guidance) > _MAX_GUIDANCE_CHARS
+                or not isinstance(guidance, str)
                 or confidence not in {"high", "medium", "low"}
                 or not isinstance(ambiguities, list) or len(ambiguities) > 10
                 or not all(isinstance(item, str) for item in ambiguities)
@@ -415,8 +427,8 @@ class ConversationIntentInterpreter:
 
     async def interpret(self, message: str, mode_hint: str = "",
                         context_summary: str = "") -> dict:
-        if not message.strip() or len(message) > _MAX_MESSAGE_CHARS:
-            return {"action": "ASK_CLARIFICATION", "reason": "Please send a shorter request."}
+        if not message.strip():
+            return {"action": "ASK_CLARIFICATION", "reason": "The message was empty."}
         seen = set(selectors_in_text(message))
         if (mode_hint == "review" and seen
                 and not re.search(r"\b(?:implement|code|edit|write|build|fix)\b",
@@ -433,12 +445,16 @@ class ConversationIntentInterpreter:
                     "START_IMPLEMENTATION for an OpenSpec-scoped coding task; CODING for "
                     "a coding task without an OpenSpec selector; REVIEW for read-only review; "
                     "SPEC_DRAFT for planning or changing an OpenSpec draft; otherwise "
-                    "ASK_CLARIFICATION. Do not invent selectors. Return only JSON.")},
+                    "ASK_CLARIFICATION. A request to do, work on, start, or implement a named "
+                    "work package (for example \"Let's do WP4\") is START_IMPLEMENTATION. "
+                    "In spec mode, a feature description, requirements, or plan without a "
+                    "selector is SPEC_DRAFT even when it is phrased as \"Implement ...\". "
+                    "Do not invent selectors. Return only JSON.")},
                 {"role": "user", "content": (
                     f"Mode hint: {mode_hint or 'default'}\n"
                     f"Conversation state: {context_summary[:1200] or 'ready'}\n"
                     f"Selectors explicitly named: {', '.join(sorted(seen)) or 'none'}\n"
-                    f"User message: {message}")},
+                    f"User message: {classifier_excerpt(message)}")},
             ], self._SCHEMA, self.model)
         except Exception:
             value = self._fallback(message, mode_hint, seen)
@@ -468,20 +484,24 @@ class ConversationIntentInterpreter:
             return {"action": action, "reason": detail or (
                 "Please clarify what you want CodePartner to do next.")}
         return {"action": action, "selectors": normalized,
-                "instruction": instruction.strip()[:_MAX_GUIDANCE_CHARS],
+                "instruction": instruction.strip(),
                 "confidence": confidence}
 
     @staticmethod
     def _fallback(message: str, mode_hint: str, selectors: set[str]) -> dict:
         text = message.lower()
         action = "ANSWER"
-        if selectors and re.search(r"\b(?:start|implement|build|code|add|fix)\b", text):
+        if mode_hint == "spec" and not selectors and not message.strip().endswith("?"):
+            # In spec mode a feature description is a spec request, even when it is
+            # phrased as "Implement ...".
+            action = "SPEC_DRAFT"
+        elif selectors and re.search(r"\b(?:start|implement|build|code|add|fix)\b", text):
             action = "START_IMPLEMENTATION"
         elif not selectors and re.search(r"\b(?:implement|build|code|add|fix)\b", text):
             action = "CODING" if mode_hint != "implement" else "ASK_CLARIFICATION"
         elif selectors and re.search(r"\b(?:review|audit|inspect)\b", text):
             action = "REVIEW"
-        elif mode_hint == "implement" and selectors and not message.strip().endswith("?"):
+        elif mode_hint in {"implement", "plan"} and selectors and not message.strip().endswith("?"):
             action = "START_IMPLEMENTATION"
         elif mode_hint == "spec" and not message.strip().endswith("?"):
             action = "SPEC_DRAFT"

@@ -22,6 +22,7 @@ from agent.spec.models import (
     Scenario,
     Task,
     ValidationContract,
+    WP_COMPLEXITIES,
     WorkPackage,
 )
 from providers.base import Provider
@@ -106,6 +107,7 @@ class CliOpenSpecAdapter(OpenSpecAdapter):
                 "title": "Purpose-oriented package title",
                 "kind": "user-story or technical-outcome or another accurate kind",
                 "objective": "One cohesive outcome",
+                "complexity": "medium",
                 "acceptance_criteria": ["Observable completion criterion"],
                 "validation": {
                     "required": ["Minimum evidence required for review"],
@@ -142,8 +144,11 @@ class CliOpenSpecAdapter(OpenSpecAdapter):
             "research, or operational when more accurate. Every task belongs to exactly "
             "one work package. Every requirement has at least one scenario. Capability "
             "paths are safe kebab-case paths. Requirement references use "
-            "'<capability-path>#<requirement-name>' and must resolve. Complexity is exactly "
-            "simple, medium, or complex. Required strings and lists are non-empty, except "
+            "'<capability-path>#<requirement-name>' and must resolve. Task complexity is exactly "
+            "simple, medium, or complex. Work package complexity is exactly low, medium, high, "
+            "or complex and rates how hard it is to plan the whole package (architecture to "
+            "understand, cross-task dependencies, existing code to reconcile); it never names "
+            "a model. Required strings and lists are non-empty, except "
             "task context, design non_goals, and design risks may be empty.\n\n"
             f"JSON shape:\n{json.dumps(shape, indent=2)}\n\n"
             "Follow the semantics of these installed OpenSpec templates:\n"
@@ -416,7 +421,8 @@ class CliOpenSpecAdapter(OpenSpecAdapter):
             value = cls._mapping(raw_package, f"work package {index}")
             legacy = {"title", "kind", "objective", "acceptance_criteria", "requirement_refs", "tasks"}
             modern = legacy | {"validation", "depends_on"}
-            if frozenset(value) not in {frozenset(legacy), frozenset(modern)}:
+            # WP complexity is optional so catalogs generated before it existed still parse.
+            if frozenset(value) - {"complexity"} not in {frozenset(legacy), frozenset(modern)}:
                 raise OpenSpecError(
                     f"work package {index} must contain the legacy fields or add validation and depends_on"
                 )
@@ -440,10 +446,20 @@ class CliOpenSpecAdapter(OpenSpecAdapter):
                 depends_on=cls._strings(
                     value.get("depends_on", []), f"work package {index}.depends_on", empty=True
                 ),
+                complexity=cls._wp_complexity(value.get("complexity"), f"work package {index}"),
             ))
         if not packages:
             raise OpenSpecError("work_packages must not be empty")
         return packages
+
+    @classmethod
+    def _wp_complexity(cls, value: object, label: str) -> str | None:
+        if value is None:
+            return None
+        complexity = cls._text(value, f"{label}.complexity")
+        if complexity not in WP_COMPLEXITIES:
+            raise OpenSpecError(f"{label} has invalid complexity")
+        return complexity
 
     @classmethod
     def _parse_task(cls, raw: object, label: str, task_id: str = "") -> Task:

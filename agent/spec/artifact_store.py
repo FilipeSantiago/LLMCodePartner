@@ -114,6 +114,9 @@ class ArtifactStore(abc.ABC):
                                          completed: bool) -> OpenSpecChange:
         raise NotImplementedError
 
+    async def reset_work_package(self, package_id: str) -> OpenSpecChange:
+        raise NotImplementedError
+
 
 class OpenSpecArtifactStore(ArtifactStore):
     """MCP-backed multi-file store with globally stable work-package IDs."""
@@ -447,6 +450,43 @@ class OpenSpecArtifactStore(ArtifactStore):
                     "blocked" if review.outcome == "BLOCK" else "unverified"),
             ))
         return await self.update_change(replace(change, work_packages=packages))
+
+    async def reset_work_package(self, package_id: str) -> OpenSpecChange:
+        catalog = await self._load_catalog(required=True)
+        changes = [OpenSpecChange.from_dict(value) for value in catalog.get("changes", [])]
+        updated_change = None
+        for index, change in enumerate(changes):
+            if not any(package.id == package_id for package in change.work_packages):
+                continue
+            packages = []
+            for package in change.work_packages:
+                if package.id != package_id:
+                    packages.append(package)
+                    continue
+                tasks = [
+                    task if task.status == "cancelled" else replace(
+                        task, completed=False, status="pending", completion_review=None)
+                    for task in package.tasks
+                ]
+                packages.append(replace(package, tasks=tasks, status="planned", review=None))
+            updated_change = replace(change, work_packages=packages)
+            changes[index] = updated_change
+            break
+        if updated_change is None:
+            raise ArtifactSelectionError(f"unknown work package ID: {package_id}")
+        catalog["changes"] = [change.to_dict() for change in changes]
+        try:
+            await self._client.create_file(
+                f"{updated_change.path}/tasks.md", render_tasks(updated_change), overwrite=True)
+            await self._client.create_file(
+                DASHBOARD_PATH, render_dashboard(changes), overwrite=True)
+            await self._client.create_file(
+                CATALOG_PATH, json.dumps(catalog, indent=2, ensure_ascii=False) + "\n",
+                overwrite=True)
+        except JetBrainsMcpError as exc:
+            raise ArtifactStoreError(
+                f"could not reset {package_id} through JetBrains MCP: {exc}") from exc
+        return updated_change
 
     async def _load_catalog(self, required: bool = False) -> dict:
         try:

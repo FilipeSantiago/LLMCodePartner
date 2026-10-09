@@ -22,6 +22,7 @@ _RUN_COMMAND = re.compile(r"^\s*/run(?:\s+|$)", re.IGNORECASE)
 _IMPLEMENT_COMMAND = re.compile(r"^\s*/(?:implement|execute)(?:\s+|$)", re.IGNORECASE)
 _REVIEW_COMMAND = re.compile(r"^\s*/review(?:\s+|$)", re.IGNORECASE)
 _REWORK_COMMAND = re.compile(r"^\s*/rework(?:\s+|$)", re.IGNORECASE)
+_RESET_COMMAND = re.compile(r"^\s*/reset(?:\s+|$)", re.IGNORECASE)
 _HELP_COMMAND = re.compile(r"^\s*/(?:help|man)(?:\s+|$)", re.IGNORECASE)
 _TASK_TARGET = re.compile(
     r"\b(?:WP|US)\s*(\d+)\s*-\s*T(?:ASK)?\s*(\d+)\b",
@@ -59,6 +60,8 @@ COMMANDS = (
                 "Inspects selected work through read-only IDE tools and reports evidence, gaps, and tests. It never writes files."),
     CommandInfo("rework", "/rework WP1|WP1-T1[: <feedback>]", "Create corrective follow-up work.",
                 "Creates a separate additive OpenSpec change linked to the selected source tasks; completed history is preserved."),
+    CommandInfo("reset", "/reset WP1", "Reset a Work Package to pending.",
+                "Clears its OpenSpec completion and review records, keeping cancelled tasks and project files."),
     CommandInfo("implement", "/implement WP1|WP1-T1 [more selectors][: <execution instruction>]", "Route and implement tasks sequentially.",
                 "Expands work packages into incomplete tasks, routes each task at start time, executes sequentially, and stops on failure. Put optional execution guidance after ':'."),
     CommandInfo("help", "/help", "List available commands.", "Use /man <command> for detailed syntax and behavior."),
@@ -130,6 +133,21 @@ def is_review_command(content: str | None) -> bool:
 
 def is_rework_command(content: str | None) -> bool:
     return bool(content and _REWORK_COMMAND.match(content))
+
+
+def is_reset_command(content: str | None) -> bool:
+    return bool(content and _RESET_COMMAND.match(content))
+
+
+def extract_reset_wp_id(content: str) -> str:
+    command = _RESET_COMMAND.match(content)
+    if command is None:
+        raise SpecCommandError("message is not a /reset command")
+    target = content[command.end():].strip().upper()
+    match = _PACKAGE_TARGET.fullmatch(target)
+    if match is None:
+        raise SpecCommandError("/reset requires exactly one work package ID such as WP1")
+    return f"WP{match.group(1)}"
 
 
 def is_help_command(content: str | None) -> bool:
@@ -356,6 +374,14 @@ class SpecCommandHandler:
                     render_response(updated, task_ids),
                     updated.path,
                     tuple(task_ids),
+                )
+            if is_reset_command(content):
+                wp_id = extract_reset_wp_id(content)
+                updated = await self._store.reset_work_package(wp_id)
+                return SpecResult(
+                    updated.id, f"Reset {wp_id} to pending in {updated.id}.\n\n"
+                    "OpenSpec completion and review records were cleared; "
+                    "project files were left in place.", updated.path, (wp_id,),
                 )
         raise SpecCommandError("no active planning command")
 

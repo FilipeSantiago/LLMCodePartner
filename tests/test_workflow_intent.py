@@ -107,6 +107,8 @@ class _Fixture:
         self.workflow = WorkflowController(
             self.persistence, self.contracts,
             interpreter=WorkflowInterpreter(self.provider, "test-model"))
+        # Direct-flow fixture: WP planning is covered in test_wp_planner.
+        self.workflow._planning_available = False
 
     async def paused(self, selector="WP4", conversation="conv",
                      status="awaiting_contract_resolution",
@@ -212,7 +214,7 @@ class WorkflowInterpretationTests(unittest.IsolatedAsyncioTestCase):
             service.retry_coder.assert_called_once()
             self.assertEqual(service.retry_coder.call_args.args[6], "add coverage")
             service.retry_contract.assert_not_called()
-            self.assertEqual(events[0].text, "retrying after review")
+            self.assertEqual(events[0].text, "retrying after review\n")
 
     async def test_same_phrase_means_contract_retry_in_contract_state(self):
         with tempfile.TemporaryDirectory() as directory:

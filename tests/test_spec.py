@@ -15,6 +15,7 @@ from fastapi import HTTPException
 from agent.spec.artifact_store import (
     CATALOG_PATH,
     DASHBOARD_PATH,
+    ArtifactSelectionError,
     ArtifactStoreError,
     BridgeRequiredMcpClient,
     ArtifactLookupIndeterminate,
@@ -25,6 +26,7 @@ from agent.spec.command import (
     SpecCommandError,
     SpecCommandHandler,
     extract_object_id,
+    extract_reset_wp_id,
     extract_help_response,
     extract_scoped_request,
     extract_spec_request,
@@ -32,6 +34,7 @@ from agent.spec.command import (
     is_spec_command,
     is_explain_command,
     is_update_command,
+    is_reset_command,
 )
 from agent.spec.jetbrains_mcp import JetBrainsMcpClient, JetBrainsMcpError
 from agent.spec.models import (
@@ -46,6 +49,7 @@ from agent.spec.models import (
     Scenario,
     Task,
     ValidationContract,
+    WorkPackageReview,
     WorkPackage,
 )
 from agent.spec.openspec_adapter import (
@@ -255,9 +259,18 @@ class CommandParsing(unittest.TestCase):
 
     def test_help_and_manual_are_registry_backed(self):
         self.assertIn("/implement", extract_help_response("/help"))
+        self.assertIn("/reset WP1", extract_help_response("/help"))
         self.assertIn("sequential", extract_help_response("/man implement"))
         with self.assertRaises(SpecCommandError):
             extract_help_response("/man unknown")
+
+    def test_reset_accepts_only_one_work_package(self):
+        self.assertTrue(is_reset_command("/RESET wp1"))
+        self.assertFalse(is_reset_command("/resetting WP1"))
+        self.assertEqual(extract_reset_wp_id("/reset wp12"), "WP12")
+        for command in ("/reset", "/reset WP1-T1", "/reset EPIC1", "/reset WP1 WP2"):
+            with self.subTest(command=command), self.assertRaises(SpecCommandError):
+                extract_reset_wp_id(command)
 
     def test_review_and_rework_parse_work_packages_and_feedback(self):
         self.assertEqual(
@@ -273,6 +286,53 @@ class CommandParsing(unittest.TestCase):
 
 
 class ArtifactSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reset_wp_clears_completion_and_keeps_other_work(self):
+        client = FakeMcpClient()
+        store = OpenSpecArtifactStore(client)
+        change = await store.create_change(draft(), "authentication")
+        first, second = change.work_packages
+        completion = CompletionReview(
+            coder=ModelIdentity("coder", "claude", "model", None, "Coder"),
+            reviewer=ModelIdentity("reviewer", "codex", "model", None, "Reviewer"),
+            reason="Approved", evidence=["tests passed"],
+        )
+        first = replace(
+            first, status="completed",
+            review=WorkPackageReview(outcome="PASS", reason="Approved"),
+            tasks=[
+                replace(first.tasks[0], completed=True, status="completed",
+                        completion_review=completion),
+                replace(first.tasks[1], status="cancelled"),
+            ],
+        )
+        await store.update_change(replace(change, work_packages=[first, second]))
+        writes_before = len(client.writes)
+
+        result = await SpecCommandHandler(FakeAdapter(), store).handle(
+            [{"role": "user", "content": "/reset WP1"}])
+        self.assertIn("Reset WP1 to pending", result.content)
+        self.assertEqual(len(client.writes) - writes_before, 3)
+        restored = await store.object_by_id("WP1")
+        package = restored[2]
+        self.assertEqual(package.status, "planned")
+        self.assertIsNone(package.review)
+        self.assertEqual(package.tasks[0].status, "pending")
+        self.assertFalse(package.tasks[0].completed)
+        self.assertIsNone(package.tasks[0].completion_review)
+        self.assertEqual(package.tasks[1].status, "cancelled")
+        self.assertEqual(restored[1].work_packages[1], second)
+        self.assertEqual([task.id for _, task in await store.tasks_for_selectors(["WP1"])],
+                         ["WP1-T1"])
+        self.assertIn("- [ ] WP1-T1", client.files[f"{change.path}/tasks.md"])
+        self.assertNotIn("Coded by", client.files[f"{change.path}/tasks.md"])
+        self.assertNotIn("WP review:", client.files[DASHBOARD_PATH])
+        self.assertIn("Status: planned", client.files[DASHBOARD_PATH])
+
+        writes_before = len(client.writes)
+        with self.assertRaises(ArtifactSelectionError):
+            await store.reset_work_package("WP99")
+        self.assertEqual(len(client.writes), writes_before)
+
     async def test_created_change_has_explicit_epic_and_validation_contract(self):
         client = FakeMcpClient()
         store = OpenSpecArtifactStore(client)

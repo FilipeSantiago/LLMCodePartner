@@ -69,6 +69,8 @@ class WorkflowContext:
     paused: tuple[PausedTask, ...] = ()
     refinement_session_id: str | None = None
     pending_action: str = ""
+    planning_session_id: str | None = None
+    planning_wp_id: str | None = None
 
     def render(self) -> str:
         shown = self.paused[:_MAX_CONTEXT_TASKS]
@@ -162,6 +164,7 @@ ACTION_TITLES: dict[WorkflowAction, str] = {
     WorkflowAction.DISCARD_SPEC: "Discard the active OpenSpec draft",
     WorkflowAction.EXECUTE_COMMAND: "Run a workflow command",
     WorkflowAction.STOP_JOB: "Stop the job at {task}",
+    WorkflowAction.APPROVE_WP_PLAN: "Approve the plan and implement {task}",
 }
 
 
