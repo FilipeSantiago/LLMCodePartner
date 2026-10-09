@@ -7,7 +7,10 @@ import shlex
 from collections.abc import AsyncIterator
 from dataclasses import asdict, replace
 
+from agent.planning.models import ApprovedWPPlan
+from agent.planning.render import coder_context, reviewer_context
 from agent.routing.config import load_routing_config
+from conversation import presentation as ui
 from agent.routing.models import HALTED_JOB_STATUSES, ImplementationJob, ImplementationJobTask
 from agent.routing.persistence import RoutingPersistence
 from agent.routing.review import (ReviewDecision, ReviewError, ReviewFinding,
@@ -68,6 +71,62 @@ class ImplementationService:
                        or getattr(self.task_execution, "config", None)
                        or load_routing_config())
 
+    def _coder_line(self, model: str | None, fallbacks: tuple[str, ...] = ()) -> str:
+        """Which model routing picked for the coder."""
+        try:
+            label = model_identity(self.config, model).label if model else "unknown"
+        except ReviewError:
+            label = model or "unknown"
+        return ui.block(f"_coder: {label}"
+                        + (f" (fallbacks: {', '.join(fallbacks)})" if fallbacks else "") + "_")
+
+    async def _approved_plan(self, job_id: str) -> ApprovedWPPlan | None:
+        """The approved WP plan this job executes, if it came from the planner."""
+        lookup = getattr(self.persistence, "job_plan_id", None)
+        plan_id = await lookup(job_id) if lookup else None
+        value = await self.persistence.approved_plan(plan_id) if plan_id else None
+        return ApprovedWPPlan.from_dict(value) if value else None
+
+    async def _record_plan_events(self, plan: ApprovedWPPlan, item: ImplementationJobTask,
+                                  task_id: str, report: str, failure: str | None,
+                                  contract_revision: int, retried: bool) -> None:
+        """Enrich the reviewer context with what actually happened for this task."""
+        events: list[tuple[str, str, object]] = []
+        handoff = _handoff(report)
+        if failure:
+            events.append(("failure", failure[:500], None))
+        if handoff.get("summary"):
+            events.append(("decisions", str(handoff["summary"])[:1000], None))
+        changed = [entry.get("path") for entry in handoff.get("changed_files") or []
+                   if isinstance(entry, dict) and isinstance(entry.get("path"), str)]
+        if changed:
+            events.append(("changed_files", ", ".join(changed), changed))
+            context = plan.tasks.get(task_id)
+            planned = {*plan.shared.relevant_files,
+                       *(context.relevant_files if context else ())}
+            outside = [path for path in changed if path not in planned]
+            if outside:
+                events.append(("deviations", "changed files not named in the plan: "
+                               + ", ".join(outside), outside))
+        if handoff.get("execution_dispute"):
+            events.append(("deviations", "coder raised an execution dispute",
+                           handoff["execution_dispute"]))
+        gaps = [str(gap) for gap in handoff.get("remaining_gaps") or [] if str(gap).strip()]
+        if gaps:
+            events.append(("unresolved", "; ".join(gaps)[:1000], gaps))
+        evidence = await self.persistence.verification_evidence(item.job_id, item.position)
+        if evidence:
+            failed = sum(1 for entry in evidence if not entry.get("success"))
+            events.append(("tests", f"{len(evidence)} captured executions, {failed} failed",
+                           [{"tool": entry.get("tool"), "success": entry.get("success")}
+                            for entry in evidence]))
+        if contract_revision > 1 or retried:
+            events.append(("retries", f"contract revision {contract_revision}"
+                           + ("; retried after an interrupted coder" if retried else ""), None))
+        for kind, summary, payload in events:
+            await self.persistence.record_reviewer_context_event(
+                plan.plan_id, item.job_id, item.position, task_id, kind, summary, payload)
+
     @staticmethod
     def _findings_json(findings: tuple[ReviewFinding, ...]) -> list[str]:
         if not findings:
@@ -83,11 +142,10 @@ class ImplementationService:
     @staticmethod
     def _resolution_options(task_id: str, verdict: str,
                             job_id: str | None = None) -> str:
-        suffix = f" for job {job_id}" if job_id else ""
-        status = ("The reviewer still reports blocking findings. "
-                  if verdict == "needs_work" else "The review is ready. ")
-        return "\n".join((
-            f"{task_id}{suffix}: {status}Choose what to do next:",
+        suffix = f" (job {ui.short_job(job_id)})" if job_id else ""
+        status = ("The reviewer still reports blocking findings."
+                  if verdict == "needs_work" else "The review is ready.")
+        return ui.block(f"{task_id}{suffix}: {status}") + ui.menu((
             "1. Reply `accept` to keep the implementation and continue.",
             "2. Reply `undo` to restore only this task's changes and stop the job.",
             "3. Reply `submit to coder again: <additional prompt>` to keep the current "
@@ -97,30 +155,23 @@ class ImplementationService:
     @staticmethod
     def _decision_text(task_id: str, verdict: str, decision: ReviewDecision,
                        review: CompletionReview) -> str:
-        status = {"done": "Approved", "needs_work": "Needs work",
-                  "ask_user": "Needs your confirmation"}[verdict]
-        lines = [
-            f"{task_id} — {status}",
-            f"Coded by: {review.coder.label}",
-            f"Reviewed by: {review.reviewer.label}",
-            f"Reviewer decision: {decision.rationale}",
-        ]
-        if decision.inspected_paths:
-            lines.extend(["Artifacts reviewed:",
-                          *[f"- {path}" for path in decision.inspected_paths]])
-        lines.extend(["Evidence and limitations:",
-                      *[f"- {item}" for item in decision.evidence]])
+        state = ui.status("approved" if verdict == "done" else verdict)
         implementation = tuple(finding for finding in decision.findings
                                if finding.kind == "implementation")
         verification = tuple(finding for finding in decision.findings
                              if finding.kind == "verification")
-        if implementation:
-            lines.extend(["Implementation findings:",
-                          *ImplementationService._findings_json(implementation)])
-        if verification:
-            lines.extend(["Verification incomplete:",
-                          *ImplementationService._findings_json(verification)])
-        return "\n".join(lines)
+        return "".join((
+            ui.heading("🔍", f"Review · {task_id} — {state}",
+                       f"coder: {review.coder.label} → reviewer: {review.reviewer.label}"),
+            ui.paragraph("Why", decision.rationale),
+            ui.validation_table(decision.validation_results),
+            ui.paragraph("Inspected", ui.paths(decision.inspected_paths)),
+            ui.section("Evidence and limitations", decision.evidence),
+            (ui.block("**Implementation findings**") + ui.findings_list(implementation)
+             if implementation else ""),
+            (ui.block("**Verification incomplete**") + ui.findings_list(verification)
+             if verification else ""),
+        ))
 
     @staticmethod
     def _revision_context(task_id: str, findings: tuple[ReviewFinding, ...]) -> str:
@@ -249,8 +300,12 @@ class ImplementationService:
         except ReviewError:
             coder_label = coder_model or "unknown"
         task_id = item.task_id if item else f"position {position}"
-        return (f"{task_id} — Coding failed\nCoded by: {coder_label}\n"
-                f"Reviewer: not run\nReason: {error}\nImplementation job {job_id} stopped.")
+        return "".join((
+            ui.heading("⛔", f"{task_id} — Coding failed",
+                       f"coder: {coder_label} · reviewer: not run"),
+            ui.quote(f"Reason: {error}"),
+            ui.block(f"Implementation job {ui.short_job(job_id)} stopped."),
+        ))
 
     async def _coder_failed(self, job_id: str, position: int, error: str) -> str:
         """Record a coder failure; recoverable ones wait for the user instead of stopping."""
@@ -266,16 +321,17 @@ class ImplementationService:
         except ReviewError:
             coder_label = coder_model or "unknown"
         task_id = item.task_id if item else f"position {position}"
-        return "\n".join((
-            f"{task_id} — Coding interrupted",
-            f"Coded by: {coder_label}",
-            "Reviewer: not run (the coder did not finish)",
-            f"Reason: {error}",
-            "Files written before the interruption are still in the project.",
-            f"{task_id} for job {job_id}: Choose what to do next:",
-            "1. Reply `try coder again` (optionally `try coder again: <guidance>`) to continue "
-            "this task on a different model, keeping the current files.",
-            "2. Reply `undo` to restore only this task's changes and stop the job.",
+        return "".join((
+            ui.heading("⏸", f"{task_id} — Coding interrupted",
+                       f"coder: {coder_label} · reviewer: not run (the coder did not finish)"),
+            ui.quote(f"Reason: {error}"),
+            ui.block("Files written before the interruption are still in the project."),
+            ui.block(f"{task_id} (job {ui.short_job(job_id)}): choose what to do next."),
+            ui.menu((
+                "1. Reply `try coder again` (optionally `try coder again: <guidance>`) to "
+                "continue this task on a different model, keeping the current files.",
+                "2. Reply `undo` to restore only this task's changes and stop the job.",
+            )),
         ))
 
     def _pending_options(self, item: ImplementationJobTask, latest: dict | None,
@@ -304,10 +360,9 @@ class ImplementationService:
 
     async def start(self, job: ImplementationJob, messages: list[dict],
                     specs: list[ToolSpec], direct_tool_handlers: dict | None = None) -> AsyncIterator[Event]:
-        yield TextEvent(
-            f"Implementation job {job.job_id} queued {len(job.task_ids)} task(s): "
-            f"{', '.join(job.task_ids)}."
-        )
+        yield TextEvent(ui.block(
+            f"**Job {ui.short_job(job.job_id)}** queued {len(job.task_ids)} task(s): "
+            f"{', '.join(job.task_ids)}"))
         async for event in self._advance(
                 job.job_id, messages, specs, job.instruction, direct_tool_handlers or {}):
             yield event
@@ -337,8 +392,10 @@ class ImplementationService:
         if paused:
             return
         if await self._halted(job_id):
-            yield TextEvent(f"Job {job_id} was stopped; {run.metadata.get('implementation_task_id') or 'the task'} "
-                            "was not reviewed and no further tasks will run.")
+            yield TextEvent(ui.block(
+                f"⏹ Job {ui.short_job(job_id)} was stopped; "
+                f"{run.metadata.get('implementation_task_id') or 'the task'} "
+                "was not reviewed and no further tasks will run."))
             if terminal is not None:
                 yield terminal
             return
@@ -372,12 +429,13 @@ class ImplementationService:
                        instruction: str = "", direct_tool_handlers: dict | None = None
                        ) -> AsyncIterator[Event]:
         if await self._halted(job_id):
-            yield TextEvent(f"Job {job_id} was stopped; no further tasks will run.")
+            yield TextEvent(ui.block(f"⏹ Job {ui.short_job(job_id)} was stopped; "
+                                     "no further tasks will run."))
             return
         item = await self.persistence.next_implementation_task(job_id)
         if item is None:
             await self.persistence.finish_implementation_job(job_id)
-            yield TextEvent(f"Implementation job {job_id} completed.")
+            yield TextEvent(ui.heading("✅", f"Job {ui.short_job(job_id)} completed"))
             return
         async for event in self._run_item(item, messages, specs, instruction,
                                           direct_tool_handlers or {}):
@@ -388,19 +446,27 @@ class ImplementationService:
                         direct_tool_handlers: dict,
                         exclude_models: frozenset[str] = frozenset()) -> AsyncIterator[Event]:
         change, task = await self.artifacts.task_by_id(item.task_id)
+        plan = await self._approved_plan(item.job_id)
         contract = await self.contract_persistence.latest(item.job_id, item.position)
         if contract is None:
-            contract = self.contractor.initial_contract(task, specs, instruction)
+            contract = self.contractor.initial_contract(
+                task, specs, instruction,
+                task_context=plan.tasks.get(task.id) if plan else None)
             await self.contract_persistence.save(item.job_id, item.position, contract)
         await self.persistence.update_implementation_task(item.job_id, item.position, "running")
-        yield TextEvent(f"Starting {task.id} ({task.complexity}) from {change.id}.")
+        yield TextEvent(ui.heading(
+            "🛠", f"{task.id} · {task.title}",
+            f"task complexity {task.complexity} · {change.id} · contract r{contract.revision}"))
         failure: str | None = None
         paused = False
         report_parts: list[str] = []
         decision_id: str | None = None
+        routed = None
+        announced = False
         async def record_decision(decision) -> None:
-            nonlocal decision_id
+            nonlocal decision_id, routed
             decision_id = decision.decision_id
+            routed = decision
             await self.persistence.update_implementation_task(
                 item.job_id, item.position, "running", decision_id=decision_id
             )
@@ -418,7 +484,12 @@ class ImplementationService:
                     "implementation_job_id": item.job_id,
                     "implementation_position": item.position,
                     "implementation_task_id": task.id,
-                }):
+                    **({"plan_id": plan.plan_id} if plan else {}),
+                }, **({"plan_context": coder_context(plan, task.id)} if plan else {})):
+            if routed is not None and not announced:
+                announced = True
+                yield TextEvent(self._coder_line(
+                    routed.recommended_model, tuple(routed.fallback_models)))
             if isinstance(event, TextEvent):
                 report_parts.append(event.text)
             if isinstance(event, ToolCallEvent):
@@ -436,16 +507,23 @@ class ImplementationService:
             if isinstance(event, ErrorEvent):
                 failure = event.message
             if isinstance(event, TextEvent):
-                yield TextEvent("Coder output (untrusted claim):\n" + event.text)
+                # Coder notes are shown quoted; the JSON handoff is summarized below.
+                prose = _without_handoff(event.text)
+                if prose.strip():
+                    yield TextEvent(ui.quote(prose))
             elif not isinstance(event, DoneEvent):
                 yield event
         report = "".join(report_parts)
         await self.persistence.save_coder_report(item.job_id, item.position, report)
         if paused:
             return
+        yield TextEvent(ui.coder_handoff(_handoff(report)))
+        if plan is not None:
+            await self._record_plan_events(plan, item, task.id, report, failure,
+                                           contract.revision, bool(exclude_models))
         if await self._halted(item.job_id):
-            yield TextEvent(f"Job {item.job_id} was stopped; {task.id} was not reviewed "
-                            "and no further tasks will run.")
+            yield TextEvent(ui.block(f"⏹ Job {ui.short_job(item.job_id)} was stopped; "
+                                     f"{task.id} was not reviewed and no further tasks will run."))
             return
         if failure:
             yield TextEvent(await self._coder_failed(item.job_id, item.position, failure))
@@ -477,8 +555,8 @@ class ImplementationService:
         await self.persistence.update_implementation_task(job_id, position, "implemented")
         rows = await self._package_rows(job_id, package.id)
         if any(row.status == "queued" for row in rows):
-            yield TextEvent(
-                f"{item.task_id} implemented; deferring review until {package.id} is assembled.")
+            yield TextEvent(ui.block(
+                f"⏳ {item.task_id} implemented; review deferred until {package.id} is assembled."))
             async for event in self._advance(
                     job_id, messages, specs, instruction, direct_tool_handlers):
                 yield event
@@ -556,7 +634,7 @@ class ImplementationService:
         if not wp_boundary:
             task = original_task
             package_rows = [item]
-            yield TextEvent(f"Reviewing explicitly selected task {task.id}.")
+            yield TextEvent(ui.block(f"🔍 _Reviewing {task.id}…_"))
         else:
             package_rows = await self._package_rows(job_id, package.id)
             reports = [await self.persistence.coder_report_for(job_id, row.position)
@@ -588,10 +666,10 @@ class ImplementationService:
                 f"Task {row.task_id} coder handoff:\n{task_report}"
                 for row, task_report in zip(package_rows, reports)
             )
-        yield TextEvent(f"Reviewing completed work package {package.id}.")
         if wp_boundary:
-            yield TextEvent(
-                f"Validating {package.id} using its required/preferred/optional contract.")
+            yield TextEvent(ui.block(
+                f"🔍 _Reviewing work package {package.id} against its "
+                "required/preferred/optional contract…_"))
         coder_model = coder_model or await self.persistence.actual_model_for(item.decision_id)
         try:
             if not coder_model:
@@ -606,17 +684,16 @@ class ImplementationService:
                 details = "; ".join(
                     str(issue.get("path") or issue.get("tool") or issue["action"])
                     for issue in integrity_issues)
-                yield TextEvent("\n".join((
-                    f"{task.id} — Recovery required",
-                    "Reviewer: not run",
-                    "A mutation was applied without a complete verified journal, so safe undo "
-                    "and independent review cannot be guaranteed.",
-                    f"Journal evidence: {details}.",
-                    "Reply `inspect recovery` for the mutation audit, "
-                    "`establish new baseline: <prompt>` to explicitly accept the current "
-                    "project state as the new undo baseline and rerun the coder/reviewer "
-                    "cycle, or `stop and repair manually` to end this job. "
-                    "`retry review` is unavailable.",
+                yield TextEvent("".join((
+                    ui.heading("⛔", f"{task.id} — Recovery required", "reviewer: not run"),
+                    ui.block("A mutation was applied without a complete verified journal, so "
+                             "safe undo and independent review cannot be guaranteed."),
+                    ui.quote(f"Journal evidence: {details}."),
+                    ui.block("Reply `inspect recovery` for the mutation audit, "
+                             "`establish new baseline: <prompt>` to explicitly accept the "
+                             "current project state as the new undo baseline and rerun the "
+                             "coder/reviewer cycle, or `stop and repair manually` to end this "
+                             "job. `retry review` is unavailable."),
                 )))
                 return
             journal_manifest = await journal.review_manifest()
@@ -666,6 +743,18 @@ class ImplementationService:
             # Keep authoritative metadata out of task text: OpenSpec context is
             # untrusted and can mention files, but cannot fabricate journal records.
             object.__setattr__(review_task, "_review_journal_manifest", journal_manifest)
+            plan = await self._approved_plan(job_id)
+            if plan is not None:
+                reviewed = None if wp_boundary else [item.task_id]
+                events = await self.persistence.reviewer_context_events(plan.plan_id, job_id)
+                planned_files = [*plan.reviewer.relevant_files, *plan.shared.relevant_files,
+                                 *(path for task_id, context in plan.tasks.items()
+                                   if reviewed is None or task_id in reviewed
+                                   for path in context.relevant_files)]
+                object.__setattr__(review_task, "_planner_review_context",
+                                   reviewer_context(plan, events, reviewed))
+                object.__setattr__(review_task, "_planner_relevant_files",
+                                   tuple(dict.fromkeys(planned_files)))
             decision = await self.reviewer.review(
                 change, review_task, report, coder_model, specs, direct_tool_handlers)
             review = CompletionReview(
@@ -716,13 +805,14 @@ class ImplementationService:
                     ),
                     completed=False,
                 )
-            heading = (f"{package.id} — UNVERIFIED" if wp_boundary
-                       else f"{task.id} — Review pending")
-            lines = [heading, f"Coded by: {coder_label}",
-                     f"Reviewer: {reviewer_status}", f"Reason: {exc}."]
+            title = (f"{package.id} — UNVERIFIED" if wp_boundary
+                     else f"{task.id} — Review pending")
+            lines = [ui.heading("⚠️", title,
+                                f"coder: {coder_label} · reviewer: {reviewer_status}"),
+                     ui.quote(f"Reason: {exc}.")]
             if exc.findings:
-                lines.extend(["Verification incomplete:",
-                              *self._findings_json(exc.findings)])
+                lines.extend([ui.block("**Verification incomplete**"),
+                              ui.findings_list(exc.findings)])
             owners = {finding.owner for finding in exc.findings}
             test_evidence = (await self.persistence.verification_evidence(job_id, position)
                              if wp_boundary and _requires_test_run(package) else None)
@@ -742,7 +832,7 @@ class ImplementationService:
                 lines.append(
                     "The reviewer exhausted the safe evidence available to this request. "
                     "Retry only after the reported condition or project evidence has changed.")
-            yield TextEvent("\n".join(lines))
+            yield TextEvent("".join(ui.block(line) for line in lines if line))
             return
         verdict = ("ask_user" if task.preferred_capability.lower() in {"research", "verification", "review"}
                    and decision.verdict == "done" else decision.verdict)
@@ -756,12 +846,14 @@ class ImplementationService:
                         "findings_schema_version": 1,
                         "findings": [finding.as_dict() for finding in decision.findings],
                         "unresolved_references": list(decision.unresolved_references),
+                        "reviewer_routing_reason": decision.routing_reason,
+                        "reviewer_gateway_used": decision.gateway_used,
                     })
                 await self.persistence.update_implementation_task(
                     job_id, position, "awaiting_user_decision")
                 yield TextEvent(self._decision_text(task.id, verdict, decision, review))
                 question = decision.question or f"Do you consider {task.id} complete?"
-                yield TextEvent(f"Reviewer question: {question}")
+                yield TextEvent(ui.block(f"❓ **Reviewer question:** {question}"))
                 yield TextEvent(self._resolution_options(task.id, verdict, job_id))
                 return
             await self.persistence.record_review(
@@ -771,6 +863,8 @@ class ImplementationService:
                     "findings_schema_version": 1,
                     "findings": [finding.as_dict() for finding in decision.findings],
                     "unresolved_references": list(decision.unresolved_references),
+                    "reviewer_routing_reason": decision.routing_reason,
+                    "reviewer_gateway_used": decision.gateway_used,
                 })
             await self.persistence.update_implementation_task(
                 job_id, position, "review_pending", error=decision.rationale)
@@ -785,10 +879,13 @@ class ImplementationService:
                 ),
                 completed=False,
             )
-            yield TextEvent(
-                f"{package.id} — UNVERIFIED. The reviewer could not obtain enough evidence. "
-                "This is a review/validation problem, not an implementation failure. "
-                "Use `retry review` after the evidence or infrastructure condition changes.")
+            yield TextEvent("".join((
+                ui.heading("⚠️", f"{package.id} — UNVERIFIED",
+                           "the reviewer could not obtain enough evidence"),
+                ui.block("This is a review/validation problem, not an implementation failure. "
+                         "Use `retry review` after the evidence or infrastructure condition "
+                         "changes."),
+            )))
             return
         await self.persistence.record_review(
             job_id, position, coder_model, decision.reviewer_model,
@@ -801,6 +898,8 @@ class ImplementationService:
                 "findings_schema_version": 1,
                 "findings": [finding.as_dict() for finding in decision.findings],
                 "unresolved_references": list(decision.unresolved_references),
+                "reviewer_routing_reason": decision.routing_reason,
+                "reviewer_gateway_used": decision.gateway_used,
             })
         log.info("implementation_review job_id=%s task_id=%s coder_model=%s "
                  "reviewer_model=%s verdict=%s", job_id, task.id, coder_model,
@@ -830,7 +929,7 @@ class ImplementationService:
                 yield TextEvent(self._resolution_options(task.id, verdict, job_id))
                 return
             attempts, budget = await self.persistence.revision_state(job_id, position)
-            yield TextEvent(f"Revising {task.id}: attempt {attempts}/{budget}.")
+            yield TextEvent(ui.block(f"🔁 Revising {task.id}: attempt {attempts}/{budget}."))
             revised_instruction = "\n".join(filter(None, [
                 instruction, self._revision_context(task.id, implementation_findings)
             ]))
@@ -856,7 +955,8 @@ class ImplementationService:
         for row in package_rows:
             await self.persistence.update_implementation_task(
                 job_id, row.position, "completed")
-        yield TextEvent(f"{package.id} — PASS. The completed WP satisfies its OpenSpec contract.")
+        yield TextEvent(ui.block(f"✅ **{package.id} — PASS.** The completed WP satisfies its "
+                                 "OpenSpec contract."))
         async for event in self._advance(
                 job_id, messages, specs, instruction, direct_tool_handlers):
             yield event
@@ -883,12 +983,12 @@ class ImplementationService:
                 reason=latest["rationale"], evidence=[],
             ))
             await self._complete(job_id, position, item.task_id, review)
-            yield TextEvent(f"{item.task_id} confirmed complete.")
+            yield TextEvent(ui.block(f"{item.task_id} confirmed complete."))
             async for event in self._advance(job_id, messages, specs, instruction,
                                              direct_tool_handlers or {}):
                 yield event
         else:
-            yield TextEvent(f"Continuing {item.task_id} with your feedback.")
+            yield TextEvent(ui.block(f"Continuing {item.task_id} with your feedback."))
             revised_instruction = "\n".join(filter(None, [instruction, feedback]))
             async for event in self._run_item(
                     item, messages, specs, revised_instruction, direct_tool_handlers or {}):
@@ -913,8 +1013,8 @@ class ImplementationService:
         dispatcher = next((name for name in handlers
                            if name.rsplit("__", 1)[-1] == "execute_tool"), None)
         if dispatcher is None:
-            yield TextEvent("The required tests have no passing run, and this IDE exposes no "
-                            "`execute_tool` for CodePartner to run them.")
+            yield TextEvent(ui.block("The required tests have no passing run, and this IDE exposes no "
+                            "`execute_tool` for CodePartner to run them."))
             return
         command = next((found for item in reversed(evidence)
                         if (found := shell_test_command(
@@ -927,12 +1027,12 @@ class ImplementationService:
                 test_paths.extend(path for path in await row_journal.changed_paths()
                                   if _is_test_path(path) and path not in test_paths)
             if not test_paths:
-                yield TextEvent("The required tests have no passing run, and no test command "
-                                "or changed test file was found to run.")
+                yield TextEvent(ui.block("The required tests have no passing run, and no test command "
+                                "or changed test file was found to run."))
                 return
             command = "pytest " + " ".join(shlex.quote(path) for path in test_paths)
         command = await self._project_test_command(journal, command)
-        yield TextEvent(f"Running the required tests through CodePartner: `{command}`")
+        yield TextEvent(ui.block(f"Running the required tests through CodePartner: `{command}`"))
         try:
             await handlers[dispatcher]({"command": command})
         except Exception as exc:
@@ -1032,7 +1132,7 @@ class ImplementationService:
                 "guidance": guidance, "scope_decision": scope_decision,
                 "contract_id": revised.contract_id,
             })
-        yield TextEvent(f"TaskContract revision {revised.revision} confirmed for {item.task_id}.")
+        yield TextEvent(ui.block(f"TaskContract revision {revised.revision} confirmed for {item.task_id}."))
         async for event in self._run_item(
                 item, messages, specs, "\n".join(filter(None, (instruction, guidance))),
                 direct_tool_handlers):
@@ -1046,8 +1146,8 @@ class ImplementationService:
             return
         await self.persistence.update_implementation_task(job_id, position, "stopped")
         await self.persistence.finish_implementation_job(job_id, "stopped")
-        yield TextEvent(f"Stopped job {job_id} at {item.task_id}. Files were left as they "
-                        "are; nothing was rolled back.")
+        yield TextEvent(ui.block(f"Stopped job {job_id} at {item.task_id}. Files were left as they "
+                        "are; nothing was rolled back."))
 
     @staticmethod
     def _stored_findings(latest: dict | None) -> tuple[ReviewFinding, ...]:
@@ -1101,9 +1201,9 @@ class ImplementationService:
                 "guidance": guidance.strip(),
                 "reviewer_model": latest["reviewer_model"],
             })
-        yield TextEvent(
+        yield TextEvent(ui.block(
             f"Submitting {item.task_id} to the coder again with a fresh "
-            f"{REVISION_BUDGET}-revision review cycle.")
+            f"{REVISION_BUDGET}-revision review cycle."))
         revised_instruction = "\n".join(filter(None, [
             instruction, guidance, self._revision_context(item.task_id, findings),
         ]))
@@ -1125,9 +1225,9 @@ class ImplementationService:
                 "failed_model": failed_model, "error": item.error,
                 "guidance": guidance.strip(),
             })
-        yield TextEvent(
+        yield TextEvent(ui.block(
             f"Continuing {item.task_id} on a different model than "
-            f"{failed_model or 'the interrupted coder'}; files written so far are kept.")
+            f"{failed_model or 'the interrupted coder'}; files written so far are kept."))
         revised_instruction = "\n".join(filter(None, [
             instruction, guidance.strip(),
             "A previous coder attempt on this task was interrupted before finishing "
@@ -1155,10 +1255,10 @@ class ImplementationService:
                 job_id, position, REVISION_BUDGET, guidance.strip()):
             yield ErrorEvent("This task is no longer awaiting journal recovery.")
             return
-        yield TextEvent(
+        yield TextEvent(ui.block(
             f"Established the current project state as the new undo baseline for "
             f"{item.task_id}. Prior uncertain mutations cannot be undone automatically. "
-            f"Starting a fresh coder/reviewer cycle.")
+            f"Starting a fresh coder/reviewer cycle."))
         recovery_instruction = "\n".join(filter(None, [
             instruction,
             guidance.strip(),
@@ -1199,7 +1299,7 @@ class ImplementationService:
                 f"- {issue['action']}: "
                 f"{issue.get('path') or issue.get('tool') or issue.get('error') or 'unknown'}"
                 for issue in issues)
-        yield TextEvent("\n".join(lines))
+        yield TextEvent(ui.block("\n".join(lines)))
 
     async def stop_recovery(self, job_id: str, position: int) -> AsyncIterator[Event]:
         item = await self.persistence.implementation_task(job_id, position)
@@ -1209,9 +1309,9 @@ class ImplementationService:
         if not await self.persistence.stop_recovery(job_id, position):
             yield ErrorEvent("This task is no longer awaiting journal recovery.")
             return
-        yield TextEvent(
+        yield TextEvent(ui.block(
             f"Stopped implementation job {job_id} at {item.task_id}. No automatic undo "
-            "was attempted; inspect and repair the current project state manually.")
+            "was attempted; inspect and repair the current project state manually."))
 
     async def accept_anyway(self, job_id: str, position: int,
                             messages: list[dict], specs: list[ToolSpec],
@@ -1260,7 +1360,7 @@ class ImplementationService:
         message = (f"{item.task_id} accepted by user override. "
                    "The reviewer verdict remains needs_work."
                    if override else f"{item.task_id} accepted after review.")
-        yield TextEvent(message)
+        yield TextEvent(ui.block(message))
         async for event in self._advance(
                 job_id, messages, specs, instruction, direct_tool_handlers):
             yield event
@@ -1293,10 +1393,10 @@ class ImplementationService:
                         "restored_paths": restored_paths,
                         "conflict_paths": conflicts,
                     })
-                yield TextEvent(
+                yield TextEvent(ui.block(
                     "Undo stopped to protect files changed after the coder run. "
                     f"Conflicts: {', '.join(conflicts)}. "
-                    "Already restored: " + (", ".join(restored_paths) or "none") + ".")
+                    "Already restored: " + (", ".join(restored_paths) or "none") + "."))
                 yield TextEvent(self._pending_options(item, latest, job_id))
                 return
             await self.persistence.record_resolution_action(
@@ -1306,9 +1406,9 @@ class ImplementationService:
             await self.persistence.update_implementation_task(
                 job_id, position, "undone", error=None)
             await self.persistence.finish_implementation_job(job_id, "undone")
-            yield TextEvent(
+            yield TextEvent(ui.block(
                 f"{item.task_id} code undo completed for {len(restored_paths)} file(s). "
-                "The task remains incomplete and the job stopped.")
+                "The task remains incomplete and the job stopped."))
             return
         report = await self.persistence.coder_report_for(job_id, position)
         findings = self._stored_findings(latest)
@@ -1329,7 +1429,7 @@ class ImplementationService:
             f"Reviewer artifact paths: {json.dumps(claimed_paths)}",
             f"Saved coder report:\n{report}",
         ])
-        yield TextEvent(f"Undoing code for {item.task_id} with a routed coder recovery run.")
+        yield TextEvent(ui.block(f"Undoing code for {item.task_id} with a routed coder recovery run."))
         failure: str | None = None
         paused = False
         decision_id: str | None = None
@@ -1371,8 +1471,8 @@ class ImplementationService:
                 job_id, position, waiting_status, error=failure)
             await self.persistence.record_resolution_action(
                 job_id, position, "undo_failed", {"error": failure})
-            yield TextEvent(f"Undo failed for {item.task_id}: {failure}\n"
-                            + self._pending_options(item, latest, job_id))
+            yield TextEvent(ui.block(f"Undo failed for {item.task_id}: {failure}\n"
+                            + self._pending_options(item, latest, job_id)))
             return
         async for event in self._complete_undo(job_id, position):
             yield event
@@ -1387,8 +1487,8 @@ class ImplementationService:
         await self.persistence.update_implementation_task(
             job_id, position, "undone", error=None)
         await self.persistence.finish_implementation_job(job_id, "undone")
-        yield TextEvent(
-            f"{item.task_id} code undo completed. The task remains incomplete and the job stopped.")
+        yield TextEvent(ui.block(
+            f"{item.task_id} code undo completed. The task remains incomplete and the job stopped."))
 
     async def _complete(self, job_id: str, position: int, task_id: str,
                         review: CompletionReview) -> None:
@@ -1398,3 +1498,44 @@ class ImplementationService:
     async def _fail(self, job_id: str, position: int, error: str) -> None:
         await self.persistence.update_implementation_task(job_id, position, "failed", error=error)
         await self.persistence.finish_implementation_job(job_id, "failed", error)
+
+
+def _handoff(report: str) -> dict:
+    """The coder's final JSON handoff (last object with a summary), or {}."""
+    decoder = json.JSONDecoder()
+    found: dict = {}
+    for index, char in enumerate(report):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(report[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and "summary" in value:
+            found = value
+    return found
+
+
+
+def _without_handoff(text: str) -> str:
+    """Coder prose with any JSON handoff object removed (the report keeps it verbatim)."""
+    decoder = json.JSONDecoder()
+    index = 0
+    kept = []
+    while index < len(text):
+        start = text.find("{", index)
+        if start < 0:
+            kept.append(text[index:])
+            break
+        try:
+            value, end = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            kept.append(text[index:start + 1])
+            index = start + 1
+            continue
+        kept.append(text[index:start])
+        if not (isinstance(value, dict) and "summary" in value):
+            kept.append(text[start:start + end])
+        index = start + end
+    prose = "".join(kept)
+    return re.sub(r"```(?:json)?\s*```", "", prose).strip()

@@ -110,12 +110,15 @@ class TaskContractor:
         return None
 
     def initial_contract(self, task: Task, specs: list[ToolSpec],
-                         instruction: str = "") -> TaskContract:
+                         instruction: str = "", task_context=None) -> TaskContract:
+        """`task_context` is an approved planner `TaskContext` for this task, if any."""
         policy = policy_for(task.complexity)
         text = "\n".join((task.title, task.description, task.context, instruction))
+        planned_paths = tuple(task_context.relevant_files) if task_context else ()
         paths = tuple(dict.fromkeys(
-            path for path in _PATH.findall(text) if self._safe_path(path)))
-        symbols = tuple(dict.fromkeys(_SYMBOL.findall(text)))
+            path for path in (*_PATH.findall(text), *planned_paths) if self._safe_path(path)))
+        symbols = tuple(dict.fromkeys((*_SYMBOL.findall(text),
+                                       *(task_context.symbols if task_context else ()))))
         criteria = task.acceptance_criteria or [task.description]
         capability = (task.preferred_capability or "").strip().lower()
         read_only = capability in DISCOVERY_CAPABILITIES
@@ -139,6 +142,7 @@ class TaskContractor:
                 + ". They are not boundaries; search and read the repository as needed.",
                 "tasker.discovery", paths)
             if read_only and paths else None,
+            *self._planner_facts(task_context),
         )))
         return TaskContract.create(
             task_id=task.id, planning_revision=task.planning_revision,
@@ -157,6 +161,27 @@ class TaskContractor:
             ),
             read_only=read_only,
         )
+
+    @staticmethod
+    def _planner_facts(task_context) -> tuple[ContextFact, ...]:
+        if task_context is None:
+            return ()
+        facts = []
+        if task_context.approach:
+            facts.append(ContextFact(task_context.approach, "planner.approach",
+                                     tuple(task_context.relevant_files)))
+        facts.extend(ContextFact(item, "planner.existing_implementation")
+                     for item in task_context.existing_implementation)
+        facts.extend(ContextFact(item, "planner.constraint") for item in task_context.constraints)
+        if task_context.do_not_modify:
+            # Advisory, not an exclusion: excluded files cannot even be read.
+            facts.append(ContextFact(
+                "Do not modify: " + ", ".join(task_context.do_not_modify), "planner.do_not_modify",
+                attributes={"do_not_modify": list(task_context.do_not_modify)}))
+        facts.extend(ContextFact(finding.statement, f"planner.finding.{finding.id}",
+                                 tuple(item["path"] for item in finding.evidence))
+                     for finding in task_context.findings)
+        return tuple(facts)
 
     def revise_after_coder(self, contract: TaskContract, result: CoderResult,
                            specs: list[ToolSpec],

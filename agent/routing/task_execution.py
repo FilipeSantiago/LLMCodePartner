@@ -36,6 +36,7 @@ class TaskExecutionService:
                       direct_tool_handlers: dict | None = None,
                       exclude_models: frozenset[str] = frozenset(),
                       contract=None, owner_metadata: dict | None = None,
+                      plan_context: str = "",
                       ) -> AsyncIterator[Event]:
         # The active project belongs to the IDE request that advertised `specs`.
         # Never route through a process-wide IDE/project setting.
@@ -46,13 +47,14 @@ class TaskExecutionService:
             await on_decision(decision)
         async for event in self._run(
                 task, decision, self._execution_messages(task, messages, execution_instruction,
-                                                         contract),
+                                                         contract, plan_context),
                 specs, direct_tool_handlers or {}, owner_metadata or {}):
             yield event
 
     @staticmethod
     def _execution_messages(task: Task, messages: list[dict],
-                            execution_instruction: str = "", contract=None) -> list[dict]:
+                            execution_instruction: str = "", contract=None,
+                            plan_context: str = "") -> list[dict]:
         """Replace the transport command with the actual OpenSpec task objective."""
         task_prompt = "\n".join(filter(None, [
             f"Implement OpenSpec task {task.id}: {task.title}",
@@ -66,10 +68,19 @@ class TaskExecutionService:
              f"Expected files: {', '.join(contract.primary_files) or 'none named'}. "
              "These are guidance, not a file allowlist."
              if contract is not None else ""),
-            "Use the IDE MCP tools as needed to complete the task's actual objective.",
-            ("Use codepartner_read_file for 100-line windows and codepartner_search_in_file "
-             "to locate text within one file. Repository searches return locations; request "
-             "only the source windows you need. Tool results include observation IDs that "
+            plan_context,
+            ("A planner already investigated this work package; the approved plan context "
+             "above is your starting point. Verify the listed files and symbols with targeted "
+             "reads first, then implement. Search the repository more broadly only if that "
+             "context proves wrong or insufficient, and report any such deviation from the "
+             "plan in remaining_gaps (or execution_dispute when it concerns execution). "
+             "Respect the do-not-modify areas."
+             if plan_context else
+             "Use the IDE MCP tools as needed to complete the task's actual objective."),
+            ("Use codepartner_read_file for full-file reads by path, or pass explicit "
+             "line ranges for smaller reads. Repeated reads use a run-local cache; pass "
+             "refresh=true when you need a fresh IDE read. Use codepartner_search_in_file "
+             "to locate text within one file. Tool results include observation IDs that "
              "codepartner_get_observation can expand when diagnostics require more detail."
              if os.getenv("CODEPARTNER_ACI_ENABLED", "true").lower() != "false"
              else "Use the advertised IDE file tools to inspect relevant source."),

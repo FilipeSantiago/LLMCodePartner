@@ -120,10 +120,16 @@ class _World:
         self.interpreter = WorkflowInterpreter(_NoModel(), "test-model")
         self.sessions = {}
 
+    # These tests exercise the direct start/switch mechanics; WP planning is
+    # covered in test_wp_planner and turned on there.
+    planning = False
+
     def workflow(self, session=None) -> WorkflowController:
-        return WorkflowController(self.persistence, self.contracts,
-                                  interpreter=self.interpreter,
-                                  project_id=getattr(session, "project_id", None))
+        workflow = WorkflowController(self.persistence, self.contracts,
+                                      interpreter=self.interpreter,
+                                      project_id=getattr(session, "project_id", None))
+        workflow._planning_available = self.planning
+        return workflow
 
     def join(self, conversation: str, project: str | None = PROJECT):
         self.sessions[conversation] = SimpleNamespace(
@@ -208,6 +214,13 @@ class _WorldTest(unittest.IsolatedAsyncioTestCase):
 # --- turn detection --------------------------------------------------------------------
 
 class TurnDetectionTests(_WorldTest):
+    async def test_reset_command_is_proposed_before_execution(self):
+        answer = await self.world.say("/reset WP5")
+        self.assertIn("/reset WP5", answer)
+        self.assertIn("Clear their OpenSpec completion and review records", answer)
+        self.assertIn("Nothing has executed yet.", answer)
+        self.assertEqual(self.world.execution.started, [])
+
     async def test_fresh_message_after_bootstrap_history_is_not_a_continuation(self):
         """The logged failure: setup results in the history hid every later user turn."""
         dialog_controller.remember_bootstrap_call("boot-1", "conv")
