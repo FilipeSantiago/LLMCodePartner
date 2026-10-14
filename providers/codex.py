@@ -109,6 +109,8 @@ class CodexProvider(Provider):
                      reasoning_effort: str | None = None,
                      direct_tool_handlers: dict | None = None,
                      reviewer_mode: bool = False,
+                     preapprove_ide_tools: bool = False,
+                     kb_first=None,
                     **kwargs) -> AsyncIterator[Event]:
         """Stateful like Claude's, and for the same reason: the `codex` process stays
         alive across HTTP requests, blocked inside its MCP tool call, while JetBrains
@@ -129,13 +131,15 @@ class CodexProvider(Provider):
             async def strategy(run: Run, prompt: str, system: str | None,
                                 specs: list[ToolSpec]) -> str:
                 return await self._run_strategy(run, prompt, system, model, gateway_url,
-                                                concrete_model, reasoning_effort, reviewer_mode)
+                                                concrete_model, reasoning_effort, reviewer_mode,
+                                                preapprove_ide_tools)
 
             run = engine.start_run(prompt, system, specs, strategy=strategy,
                                    allowed=allowed_for(role),
                                    direct_tool_handlers=direct_tool_handlers,
                                    agent_tool_interface=role == ROLE_CODER)
             run.metadata.update(run_metadata or {})
+            run.kb_first = kb_first
 
         async for event in self._drain_queue(run):
             yield event
@@ -146,7 +150,8 @@ class CodexProvider(Provider):
                             model: str | None = None, gateway_url: str | None = None,
                             concrete_model: bool = False,
                             reasoning_effort: str | None = None,
-                            reviewer_mode: bool = False) -> str:
+                            reviewer_mode: bool = False,
+                            preapprove_ide_tools: bool = False) -> str:
         """The engine `Strategy`: publish this Run's bridged tools, run `codex exec`
         against them, and push its output onto the Run as neutral events. Returns the
         terminal reason. The MCP endpoint is opened and closed with the process, so a
@@ -154,7 +159,8 @@ class CodexProvider(Provider):
         async with mcp_http.serve_run(run) as url:
             args = self._base_args(model, gateway_url, concrete_model, reasoning_effort,
                                    reviewer_mode) + self._mcp_args(
-                                       url, run.registry.names(), reviewer_mode)
+                                       url, run.registry.names(), reviewer_mode,
+                                       preapprove_ide_tools)
             item_types: Counter[str] = Counter()
             reviewer_tool_activity: list[dict[str, str | bool]] = []
             async for obj in self._exec(args, self._join(prompt, system)):
@@ -185,16 +191,16 @@ class CodexProvider(Provider):
         return "endTurn"
 
     @staticmethod
-    def _mcp_args(url: str, tool_names: list[str], reviewer_mode: bool) -> list[str]:
+    def _mcp_args(url: str, tool_names: list[str], reviewer_mode: bool,
+                  preapprove_ide_tools: bool = False) -> list[str]:
         server = mcp_http.SERVER_NAME
         args = [
             "-c", f'mcp_servers.{server}.url="{url}"',
             "-c", f"mcp_servers.{server}.enabled_tools={json.dumps(tool_names)}",
         ]
-        if reviewer_mode:
-            # This endpoint is private to one Run and its registry already exposes
-            # only optimizer-approved read/search tools. Pre-approve those reads so
-            # noninteractive `codex exec` never tries to open an approval prompt.
+        if reviewer_mode or preapprove_ide_tools:
+            # Only the private, run-scoped, role-filtered IDE registry is approved.
+            # The bridge still validates every call and journals project writes.
             args += [
                 "-c", f'mcp_servers.{server}.default_tools_approval_mode="approve"',
             ]

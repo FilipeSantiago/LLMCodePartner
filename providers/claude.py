@@ -83,7 +83,8 @@ class ClaudeProvider(Provider):
                     model: str | None = None, role: str | None = None,
                     run_metadata: dict | None = None,
                     execution_env: dict[str, str] | None = None,
-                    direct_tool_handlers: dict | None = None, **kwargs) -> AsyncIterator[Event]:
+                    direct_tool_handlers: dict | None = None,
+                    kb_first=None, **kwargs) -> AsyncIterator[Event]:
         """Stateful, but the start-vs-resume decision is private: a history carrying
         tool results resolves the pending futures and continues the SAME background
         run; otherwise a fresh run is started. Either way, yields the same neutral
@@ -111,6 +112,7 @@ class ClaudeProvider(Provider):
                                    direct_tool_handlers=direct_tool_handlers,
                                    agent_tool_interface=role == ROLE_CODER)
             run.metadata.update(run_metadata or {})
+            run.kb_first = kb_first
 
         async for event in self._drain_queue(run):
             yield event

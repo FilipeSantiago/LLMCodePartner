@@ -13,7 +13,7 @@ from unittest import mock
 
 from agent.routing.config import RoutingConfig, RoutingConfigError, load_routing_config
 from agent.routing.executors.registry import ExecutorRegistry
-from agent.routing.implementation import ImplementationService
+from agent.routing.implementation import ImplementationService, handoff_blocker
 from agent.routing.models import ModelRef
 from agent.routing.persistence import RoutingPersistence
 from agent.routing.review import (ReviewDecision, ReviewError, ReviewFinding,
@@ -33,7 +33,7 @@ from agent.spec.command import (
     is_run_command,
 )
 from agent.spec.models import Task, OpenSpecChange
-from mcp_bridge.models import DoneEvent, ErrorEvent, Run, TextEvent
+from mcp_bridge.models import DoneEvent, ErrorEvent, MutationEvent, Run, TextEvent
 from mcp_bridge.registry import ToolSpec
 
 
@@ -198,6 +198,32 @@ class _SuccessfulExecutor:
 
 
 class ExecutionFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_claude_session_limit_skips_duplicate_direct_attempt(self):
+        calls = []
+
+        class LimitedClaude:
+            async def execute(self, _task, _model, context):
+                calls.append(("claude", context.use_gateway))
+                yield ErrorEvent("You've hit your session limit (API status 429)")
+                yield DoneEvent("failed")
+
+        class DirectCodex:
+            async def execute(self, _task, _model, context):
+                calls.append(("codex", context.use_gateway))
+                yield TextEvent("finished")
+                yield DoneEvent("endTurn")
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_routing_config()
+            service = TaskExecutionService(
+                config=config,
+                router=ModelRoutingService(config, Router("claude-haiku")),
+                persistence=RoutingPersistence(Path(directory) / "routing.sqlite3"),
+                executors=ExecutorRegistry({
+                    "claude-cli": LimitedClaude(), "codex-cli": DirectCodex()}))
+            [event async for event in service.execute(task("simple"), "CHG1", [], [])]
+        self.assertEqual(calls, [("claude", True), ("codex", False)])
+
     def test_execution_replaces_run_transport_command_with_task_content(self):
         messages = TaskExecutionService._execution_messages(
             task(), [{"role": "system", "content": "system"}, {"role": "user", "content": "/run WP1-T1"}],
@@ -209,6 +235,8 @@ class ExecutionFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"schema_version":1', messages[-1]["content"])
         self.assertIn('"changed_files"', messages[-1]["content"])
         self.assertIn('"execution_dispute":null', messages[-1]["content"])
+        self.assertIn("planned work assigned to later tasks in the summary",
+                      messages[-1]["content"])
         self.assertIn("numeric IDs actually issued", messages[-1]["content"])
         self.assertIn("does not replace the mutation journal", messages[-1]["content"])
         self.assertIn("Do not create summary", messages[-1]["content"])
@@ -234,6 +262,61 @@ class ExecutionFallbackTests(unittest.IsolatedAsyncioTestCase):
             )]
             self.assertEqual([event.text for event in events if isinstance(event, TextEvent)],
                              ["completed by fallback"])
+
+    async def test_streamed_text_failure_returns_to_persisted_job(self):
+        class PartialExecutor:
+            async def execute(self, _task, _model, _context):
+                yield TextEvent("Inspected the task.")
+                yield ErrorEvent("connection reset")
+                yield DoneEvent("failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_routing_config()
+            service = TaskExecutionService(
+                config=config,
+                router=ModelRoutingService(config, Router("claude-haiku")),
+                persistence=RoutingPersistence(Path(directory) / "routing.sqlite3"),
+                executors=ExecutorRegistry({
+                    "claude-cli": PartialExecutor(),
+                    "codex-cli": _SuccessfulExecutor(),
+                }),
+            )
+            events = [event async for event in service.execute(
+                task("simple"), "CHG1", [], [])]
+            self.assertTrue(any(isinstance(event, ErrorEvent) for event in events))
+            self.assertEqual([event.text for event in events if isinstance(event, TextEvent)],
+                             ["Inspected the task."])
+
+    async def test_successful_mutation_stops_in_run_fallback(self):
+        class MutatingExecutor:
+            async def execute(self, _task, _model, _context):
+                yield MutationEvent("apply_patch", {"path": "src/a.py"})
+                yield ErrorEvent("connection reset")
+                yield DoneEvent("failed")
+
+        class BackupExecutor:
+            def __init__(self):
+                self.calls = 0
+
+            async def execute(self, _task, _model, _context):
+                self.calls += 1
+                yield DoneEvent("endTurn")
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_routing_config()
+            backup = BackupExecutor()
+            service = TaskExecutionService(
+                config=config,
+                router=ModelRoutingService(config, Router("claude-haiku")),
+                persistence=RoutingPersistence(Path(directory) / "routing.sqlite3"),
+                executors=ExecutorRegistry({
+                    "claude-cli": MutatingExecutor(), "codex-cli": backup,
+                }),
+            )
+            events = [event async for event in service.execute(
+                task("simple"), "CHG1", [], [])]
+            self.assertTrue(any(isinstance(event, ErrorEvent) for event in events))
+            self.assertEqual(backup.calls, 0)
 
 
 class RunCommandTests(unittest.TestCase):
@@ -321,6 +404,256 @@ class _TaskExecution:
 
 
 class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_later_task_gap_does_not_pause_work_package(self):
+        class SiblingGapExecution(_TaskExecution):
+            strict_handoff = True
+
+            async def execute(self, queued_task, change_id, messages, specs, **kwargs):
+                self.started.append((queued_task.id, change_id))
+                yield TextEvent(json.dumps({
+                    "schema_version": 1, "task_id": queued_task.id,
+                    "summary": "Inspected the existing loader seams",
+                    "changed_files": [],
+                    "criteria": [{"criterion": "Inspect source", "status": "satisfied"}],
+                    "remaining_gaps": (["T2 still needs to implement its adapter"]
+                                       if queued_task.id == "WP1-T1" else []),
+                }))
+                yield DoneEvent("endTurn")
+
+        with tempfile.TemporaryDirectory() as directory:
+            execution = SiblingGapExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            service = ImplementationService(
+                _Artifacts(), execution, persistence, _Reviewer(["done"]))
+            job = await service.create_job(["WP1"], conversation_id="conv")
+            [event async for event in service.start(job, [], [])]
+            self.assertEqual(execution.started[:2],
+                             [("WP1-T1", "CHG1"), ("WP1-T2", "CHG1")])
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "implemented")
+
+    async def test_later_task_gap_after_tool_resume_reaches_reviewer(self):
+        class ResumedExecution(_TaskExecution):
+            strict_handoff = True
+
+            async def resume(self, run, messages, specs):
+                yield TextEvent(json.dumps({
+                    "schema_version": 1, "task_id": "WP1-T1",
+                    "summary": "Inspected the existing loader seams",
+                    "changed_files": [],
+                    "criteria": [{"criterion": "Inspect source", "status": "satisfied"}],
+                    "remaining_gaps": ["T2 still needs to implement its adapter"],
+                }))
+                yield DoneEvent("endTurn")
+
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def actual_model(_decision_id):
+                return "codex-luna-low"
+
+            persistence.actual_model_for = actual_model
+            reviewer = _Reviewer(["done"])
+            service = ImplementationService(
+                _Artifacts(), ResumedExecution(), persistence, reviewer)
+            job = await service.create_job(["WP1-T1"], conversation_id="conv")
+            await persistence.update_implementation_task(job.job_id, 0, "waiting")
+            run = Run(metadata={
+                "implementation_job_id": job.job_id,
+                "implementation_position": 0,
+                "implementation_task_id": "WP1-T1",
+            })
+            [event async for event in service.resume(run, [], [])]
+            self.assertEqual(len(reviewer.reports), 1)
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "awaiting_user_decision")
+
+    async def test_satisfied_criterion_with_current_task_gap_reaches_reviewer(self):
+        report = json.dumps({
+            "schema_version": 1, "task_id": "WP1-T1",
+            "summary": "Inspected some sources", "changed_files": [],
+            "criteria": [{"criterion": "Inspect all sources", "status": "satisfied"}],
+            "remaining_gaps": ["One required source was not inspected"],
+        })
+        self.assertIsNone(handoff_blocker(report, "WP1-T1"))
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def actual_model(_decision_id):
+                return "codex-luna-low"
+
+            persistence.actual_model_for = actual_model
+            reviewer = _Reviewer(["needs_work"] * 4)
+
+            class GapExecution(_TaskExecution):
+                strict_handoff = True
+
+                async def execute(self, queued_task, change_id, messages, specs, **kwargs):
+                    self.started.append((queued_task.id, change_id))
+                    yield TextEvent(report)
+                    yield DoneEvent("endTurn")
+
+            service = ImplementationService(
+                _Artifacts(), GapExecution(), persistence, reviewer)
+            job = await service.create_job(["WP1-T1"], conversation_id="conv")
+            [event async for event in service.start(job, [], [])]
+            self.assertEqual(len(reviewer.reports), 4)
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "awaiting_user_decision")
+
+    async def test_blocked_criterion_without_gap_still_pauses(self):
+        report = json.dumps({
+            "schema_version": 1, "task_id": "WP1-T1",
+            "summary": "Inspection could not finish", "changed_files": [],
+            "criteria": [{"criterion": "Inspect source", "status": "blocked"}],
+            "remaining_gaps": [],
+        })
+        self.assertIn("Coder handoff blocked", handoff_blocker(report, "WP1-T1"))
+
+    async def test_existing_paused_sibling_gap_can_use_review_anyway(self):
+        report = json.dumps({
+            "schema_version": 1, "task_id": "WP1-T1",
+            "summary": "Inspected existing loader seams", "changed_files": [],
+            "criteria": [{"criterion": "Inspect source", "status": "satisfied"}],
+            "remaining_gaps": ["T2 still needs to implement its adapter"],
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            execution = _TaskExecution()
+            service = ImplementationService(
+                _Artifacts(), execution, persistence, _Reviewer(["done"]))
+            job = await service.create_job(["WP1"], conversation_id="conv")
+            await persistence.save_coder_report(job.job_id, 0, report)
+            await persistence.update_implementation_task(
+                job.job_id, 0, "awaiting_coder_recovery",
+                error="Coder handoff blocked: acceptance criteria or remaining gaps are unresolved")
+            events = [event async for event in service.review_blocked_handoff(
+                job.job_id, 0, [], [], "", {})]
+            self.assertFalse(any(isinstance(event, ErrorEvent) for event in events))
+            self.assertEqual(execution.started[0], ("WP1-T2", "CHG1"))
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "implemented")
+
+    async def test_malformed_coder_handoff_switches_with_saved_failure_context(self):
+        class MalformedThenValid(_TaskExecution):
+            strict_handoff = True
+
+            async def execute(self, queued_task, change_id, messages, specs, **kwargs):
+                self.started.append((queued_task.id, change_id))
+                self.instructions.append(kwargs.get("execution_instruction"))
+                if len(self.started) == 1:
+                    yield TextEvent("The first coder stopped with an invalid handoff.")
+                else:
+                    yield TextEvent(json.dumps({
+                        "schema_version": 1, "task_id": queued_task.id,
+                        "summary": "Finished after checking the saved task state",
+                        "changed_files": [],
+                        "criteria": [{"criterion": "Task finished", "status": "satisfied"}],
+                        "remaining_gaps": [],
+                    }))
+                yield DoneEvent("endTurn")
+
+        with tempfile.TemporaryDirectory() as directory:
+            execution = MalformedThenValid()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+
+            async def actual_model(_decision_id):
+                return "claude-haiku" if len(execution.started) == 1 else "codex-luna-low"
+
+            persistence.actual_model_for = actual_model
+            service = ImplementationService(
+                _Artifacts(), execution, persistence, _Reviewer(["done"]))
+            job = await service.create_job(["WP1-T1"], conversation_id="conv")
+            events = [event async for event in service.start(job, [], [])]
+            self.assertEqual(len(execution.started), 2)
+            self.assertEqual(execution.instructions[1].count("Coder handoff invalid"), 1)
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "awaiting_user_decision")
+            self.assertTrue(any("continuing WP1-T1" in event.text
+                                for event in events if isinstance(event, TextEvent)))
+
+    async def test_blocked_coder_handoff_pauses_before_next_wp_task(self):
+        class BlockedExecution(_TaskExecution):
+            strict_handoff = True
+
+            async def execute(self, queued_task, change_id, messages, specs, **kwargs):
+                self.started.append((queued_task.id, change_id))
+                yield TextEvent(json.dumps({
+                    "schema_version": 1, "task_id": queued_task.id,
+                    "summary": "IDE reader needed approval; no edits made",
+                    "changed_files": [],
+                    "criteria": [{"criterion": "Inspect source", "status": "blocked"}],
+                    "remaining_gaps": ["Read source through IDE MCP"],
+                }))
+                yield DoneEvent("endTurn")
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = _Artifacts()
+            execution = BlockedExecution()
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            reviewer = _Reviewer(["done"])
+            service = ImplementationService(artifacts, execution, persistence, reviewer)
+            job = await service.create_job(["WP1"], conversation_id="blocked-conversation")
+            events = [event async for event in service.start(job, [], [])]
+            self.assertEqual(execution.started, [("WP1-T1", "CHG1")])
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "awaiting_coder_recovery")
+            self.assertEqual((await persistence.implementation_task(job.job_id, 1)).status,
+                             "queued")
+            text = "".join(event.text for event in events if isinstance(event, TextEvent))
+            self.assertIn("Coder reported unresolved gaps", text)
+            self.assertIn("Gap: Read source through IDE MCP", text)
+            self.assertIn("`review anyway`", text)
+
+            reviewed = [event async for event in service.review_blocked_handoff(
+                job.job_id, 0, [], [], "", {})]
+            self.assertFalse(any(isinstance(event, ErrorEvent) for event in reviewed))
+            self.assertEqual(execution.started, [("WP1-T1", "CHG1"), ("WP1-T2", "CHG1")])
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "implemented")
+            again = [event async for event in service.review_blocked_handoff(
+                job.job_id, 0, [], [], "", {})]
+            self.assertTrue(any(isinstance(event, ErrorEvent) for event in again))
+
+    async def test_coder_prose_is_saved_but_not_echoed_to_chat(self):
+        class ChattyExecution(_TaskExecution):
+            async def execute(self, queued_task, change_id, messages, specs, **kwargs):
+                self.started.append((queued_task.id, change_id))
+                yield TextEvent("I'll help you implement this. Now let me read the files.\n")
+                yield TextEvent(json.dumps({
+                    "schema_version": 1, "task_id": queued_task.id,
+                    "summary": "Added the factory. It registers every loader by name.",
+                    "changed_files": [], "remaining_gaps": [],
+                    "criteria": [{"criterion": "Task finished", "status": "satisfied"}],
+                }))
+                yield DoneEvent("endTurn")
+
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            service = ImplementationService(
+                _Artifacts(), ChattyExecution(), persistence, _Reviewer(["done"]))
+            job = await service.create_job(["WP1-T1"], conversation_id="conv")
+            events = [event async for event in service.start(job, [], [])]
+            text = "".join(event.text for event in events if isinstance(event, TextEvent))
+            self.assertNotIn("I'll help you", text)
+            self.assertIn("Added the factory.", text)
+            self.assertNotIn("registers every loader", text)
+            self.assertIn("I'll help you", await persistence.coder_report_for(job.job_id, 0))
+
+    async def test_review_anyway_is_refused_for_an_interrupted_coder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            service = ImplementationService(
+                _Artifacts(), _TaskExecution(), persistence, _Reviewer(["done"]))
+            job = await service.create_job(["WP1-T1"], conversation_id="conv")
+            await persistence.update_implementation_task(
+                job.job_id, 0, "awaiting_coder_recovery", error="provider timed out")
+            events = [event async for event in service.review_blocked_handoff(
+                job.job_id, 0, [], [], "", {})]
+            self.assertTrue(any(isinstance(event, ErrorEvent) for event in events))
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "awaiting_coder_recovery")
+
     def test_revision_prompt_requires_direct_artifact_edits_and_real_verification(self):
         finding = ReviewFinding(
             "implementation", "Counts conflict", "Correct the named reports",
@@ -339,7 +672,14 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
                 return "claude-haiku"
             persistence.actual_model_for = actual_model
             reviewer = _Reviewer(["done"])
-            service = ImplementationService(artifacts, execution, persistence, reviewer)
+            refreshes = []
+
+            async def refresh(job_id, wp_id):
+                refreshes.append((job_id, wp_id))
+                return "KB refresh succeeded for WP1."
+
+            service = ImplementationService(artifacts, execution, persistence, reviewer,
+                                            kb_refresh=refresh)
             job = await service.create_job(["WP1", "WP1-T2"], "Add traceability")
             events = [event async for event in service.start(
                 job, [{"role": "user", "content": "/implement WP1"}], []
@@ -348,6 +688,7 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(execution.instructions, ["Add traceability"] * 2)
             self.assertEqual(artifacts.completed, ["WP1-T1", "WP1-T2"])
             self.assertEqual(len(reviewer.reports), 1)
+            self.assertEqual(refreshes, [(job.job_id, "WP1")])
             self.assertIn("Task WP1-T1 coder handoff", reviewer.reports[0])
             self.assertIn("Task WP1-T2 coder handoff", reviewer.reports[0])
             self.assertTrue(any("WP1 — PASS" in event.text
@@ -380,12 +721,19 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
 
             persistence.actual_model_for = actual_model
             reviewer = UnavailableReviewer()
-            service = ImplementationService(artifacts, execution, persistence, reviewer)
+            refreshes = []
+
+            async def refresh(job_id, wp_id):
+                refreshes.append((job_id, wp_id))
+
+            service = ImplementationService(artifacts, execution, persistence, reviewer,
+                                            kb_refresh=refresh)
             job = await service.create_job(["WP1"])
             events = [event async for event in service.start(job, [], [])]
             self.assertEqual(execution.started,
                              [("WP1-T1", "CHG1"), ("WP1-T2", "CHG1")])
             self.assertEqual(reviewer.calls, 1)
+            self.assertEqual(refreshes, [])
             self.assertTrue(any("WP1 — UNVERIFIED" in event.text
                                 for event in events if isinstance(event, TextEvent)))
             self.assertEqual(
@@ -1797,7 +2145,7 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider.reasoning_effort, "medium")
         self.assertEqual(provider.run_metadata,
                          {"reviewer": True, "reviewer_model": "codex-luna-low",
-                          "gateway_used": True})
+                     "gateway_used": False})
         self.assertEqual(decision.verdict, "done")
         self.assertEqual(decision.reviewer_model, "codex-luna-low")
         self.assertEqual(decision.evidence, ("Inspected report.md",))
@@ -1900,7 +2248,7 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
                 {"read_file": read_file})
         self.assertEqual([item["file_path"] for item in reads], ["src/trainer.py"])
         self.assertIn("class Trainer", provider.prompt)
-        self.assertIn("FORBIDDEN to access project files", provider.prompt)
+        self.assertIn("Access current project file contents only", provider.prompt)
         self.assertEqual(decision.inspected_paths, ("src/trainer.py",))
 
     async def test_approval_must_account_for_every_journaled_mutation(self):
@@ -2839,16 +3187,17 @@ _PARSE_FAILURE = ("Claude Code returned an error result: "
 
 
 class _InterruptedTaskExecution(_TaskExecution):
-    """First run fails mid-task with a tool-call parse error; later runs succeed."""
+    """A configured number of runs fail mid-task; later runs succeed."""
 
-    def __init__(self, failure=_PARSE_FAILURE):
+    def __init__(self, failure=_PARSE_FAILURE, failures=1):
         super().__init__()
         self.failure = failure
+        self.failures = failures
         self.excluded = []
 
     async def execute(self, queued_task, change_id, messages, specs, **kwargs):
         self.excluded.append(kwargs.get("exclude_models", frozenset()))
-        if len(self.excluded) == 1:
+        if len(self.excluded) <= self.failures:
             self.started.append((queued_task.id, change_id))
             self.instructions.append(kwargs.get("execution_instruction"))
             yield TextEvent("Wrote part of the tests.")
@@ -2864,7 +3213,8 @@ class CoderRecoveryTests(unittest.IsolatedAsyncioTestCase):
         persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
 
         async def actual_model(_decision_id):
-            return "claude-haiku"
+            return ("codex-luna-low" if len(execution.excluded) > 1
+                    else "claude-haiku")
 
         persistence.actual_model_for = actual_model
         artifacts = _Artifacts()
@@ -2876,7 +3226,7 @@ class CoderRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_parse_failure_waits_for_user_instead_of_stopping(self):
         with tempfile.TemporaryDirectory() as directory:
             service, persistence, _, job, events = await self._interrupted_job(
-                directory, _InterruptedTaskExecution())
+                directory, _InterruptedTaskExecution(failures=2))
             text = "\n".join(event.text for event in events if isinstance(event, TextEvent))
             self.assertIn("Coding interrupted", text)
             self.assertIn("could not be parsed", text)
@@ -2888,13 +3238,13 @@ class CoderRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_try_again_excludes_the_failed_model_and_continues(self):
         with tempfile.TemporaryDirectory() as directory:
-            execution = _InterruptedTaskExecution()
+            execution = _InterruptedTaskExecution(failures=2)
             service, persistence, artifacts, job, _ = await self._interrupted_job(
                 directory, execution)
             events = [event async for event in service.retry_coder(
                 job.job_id, 0, [], [], "", {}, "")]
             self.assertFalse(any(isinstance(event, ErrorEvent) for event in events))
-            self.assertEqual(execution.excluded[-1], frozenset({"claude-haiku"}))
+            self.assertEqual(execution.excluded[-1], frozenset({"codex-luna-low"}))
             self.assertIn("interrupted before finishing", execution.instructions[-1])
             self.assertTrue(any("Approved" in event.text
                                 for event in events if isinstance(event, TextEvent)))
@@ -2913,16 +3263,56 @@ class CoderRecoveryTests(unittest.IsolatedAsyncioTestCase):
                              "undone")
             self.assertEqual(artifacts.completed, [])
 
-    async def test_other_coder_failures_still_stop_the_job(self):
+    async def test_exhausted_operational_failures_remain_retryable(self):
         with tempfile.TemporaryDirectory() as directory:
             _, persistence, _, job, events = await self._interrupted_job(
-                directory, _InterruptedTaskExecution("all simple routing candidates failed: boom"))
+                directory, _InterruptedTaskExecution(
+                    "all simple routing candidates failed: boom", failures=2))
             self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
-                             "failed")
-            self.assertTrue(any("reviewer: not run" in event.text
+                             "awaiting_coder_recovery")
+            self.assertTrue(any("try coder again" in event.text
                                 for event in events if isinstance(event, TextEvent)))
 
-    async def test_routing_excludes_models_but_never_empties_the_tier(self):
+    async def test_failed_tool_result_resumes_with_another_coder(self):
+        class FailedResume(_TaskExecution):
+            def __init__(self):
+                super().__init__()
+                self.resume_calls = 0
+
+            async def resume(self, run, messages, specs):
+                self.resume_calls += 1
+                yield TextEvent("Earlier coder output.")
+                yield ErrorEvent("connection reset after IDE result")
+                yield DoneEvent("failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            execution = FailedResume()
+
+            async def actual_model(_decision_id):
+                return "codex-luna-low" if execution.started else "claude-haiku"
+
+            persistence.actual_model_for = actual_model
+            service = ImplementationService(
+                _Artifacts(), execution, persistence, _Reviewer(["done"]))
+            job = await service.create_job(["WP1-T1"], conversation_id="conv")
+            await persistence.update_implementation_task(job.job_id, 0, "waiting")
+            run = Run(metadata={
+                "implementation_job_id": job.job_id,
+                "implementation_position": 0,
+                "implementation_task_id": "WP1-T1",
+                "implementation_instruction": "Finish the feature",
+            })
+            events = [event async for event in service.resume(run, [], [])]
+            self.assertEqual(execution.resume_calls, 1)
+            self.assertEqual(execution.started, [("WP1-T1", "CHG1")])
+            self.assertIn("Inspect the current project", execution.instructions[-1])
+            self.assertTrue(any("continuing WP1-T1" in event.text
+                                for event in events if isinstance(event, TextEvent)))
+            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
+                             "awaiting_user_decision")
+
+    async def test_routing_excludes_models_and_rejects_exhausted_tier(self):
         config = load_routing_config()
         candidates = config.candidates_for("medium")
         service = ModelRoutingService(config, Router(candidates[0]))
@@ -2931,9 +3321,9 @@ class CoderRecoveryTests(unittest.IsolatedAsyncioTestCase):
         if len(candidates) > 1:
             self.assertNotEqual(decision.recommended_model, candidates[0])
             self.assertNotIn(candidates[0], decision.candidates)
-        everything = await service.route(task(), "CHG1", "/work/project",
-                                         exclude=frozenset(candidates))
-        self.assertEqual(everything.candidates, candidates)
+        with self.assertRaises(RoutingConfigError):
+            await service.route(task(), "CHG1", "/work/project",
+                                exclude=frozenset(candidates))
 
 
 class ClaudeProviderErrorTests(unittest.IsolatedAsyncioTestCase):
@@ -3210,13 +3600,28 @@ class ReviewerFormatRepairTests(unittest.IsolatedAsyncioTestCase):
         bad = self.decision(validation_results=[{
             "expectation": "All DataLoaderFactory unit tests pass.",
             "category": "required", "status": "green", "evidence": []}])
-        provider = self.Provider([bad, bad])
+        provider = self.Provider([bad, bad, bad, bad])
         with self.assertRaises(ReviewFormatError) as raised:
             await self.review(provider, self.wp_task())
         message = str(raised.exception)
         self.assertIn("validation_results[0] status='green'", message)
         self.assertIn("still malformed after one correction request", message)
-        self.assertEqual(len(provider.conversations), 2)
+        self.assertEqual(len(provider.conversations), 4)
+
+    async def test_malformed_primary_reviewer_uses_other_provider(self):
+        bad = self.decision(validation_results=[{
+            "expectation": "All DataLoaderFactory unit tests pass.",
+            "category": "required", "status": "green", "evidence": []}])
+        provider = self.Provider([bad, bad, self.decision(validation_results=[{
+            "expectation": "All DataLoaderFactory unit tests pass.",
+            "category": "required", "status": "satisfied", "evidence": ["25 passed"]}])])
+        decision = await self.review(provider, self.wp_task())
+        self.assertEqual(decision.reviewer_model, "claude-haiku")
+        self.assertEqual(len(provider.conversations), 3)
+        self.assertEqual(
+            [(entry["model"], entry["status"]) for entry in decision.routing_attempts],
+            [("codex-luna-low", "failed"), ("claude-haiku", "completed")])
+        self.assertIn("malformed", decision.routing_attempts[0]["error"])
 
 
 if __name__ == "__main__":

@@ -57,6 +57,8 @@ _PHRASES: tuple[tuple[re.Pattern, Callable[[re.Match], _Phrase]], ...] = tuple(
              if item and item.lower() != "and"))),
         (r"(?:submit to coder again|try coder again|try again|retry)(?:\s*:\s*(?P<g>.+))?",
          lambda m: _Phrase("retry", _group(m, "g"))),
+        (r"review(?: it)? anyway(?:\s*:\s*(?P<g>.+))?",
+         lambda m: _Phrase("review_handoff", _group(m, "g"))),
         (r"accept(?: anyway)?(?:\s*:\s*(?P<g>.+))?",
          lambda m: _Phrase("accept", _group(m, "g"))),
         (r"undo(?: code)?", lambda m: _Phrase("undo")),
@@ -73,6 +75,8 @@ _TASK_PREFIX = re.compile(r"\s*((?:WP|US)\d+-T\d+)\s*[:,]?\s+(.+)", re.IGNORECAS
 _NATURAL_REVIEW_RETRY = re.compile(
     r"\b(?:retry|rerun|re-run|run again)\b.{0,100}\breview\b|"
     r"\breview\b.{0,60}\b(?:again|retry)\b", re.IGNORECASE | re.DOTALL)
+_NATURAL_RETRY = re.compile(r"\b(?:retry|try(?:\s+(?:the\s+coder\s+)?)again|"
+                            r"rerun|re-run|run again)\b", re.IGNORECASE)
 _NEGATED_RETRY = re.compile(r"\b(?:do not|don't|dont|never|no)\s+(?:want to\s+)?"
                             r"(?:retry|rerun|re-run|run again)\b", re.IGNORECASE)
 _JOB_REFERENCE = re.compile(
@@ -87,6 +91,7 @@ def _phrase_action(phrase: _Phrase, state: str) -> tuple[A, dict] | None:
                 S.REVIEW_RESOLUTION.value: (A.RETRY_CODER_AFTER_REVIEW, {}),
                 S.CODER_RECOVERY.value: (A.RESOLVE_CODER_RECOVERY,
                                          {"recovery_mode": "retry_coder"}),
+                S.EVIDENCE_RESOLUTION.value: (A.RETRY_REVIEW, {}),
                 }.get(state)
     simple = {
         "retry_contract": (A.RETRY_CONTRACT, {}),
@@ -96,6 +101,7 @@ def _phrase_action(phrase: _Phrase, state: str) -> tuple[A, dict] | None:
         "retry_review": (A.RETRY_REVIEW, {}),
         "inspect": (A.RESOLVE_CODER_RECOVERY, {"recovery_mode": "inspect"}),
         "baseline": (A.RESOLVE_CODER_RECOVERY, {"recovery_mode": "establish_baseline"}),
+        "review_handoff": (A.RESOLVE_CODER_RECOVERY, {"recovery_mode": "review_handoff"}),
         "stop": (A.STOP_JOB, {}),
         "yes": (A.ANSWER_REVIEWER_QUESTION, {"approved": True}),
         "no": (A.ANSWER_REVIEWER_QUESTION, {"approved": False}),
@@ -120,7 +126,8 @@ _HINTS = {
 
 def _hint(action: A, state: str) -> str:
     if action == A.RESOLVE_CODER_RECOVERY:
-        return {S.CODER_RECOVERY.value: "`try coder again[: <guidance>]`",
+        return {S.CODER_RECOVERY.value:
+                    "`try coder again[: <guidance>]` or `review anyway`",
                 S.JOURNAL_RECOVERY.value:
                     "`inspect recovery` or `establish new baseline: <guidance>`"}.get(state, "")
     return _HINTS.get(action, "")
@@ -184,6 +191,10 @@ def expected_effects(intent: WorkflowIntent, task: PausedTask | None) -> tuple[s
             return ("Accept the current files as the new undo baseline",
                     "Prior uncertain mutations can no longer be undone automatically",
                     *guidance, *resume)
+        if mode == "review_handoff":
+            return (f"Send {name}'s coder report to the Reviewer despite its reported gaps",
+                    "The Reviewer judges the acceptance criteria",
+                    "No Coder run or file change is proposed")
         return ("Continue on a different model, keeping files written so far",
                 *guidance, *resume)
     if action == A.ANSWER_REVIEWER_QUESTION:
@@ -256,6 +267,8 @@ class WorkflowInterpreter:
                        if (match := pattern.fullmatch(body))), None)
         if phrase is None and _NATURAL_REVIEW_RETRY.search(body):
             phrase = _Phrase("retry_review")
+        if phrase is None and _NATURAL_RETRY.search(body):
+            phrase = _Phrase("retry")
         if phrase is not None:
             return self._deterministic(base, context, phrase, named)
         return await self._model(base, context, text, named)

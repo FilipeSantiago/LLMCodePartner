@@ -19,8 +19,9 @@ class ComplexityPolicy:
 # Content search and project inspection let the Coder find what the deterministic
 # Tasker could not predict; secrets and excluded files are filtered by the guard.
 OP_FILE_TEXT_SEARCH, OP_PROJECT_INSPECT = "file_text_search", "project_inspect"
+OP_KB_INSPECT = "kb_inspect"
 _COMMON = (OP_FILE_READ, OP_FILE_SEARCH, OP_FILE_TEXT_SEARCH, OP_PROJECT_INSPECT,
-           OP_FILE_CREATE, OP_FILE_REPLACE, OP_FILE_PATCH)
+           OP_KB_INSPECT, OP_FILE_CREATE, OP_FILE_REPLACE, OP_FILE_PATCH)
 POLICIES = {
     "simple": ComplexityPolicy(
         ExecutionLimits(repeated_calls=2),
@@ -35,7 +36,7 @@ POLICIES = {
 
 # Read-only discovery contracts for tasks that investigate rather than edit.
 DISCOVERY_OPERATIONS = (OP_FILE_READ, OP_FILE_SEARCH, OP_FILE_TEXT_SEARCH,
-                        OP_PROJECT_INSPECT)
+                        OP_PROJECT_INSPECT, OP_KB_INSPECT)
 # OpenSpec preferred capabilities that mean "investigate, do not edit".
 DISCOVERY_CAPABILITIES = frozenset({
     "read", "research", "inspect", "inspection", "analysis", "review", "verification"})

@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 from uuid import uuid4
 
-from agent.routing.config import RoutingConfig
+from agent.routing.config import RoutingConfig, RoutingConfigError
 from agent.routing.health import ExecutorHealth
 from agent.routing.models import ExecutionDecision
 from agent.routing.semantic_router import SemanticRouterClient, SemanticRouterError
@@ -22,10 +22,11 @@ class ModelRoutingService:
 
     async def route(self, task: Task, change_id: str, project_path: str,
                     exclude: frozenset[str] = frozenset()) -> ExecutionDecision:
-        """Pick a model for the task; `exclude` drops models that already failed it,
-        unless that would leave no candidate."""
+        """Pick a model for the task, excluding models already tried for this task."""
         candidates = self.config.candidates_for(task.complexity)
-        candidates = tuple(item for item in candidates if item not in exclude) or candidates
+        candidates = tuple(item for item in candidates if item not in exclude)
+        if not candidates:
+            raise RoutingConfigError(f"no untried {task.complexity} coder candidates")
         eligible = tuple(candidate for candidate in candidates if self.health.available(
             candidate, self.config.models[candidate].executor, True
         )) or candidates
@@ -43,7 +44,10 @@ class ModelRoutingService:
             source = "deterministic-fallback"
             reason = str(exc)
         model = self.config.models[selected]
-        fallbacks = tuple(candidate for candidate in candidates if candidate != selected)
+        other = [candidate for candidate in candidates if candidate != selected]
+        fallbacks = tuple(sorted(other, key=lambda candidate: (
+            self.config.models[candidate].provider == model.provider,
+            candidates.index(candidate))))
         project_id = sha256(project_path.encode()).hexdigest()[:16]
         return ExecutionDecision(
             decision_id="route_" + uuid4().hex,

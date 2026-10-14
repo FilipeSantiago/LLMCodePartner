@@ -327,9 +327,11 @@ def create_change_id(request: str, max_length: int = 48) -> str:
 
 
 class SpecCommandHandler:
-    def __init__(self, adapter: OpenSpecAdapter, store: ArtifactStore):
+    def __init__(self, adapter: OpenSpecAdapter, store: ArtifactStore,
+                 planning_context: str = ""):
         self._adapter = adapter
         self._store = store
+        self._planning_context = "\n\n" + planning_context if planning_context else ""
         self._lock = asyncio.Lock()
 
     async def handle(self, messages: list[dict[str, Any]]) -> SpecResult:
@@ -340,7 +342,8 @@ class SpecCommandHandler:
         async with self._lock:
             if is_spec_command(content):
                 request = extract_spec_request(content)
-                draft = await self._adapter.generate_change(request)
+                draft = await self._adapter.generate_change(
+                    request + self._planning_context)
                 change = await self._store.create_change(
                     draft, create_change_id(draft.title)
                 )
@@ -366,7 +369,7 @@ class SpecCommandHandler:
                 except ArtifactSelectionError as exc:
                     raise SpecCommandError(str(exc)) from exc
                 replacements = await self._adapter.refine_tasks(
-                    change, task_ids, instruction
+                    change, task_ids, instruction + self._planning_context
                 )
                 updated = await self._store.replace_tasks(change, replacements)
                 return SpecResult(

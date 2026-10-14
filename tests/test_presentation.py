@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent.routing.implementation import ImplementationService, _without_handoff
+from agent.routing.implementation import ImplementationService
 from agent.routing.persistence import RoutingPersistence
 from agent.routing.review import ReviewDecision, ReviewFinding
 from agent.spec.models import CompletionReview, ModelIdentity
@@ -57,9 +57,6 @@ class HelperTests(unittest.TestCase):
         self.assertIn("1 satisfied · 1 blocked", text)
         self.assertIn("docs not updated", text)
         self.assertNotIn("schema_version", text)
-        prose = _without_handoff("I extended the registry.\n```json\n"
-                                 + json.dumps(HANDOFF) + "\n```")
-        self.assertEqual(prose, "I extended the registry.")
 
     def test_review_renders_findings_and_validation_table(self):
         finding = ReviewFinding("implementation", "Recurrent trainer missing",
@@ -106,12 +103,13 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
             stream = "".join(texts)
             self.assertIn(f"**Job {job.job_id[:8]}** queued 1 task(s)", stream)
             self.assertIn("### 🛠 WP1-T1 ·", stream)
-            self.assertIn("> I will extend the existing registry.", stream)
+            self.assertNotIn("I will extend the existing registry.", stream)
             self.assertIn("**Coder handoff** (unverified until review)", stream)
             self.assertNotIn('"schema_version"', stream)
             self.assertNotRegex(stream, r"handoff\S*WP1|\.Starting|\)Reviewing")
             report = await persistence.coder_report_for(job.job_id, 0)
             self.assertIn('"schema_version": 1', report)
+            self.assertIn("I will extend the existing registry.", report)
 
 
 if __name__ == "__main__":

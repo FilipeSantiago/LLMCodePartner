@@ -14,6 +14,7 @@ from agent.routing.models import (
     ExecutionDecision, ImplementationJob,
     ImplementationJobTask,
 )
+from agent.routing.gateway import operational_failure
 
 from agent.workflow.states import PAUSED_STATES
 
@@ -144,6 +145,11 @@ class RoutingPersistence:
                   reviewer_model TEXT NOT NULL, verdict TEXT NOT NULL,
                   rationale TEXT NOT NULL, question TEXT, details_json TEXT,
                   created_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS kb_refreshes (
+                  job_id TEXT NOT NULL, wp_id TEXT NOT NULL, kb_project_id TEXT NOT NULL,
+                  status TEXT NOT NULL, details_json TEXT, created_at REAL NOT NULL,
+                  updated_at REAL NOT NULL, PRIMARY KEY(job_id, wp_id)
                 );
                 CREATE TABLE IF NOT EXISTS blocked_operations (
                   operation_id TEXT PRIMARY KEY, operation TEXT NOT NULL,
@@ -310,6 +316,18 @@ class RoutingPersistence:
             _migrate_workflow_proposals(db)
             from agent.workflow.migration import migrate_paused_states
             migrate_paused_states(db)
+            # Older jobs treated all coder errors as terminal. Expose only
+            # identifiable operational failures as resumable paused work.
+            rows = db.execute("""SELECT job_id, position, error
+              FROM implementation_job_tasks WHERE status='failed'""").fetchall()
+            for job_id, position, error in rows:
+                if operational_failure(error or ""):
+                    db.execute("""UPDATE implementation_job_tasks
+                      SET status='awaiting_coder_recovery' WHERE job_id=? AND position=?""",
+                      (job_id, position))
+                    db.execute("""UPDATE implementation_jobs
+                      SET status='awaiting_coder_recovery' WHERE job_id=? AND status='failed'""",
+                      (job_id,))
 
     async def record_decision(self, decision: ExecutionDecision) -> None:
         await asyncio.to_thread(self._record_decision, decision)
@@ -342,6 +360,35 @@ class RoutingPersistence:
                 decision.decision_id, model, provider, executor, int(gateway_used), status,
                 latency_ms, error, json.dumps(usage) if usage else None, time.time(),
             ))
+
+    async def attempted_models_for(self, decision_id: str | None) -> frozenset[str]:
+        if not decision_id:
+            return frozenset()
+        return await asyncio.to_thread(self._attempted_models_for, decision_id)
+
+    def _attempted_models_for(self, decision_id):
+        with self._database() as db:
+            rows = db.execute(
+                "SELECT DISTINCT model FROM execution_attempts WHERE decision_id=?",
+                (decision_id,)).fetchall()
+            current = db.execute(
+                "SELECT actual_model FROM routing_decisions WHERE decision_id=?",
+                (decision_id,)).fetchone()
+        models = {row[0] for row in rows}
+        if current and current[0]:
+            models.add(current[0])
+        return frozenset(models)
+
+    async def record_running_model(self, decision: ExecutionDecision, model: str,
+                                   provider: str, gateway_used: bool) -> None:
+        await asyncio.to_thread(self._record_running_model, decision, model, provider,
+                                gateway_used)
+
+    def _record_running_model(self, decision, model, provider, gateway_used):
+        with self._database() as db:
+            db.execute("""UPDATE routing_decisions SET actual_model=?, actual_provider=?,
+              gateway_used=?, execution_status='running' WHERE decision_id=?""",
+              (model, provider, int(gateway_used), decision.decision_id))
 
     async def finalize(self, decision: ExecutionDecision, model: str, provider: str,
                        gateway_used: bool, status: str, latency_ms: int,
@@ -580,6 +627,32 @@ class RoutingPersistence:
         return await asyncio.to_thread(
             self._restart_revision_cycle, job_id, position, budget)
 
+    async def claim_coder_recovery(self, job_id: str, position: int) -> bool:
+        return await asyncio.to_thread(self._claim_coder_recovery, job_id, position)
+
+    def _claim_coder_recovery(self, job_id, position):
+        with self._database() as db:
+            result = db.execute("""UPDATE implementation_job_tasks
+              SET status='running', error=NULL WHERE job_id=? AND position=?
+              AND status='awaiting_coder_recovery'""", (job_id, position))
+            if result.rowcount:
+                db.execute("""UPDATE implementation_jobs SET status='running',
+                  error=NULL, updated_at=? WHERE job_id=?""", (time.time(), job_id))
+            return bool(result.rowcount)
+
+    async def claim_auto_coder_fallback(self, job_id: str, position: int,
+                                        decision_id: str | None) -> bool:
+        return await asyncio.to_thread(
+            self._claim_auto_coder_fallback, job_id, position, decision_id)
+
+    def _claim_auto_coder_fallback(self, job_id, position, decision_id):
+        with self._database() as db:
+            result = db.execute("""UPDATE implementation_job_tasks
+              SET status='retrying' WHERE job_id=? AND position=?
+              AND decision_id IS ? AND status IN ('running', 'waiting')""",
+              (job_id, position, decision_id))
+            return bool(result.rowcount)
+
     def _restart_revision_cycle(self, job_id, position, budget):
         now = time.time()
         with self._database() as db:
@@ -654,6 +727,33 @@ class RoutingPersistence:
 
     async def mutations(self, job_id: str, position: int) -> list[dict]:
         return await asyncio.to_thread(self._mutations, job_id, position)
+
+    async def recent_mutations(self, project_id: str, since: float,
+                               limit: int = 200) -> list[dict]:
+        """Read-only, bounded mutation hints newer than the KB index."""
+        return await asyncio.to_thread(self._recent_mutations, project_id, since, limit)
+
+    def _recent_mutations(self, project_id, since, limit):
+        with self._database() as db:
+            rows = db.execute("""SELECT m.job_id, m.position, m.targets_json,
+                m.updated_at FROM implementation_mutations m
+                JOIN implementation_jobs j ON j.job_id=m.job_id
+                WHERE j.project_id=? AND m.updated_at>?
+                  AND m.stage IN ('applied', 'postimage_verified')
+                ORDER BY m.updated_at DESC LIMIT ?""",
+                (project_id, since, max(1, min(int(limit), 1000)))).fetchall()
+        return [{"job_id": row[0], "position": row[1],
+                 "targets": json.loads(row[2]), "updated_at": row[3]}
+                for row in rows]
+
+    async def implementation_job_project_id(self, job_id: str) -> str | None:
+        return await asyncio.to_thread(self._implementation_job_project_id, job_id)
+
+    def _implementation_job_project_id(self, job_id):
+        with self._database() as db:
+            row = db.execute("SELECT project_id FROM implementation_jobs WHERE job_id=?",
+                             (job_id,)).fetchone()
+        return row[0] if row else None
 
     def _mutations(self, job_id, position):
         with self._database() as db:
@@ -876,6 +976,28 @@ class RoutingPersistence:
                             details: dict | None = None) -> None:
         await asyncio.to_thread(self._record_review, job_id, position, coder_model,
                                 reviewer_model, verdict, rationale, question, details)
+
+    async def claim_kb_refresh(self, job_id: str, wp_id: str, kb_project_id: str) -> bool:
+        return await asyncio.to_thread(self._claim_kb_refresh, job_id, wp_id, kb_project_id)
+
+    def _claim_kb_refresh(self, job_id, wp_id, kb_project_id):
+        with self._database() as db:
+            now = time.time()
+            cursor = db.execute("""INSERT OR IGNORE INTO kb_refreshes
+              (job_id, wp_id, kb_project_id, status, created_at, updated_at)
+              VALUES (?, ?, ?, 'running', ?, ?)""",
+              (job_id, wp_id, kb_project_id, now, now))
+            return cursor.rowcount == 1
+
+    async def finish_kb_refresh(self, job_id: str, wp_id: str, status: str,
+                                details: dict) -> None:
+        await asyncio.to_thread(self._finish_kb_refresh, job_id, wp_id, status, details)
+
+    def _finish_kb_refresh(self, job_id, wp_id, status, details):
+        with self._database() as db:
+            db.execute("""UPDATE kb_refreshes SET status=?, details_json=?, updated_at=?
+              WHERE job_id=? AND wp_id=?""", (
+                status, json.dumps(details, ensure_ascii=False), time.time(), job_id, wp_id))
 
     def _record_review(self, job_id, position, coder_model, reviewer_model, verdict,
                        rationale, question, details):

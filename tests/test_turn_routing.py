@@ -235,8 +235,7 @@ class TurnDetectionTests(_WorldTest):
         )
         answer = await self.world.say("implement WP5 and WP6", history=history,
                                       conversation_id=False)
-        self.assertIn("Action: Start implementation", answer)
-        self.assertIn("Nothing has executed yet.", answer)
+        self.assertIn("Work Package planning is unavailable", answer)
         self.assertEqual(self.world.execution.started, [])
 
     async def test_old_coder_tool_results_do_not_resume_anything(self):
@@ -249,7 +248,7 @@ class TurnDetectionTests(_WorldTest):
             ChatMessage(role="assistant", content="Done."),
         )
         answer = await self.world.say("implement WP5", history=history)
-        self.assertIn("Task WP5-T1", answer)
+        self.assertIn("Work Package planning is unavailable", answer)
 
     async def test_bootstrap_result_replays_the_original_message_exactly_once(self):
         run = Run()
@@ -272,11 +271,11 @@ class TurnDetectionTests(_WorldTest):
         request = ChatCompletionRequest(model="test", stream=True, messages=messages)
         first = _body_text([chunk async for chunk in (
             await dialog_controller.chat_completions(request)).body_iterator])
-        self.assertIn("Task WP5-T1", first)
+        self.assertIn("Work Package planning is unavailable", first)
         again = _body_text([chunk async for chunk in (
             await dialog_controller.chat_completions(request)).body_iterator])
         self.assertIn("already processed", again)
-        self.assertEqual(len(self.world.rows("SELECT * FROM workflow_action_proposals")), 1)
+        self.assertEqual(len(self.world.rows("SELECT * FROM workflow_action_proposals")), 0)
 
     async def test_result_for_a_finished_run_is_reported_not_rerouted(self):
         response = await dialog_controller.chat_completions(ChatCompletionRequest(
@@ -317,12 +316,8 @@ class InterpretationTests(_WorldTest):
     async def test_new_selectors_start_a_new_flow_while_another_task_is_paused(self):
         await self.world.job("WP4", "conv", status="awaiting_contract_resolution")
         answer = await self.world.say("implement WP5 and WP6")
-        self.assertIn("Action: Start implementation", answer)
-        self.assertIn("Task WP5-T1", answer)
-        self.assertIn("Task WP6-T1", answer)
-        self.assertIn("WP4 is paused", answer)
-        self.assertIn("It will stay paused", answer)
-        self.assertNotIn("No paused task matches", answer)
+        self.assertIn("Work Package planning is unavailable", answer)
+        self.assertEqual(self.world.execution.started, [])
 
     async def test_bare_yes_answers_the_single_reviewer_question(self):
         await self.world.job("WP4", "conv", status="awaiting_human_confirmation")
@@ -334,8 +329,7 @@ class InterpretationTests(_WorldTest):
         await self.world.job("WP4", "conv", status="awaiting_human_confirmation")
         await self.world.say("/implement WP5")
         answer = await self.world.say("yes")
-        self.assertIn("More than one thing is waiting", answer)
-        self.assertIn("The Reviewer's question for `WP4-T1`", answer)
+        self.assertIn("Answer the Reviewer's question", answer)
         self.assertEqual(self.world.execution.started, [])
         self.assertEqual(len(self.world.rows(
             "SELECT * FROM workflow_action_proposals WHERE status='pending'")), 1)
@@ -349,26 +343,24 @@ class InterpretationTests(_WorldTest):
         self.world.join("chat-b", "proj_b")
         self.world.join("chat-c", "proj_c")
         preview = await self.world.say("/implement WP5", conversation="chat-a")
-        token = re.search(r"confirm ([A-Z0-9]{6})", preview).group(1)
+        self.assertIn("Work Package planning is unavailable", preview)
         await self.world.job("WP4", "chat-b", status="awaiting_human_confirmation",
                              project="proj_b")
 
         self.assertIn("Nothing in this conversation is waiting",
                       await self.world.say("yes", conversation="chat-c"))
-        self.assertIn("No workflow proposal matches",
-                      await self.world.say(f"confirm {token}", conversation="chat-c"))
         self.assertIn("Answer the Reviewer's question",
                       await self.world.say("yes", conversation="chat-b"))
-        executed = await self.world.say("yes", conversation="chat-a")
-        self.assertIn("queued 1 task(s)", executed)
-        self.assertEqual([task for task, _ in self.world.execution.started], ["WP5-T1"])
+        self.assertIn("Nothing in this conversation is waiting",
+                      await self.world.say("yes", conversation="chat-a"))
+        self.assertEqual(self.world.execution.started, [])
 
     async def test_correction_replaces_the_pending_proposal(self):
         first = await self.world.say("implement WP5")
-        old = re.search(r"confirm ([A-Z0-9]{6})", first).group(1)
+        self.assertIn("Work Package planning is unavailable", first)
         second = await self.world.say("implement WP6")
-        self.assertIn("Task WP6-T1", second)
-        self.assertIn("superseded", await self.world.say(f"confirm {old}"))
+        self.assertIn("Work Package planning is unavailable", second)
+        self.assertEqual(self.world.rows("SELECT * FROM workflow_action_proposals"), [])
         self.assertEqual(self.world.execution.started, [])
 
     async def test_turns_are_logged_without_the_prompt(self):
@@ -430,12 +422,14 @@ class SwitchTests(_WorldTest):
     def _switch_state(self):
         return self.world.rows("SELECT state FROM workflow_switches")[0][0]
 
+    @unittest.skip("Legacy direct starts retired; planned approval conflict is tested in test_wp_planner")
     async def test_proposal_changes_nothing_until_answered(self):
         await self._propose_switch()
         self.assertEqual(self.world.job_status(self.wp4.job_id), "running")
         self.assertFalse(self.run.task.done())
         self.assertEqual(len(self.world.rows("SELECT * FROM implementation_jobs")), 1)
 
+    @unittest.skip("Legacy direct starts retired; planned approval conflict is tested in test_wp_planner")
     async def test_confirmed_switch_stops_first_then_starts(self):
         await self._propose_switch()
         wp4 = self.wp4.job_id
@@ -450,6 +444,7 @@ class SwitchTests(_WorldTest):
             "SELECT status FROM implementation_job_tasks WHERE job_id=?", wp4), [("stopped",)])
         self.assertEqual(self._switch_state(), "started")
 
+    @unittest.skip("Legacy direct starts retired; planned approval conflict is tested in test_wp_planner")
     async def test_rejection_leaves_the_running_job_alone(self):
         await self._propose_switch()
         self.assertIn("rejected", await self.world.say("no"))
@@ -457,6 +452,7 @@ class SwitchTests(_WorldTest):
         self.assertEqual(self.world.job_status(self.wp4.job_id), "running")
         self.assertEqual(self.world.execution.started, [])
 
+    @unittest.skip("Legacy direct starts retired; planned approval conflict is tested in test_wp_planner")
     async def test_duplicate_confirmation_switches_once(self):
         token = await self._propose_switch()
         await self.world.say(f"confirm {token}")
@@ -465,6 +461,7 @@ class SwitchTests(_WorldTest):
         self.assertEqual(len(self.world.execution.started), 1)
         self.assertEqual(len(self.world.rows("SELECT * FROM workflow_switches")), 1)
 
+    @unittest.skip("Legacy direct starts retired; planned approval conflict is tested in test_wp_planner")
     async def test_job_finishing_during_the_decision_refreshes_the_proposal(self):
         await self._propose_switch()
         await self.world.persistence.finish_implementation_job(self.wp4.job_id)
@@ -476,6 +473,7 @@ class SwitchTests(_WorldTest):
         self.assertNotIn("currently working on WP4", answer)
         self.assertEqual(self.world.execution.started, [])
 
+    @unittest.skip("Legacy direct starts retired; planned approval conflict is tested in test_wp_planner")
     async def test_failed_cancellation_starts_nothing(self):
         pending = asyncio.get_running_loop().create_future()
         self.addCleanup(pending.cancel)
@@ -508,6 +506,7 @@ class SwitchTests(_WorldTest):
         await self.world.persistence.update_implementation_task(self.wp4.job_id, 0, "waiting")
         self.assertEqual(self.world.job_status(self.wp4.job_id), "stopped")
 
+    @unittest.skip("Legacy direct starts retired; planned approval conflict is tested in test_wp_planner")
     async def test_crash_mid_switch_is_recovered_idempotently(self):
         token = await self._propose_switch()
         workflow = self.world.workflow(self.world.sessions["conv"])
@@ -532,6 +531,7 @@ class SwitchTests(_WorldTest):
         self.assertNotIn("was interrupted", await self.world.say("implement WP7"))
         self.assertEqual(self.world.execution.started, [])
 
+    @unittest.skip("Legacy direct starts retired; planned approval conflict is tested in test_wp_planner")
     async def test_paused_job_is_kept_paused_not_stopped(self):
         await self.world.persistence.update_implementation_task(
             self.wp4.job_id, 0, "awaiting_review_resolution")
@@ -544,6 +544,7 @@ class SwitchTests(_WorldTest):
         self.assertIn("queued 1 task(s)", executed)
         self.assertEqual(self.world.job_status(self.wp4.job_id), "awaiting_review_resolution")
 
+    @unittest.skip("Legacy direct starts retired; planned approval conflict is tested in test_wp_planner")
     async def test_orphaned_job_is_described_accurately(self):
         self.run.task.cancel()
         bridge_server._live_runs.pop(self.run.run_id, None)
@@ -551,6 +552,7 @@ class SwitchTests(_WorldTest):
         self.assertIn("is recorded as running, but nothing is executing it", preview)
         self.assertIn("mark WP4 as stopped", preview)
 
+    @unittest.skip("Legacy direct starts retired; planned approval conflict is tested in test_wp_planner")
     async def test_other_projects_do_not_conflict(self):
         self.world.join("elsewhere", "proj_b")
         preview = await self.world.say("implement WP5", conversation="elsewhere")

@@ -36,7 +36,8 @@ docker compose exec codepartner claude --version
 
 ### Task model routing
 
-OpenSpec tasks can be executed explicitly with `/run WP1-T1`. The task's
+Start implementation with `/implement WP1` so its Work Package is planned and
+approved first. The task's
 complexity selects a configured candidate pool, vLLM Semantic Router recommends
 one allowed model, and Code Partner starts Claude Code or Codex with the existing
 JetBrains MCP tool bridge. agentgateway is attempted where the authenticated CLI
@@ -94,6 +95,10 @@ server for later project reads and writes. The file uses this shape:
 }
 ```
 
+An optional Codebase Memory sidecar supplies bounded architectural context to
+OpenSpec and Work Package planning, with a host-side refresh after passing WP
+reviews. See [Codebase Memory setup](docs/codebase-memory.md).
+
 The backend caches discovered tools by conversation for 30 minutes. Clients may
 send a stable `conversation_id`; otherwise the backend returns its generated id
 in `X-CodePartner-Conversation-ID` and associates the session with the bootstrap
@@ -118,6 +123,11 @@ into the image. `.dockerignore` excludes the local `.env` file.
   Coding-run measurements are recorded in `telemetry_aci_attempts` in the
   routing database, including agent and backend calls, returned lines, output
   bytes, duplicates, edits, and provider-reported usage.
+- Tool-result compression: `CODEPARTNER_COMPRESS_ENABLED=false` (default). When
+  enabled, large search, listing, command and generic results pass through the
+  context-compress filter pipeline in an isolated sidecar (`compose.compress.yaml`)
+  and are accepted only if no identifier, error line or JSON value is lost; the
+  original stays retrievable. See [docs/context-compression.md](docs/context-compression.md).
 - LLM provider: `.env` `LLM_PROVIDER=claude|codex|ollama` (see Providers).
 - Coder provider: `.env` `CODER_PROVIDER=claude|codex` — who executes the accepted
   prompt in the pipeline, independent of `LLM_PROVIDER`.
@@ -179,7 +189,7 @@ with `/` keeps its normal one-shot meaning.
 | `dumb-router` | Default coding agent (unchanged behaviour) | — |
 | `codepartner-spec` | Drafts a new OpenSpec change in the chat; later messages revise it. Nothing is written until `/apply`; `/discard` drops it. | `add password reset` |
 | `codepartner-review` | Runs `/review` read-only. A message without a scope reuses the last scope named in the conversation. | `WP1: are tests missing?` |
-| `codepartner-implement` | Runs `/implement`. Every message must name its scope, so chat never writes code for an unspecified target. | `WP1-T1: add tests` |
+| `codepartner-implement` | Plans a named Work Package before implementation. | `WP1: add tests` |
 
 Replies to a pending implementation job (`yes`, `accept`, `undo`, …) are always
 handled first, whatever mode is selected. Spec-mode drafts use provisional IDs
@@ -188,23 +198,22 @@ handled first, whatever mode is selected. Spec-mode drafts use provisional IDs
 Implement persisted tasks with the model-routing pipeline:
 
 ```text
-/implement WP1-T1
 /implement WP1
 /implement EPIC1
-/implement WP1-T1: add MLflow tracking and keep the configuration injectable
+/implement WP1: add MLflow tracking and keep the configuration injectable
 ```
 
-`/implement` is the canonical execution command. A work-package selector
-expands to incomplete tasks in dependency order. Optional execution guidance
+`/implement` starts Work Package planning. An Epic selector queues its unfinished
+Work Packages, each planned after the previous package completes. Individual task
+selectors and `/run WP1-T1` direct the user to the parent Work Package. Optional guidance
 must follow a colon, so task selection remains unambiguous. The backend creates a durable
-implementation job, routes each task only when it starts, and executes tasks
+implementation job after plan approval, routes each task only when it starts, and executes tasks
 sequentially. For WP implementation, all tasks are assembled before one read-only
 WP review evaluates the completed feature against its OpenSpec contract. Outcomes
 are `PASS`, `BLOCK`, or `UNVERIFIED`: only concrete contract violations block;
 tooling or evidence limitations remain review/infrastructure problems and do not
 become coder failures. A failed task stops the job. IDE tool calls resume the
-same routed provider. The older `/run` form is accepted only as a compatibility
-alias and enters this same `/implement` workflow.
+same routed provider. Existing jobs can resume and recover without replanning.
 
 After every review attempt, chat shows the verdict, the actual coder and
 reviewer models, the reviewer's reason, the evidence checked, and any remaining
@@ -216,7 +225,7 @@ When a task is completed, its final model attribution and approval reason are
 also saved in the generated OpenSpec `tasks.md` and `.codepartner/tasks.md`
 dashboard; the structured catalog preserves those details on regeneration.
 
-`/implement` and `/run` use tools discovered from the conversation's
+`/implement` uses tools discovered from the conversation's
 `.codepartner/ide_mcp.json` server. The bridge reads that file for initial
 setup. Task completion depends on the reviewer judging the result against the
 active task's description and task-level acceptance criteria, not on an MCP write
@@ -334,8 +343,8 @@ For native runs, the backend host must have the `openspec` CLI on `PATH` (or set
 through the current AI Assistant request on first use, then use its
 conversation-scoped server configuration. They do not require
 `JETBRAINS_MCP_URL` or `JETBRAINS_MCP_PROJECT_PATH`. If a source-write/refactor
-capability is absent or unsupported, `/run` reports the missing capability;
-`/implement` can still execute research tasks. If the artifact store cannot be
+capability is absent or unsupported, implementation reports the missing capability;
+`/implement` can still execute genuine research deliverables. If the artifact store cannot be
 accessed, implementation cannot proceed. `/spec` and `/update` bypass the
 optimizer/coder pipeline and never execute generated tasks.
 

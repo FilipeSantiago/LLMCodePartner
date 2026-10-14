@@ -11,7 +11,7 @@ from starlette.responses import StreamingResponse
 
 import providers
 from conversation.chat_responder import ChatResponder
-from mcp_bridge.models import DoneEvent, ErrorEvent, TextEvent, ToolCallEvent
+from mcp_bridge.models import DoneEvent, ErrorEvent, ProgressEvent, TextEvent, ToolCallEvent
 from logger.diagnostic import debug
 
 log = logging.getLogger("codepartner.openai.sse")
@@ -63,7 +63,7 @@ class StreamingResponder(ChatResponder):
             usage = None
             try:
                 async for event in events:
-                    if isinstance(event, TextEvent):
+                    if isinstance(event, (TextEvent, ProgressEvent)):
                         if not event.text:
                             continue
                         delta = ({"role": "assistant", "content": event.text}

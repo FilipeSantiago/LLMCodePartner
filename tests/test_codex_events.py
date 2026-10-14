@@ -124,6 +124,13 @@ class SandboxArgs(unittest.TestCase):
             "http://127.0.0.1:7777/mcp/token", ["read_file", "create_new_file"], False)
         self.assertFalse(any("default_tools_approval_mode" in item for item in args))
 
+    def test_approved_implementation_preapproves_only_its_run_scoped_tools(self):
+        args = CodexProvider._mcp_args(
+            "http://127.0.0.1:7777/mcp/token", ["read_file", "apply_patch"],
+            False, preapprove_ide_tools=True)
+        self.assertIn('mcp_servers.jetbrains.default_tools_approval_mode="approve"', args)
+        self.assertIn('mcp_servers.jetbrains.enabled_tools=["read_file", "apply_patch"]', args)
+
     def test_reviewer_disables_shell_after_extra_args(self):
         with _clean_env(CODEX_ARGS="-c features.shell_tool=true"):
             args = CodexProvider()._base_args(reviewer_mode=True)

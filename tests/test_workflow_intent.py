@@ -16,7 +16,7 @@ from agent.spec.models import Task
 from agent.task_contracts.persistence import TaskContractPersistence
 from agent.workflow.controller import ConversationPhase, WorkflowController, parse_decision
 from agent.workflow.interpreter import WorkflowInterpreter
-from agent.workflow.states import WorkflowAction as A
+from agent.workflow.states import WorkflowAction as A, action_allowed
 from api import dialog_controller
 from mcp_bridge.models import DoneEvent, TextEvent
 from mcp_bridge.registry import ToolSpec
@@ -215,6 +215,40 @@ class WorkflowInterpretationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(service.retry_coder.call_args.args[6], "add coverage")
             service.retry_contract.assert_not_called()
             self.assertEqual(events[0].text, "retrying after review\n")
+
+    async def test_review_anyway_sends_a_blocked_handoff_to_the_reviewer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = _Fixture(directory)
+            job, _ = await fixture.paused(
+                status="awaiting_coder_recovery",
+                error="Coder handoff blocked: acceptance criteria or remaining gaps "
+                      "are unresolved")
+            intent = await fixture.workflow.interpret(
+                "review anyway", await fixture.workflow.context("conv"))
+            self.assertEqual(intent.action, A.RESOLVE_CODER_RECOVERY)
+            self.assertEqual(intent.parameters["recovery_mode"], "review_handoff")
+            self.assertEqual(fixture.provider.calls, [])
+
+            proposal = await fixture.workflow.propose(intent)
+            row = await fixture.workflow.find("conv", proposal.confirmation_token)
+            result = await fixture.workflow.claim(row)
+            service = mock.Mock()
+
+            async def review_blocked_handoff(*args):
+                yield TextEvent("reviewing")
+            service.review_blocked_handoff = mock.Mock(side_effect=review_blocked_handoff)
+            service.retry_coder = mock.Mock()
+            events = [event async for event in fixture.workflow.execute(
+                result.proposal, service, [], _specs(), {})]
+            service.review_blocked_handoff.assert_called_once()
+            service.retry_coder.assert_not_called()
+            self.assertEqual(events[0].text, "reviewing\n")
+
+    def test_review_handoff_mode_is_only_valid_during_coder_recovery(self):
+        self.assertTrue(action_allowed(
+            "awaiting_coder_recovery", "RESOLVE_CODER_RECOVERY", "review_handoff"))
+        self.assertFalse(action_allowed(
+            "recovery_required", "RESOLVE_CODER_RECOVERY", "review_handoff"))
 
     async def test_same_phrase_means_contract_retry_in_contract_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -628,7 +662,7 @@ class TranscriptTests(unittest.IsolatedAsyncioTestCase):
                 for patch in patches:
                     patch.stop()
 
-    async def test_explicit_implement_command_requires_confirmation(self):
+    async def test_explicit_implement_command_requires_planner(self):
         with tempfile.TemporaryDirectory() as directory:
             fixture = _Fixture(directory)
             patches = self._patches(fixture)
@@ -636,17 +670,9 @@ class TranscriptTests(unittest.IsolatedAsyncioTestCase):
                 patch.start()
             try:
                 preview = await self._say("/implement WP4 WP5", conversation="fresh")
-                self.assertIn("Action: Start implementation", preview)
-                self.assertIn("Task WP4-T1", preview)
-                self.assertIn("Nothing has executed yet.", preview)
+                self.assertIn("Work Package planning is unavailable", preview)
                 self.assertEqual(fixture.rows("SELECT * FROM implementation_jobs"), [])
                 self.assertEqual(fixture.execution.contracts, [])
-
-                # A bare "yes" is accepted because exactly one proposal is pending.
-                executed = await self._say("yes", conversation="fresh")
-                self.assertIn("queued 2 task(s)", executed)
-                self.assertEqual(len(fixture.rows("SELECT * FROM implementation_jobs")), 1)
-                self.assertEqual(len(fixture.execution.contracts), 1)
             finally:
                 for patch in patches:
                     patch.stop()
@@ -690,9 +716,9 @@ class TranscriptTests(unittest.IsolatedAsyncioTestCase):
                         return_value=classification)
                     revised = await self._say("No, start WP5 instead",
                                               model="codepartner-implement")
-                self.assertIn("Task WP5-T1", revised)
+                self.assertIn("Work Package planning is unavailable", revised)
                 self.assertEqual((await fixture.workflow.find("conv", token))["status"],
-                                 "superseded")
+                                 "pending")
                 self.assertEqual(len(fixture.rows("SELECT * FROM implementation_jobs")), 1)
             finally:
                 for patch in patches:

@@ -717,6 +717,9 @@ class AdapterValidation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.work_packages[0].id, "")
         self.assertEqual(result.work_packages[0].tasks[0].id, "")
         provider.complete.assert_awaited_once()
+        self.assertIn("Do not create preparatory discovery", provider.complete.call_args.args[1])
+        self.assertIn("investigation or report is itself the requested deliverable",
+                      provider.complete.call_args.args[1])
 
     async def test_rejects_unknown_requirement_reference(self):
         payload = self.payload()

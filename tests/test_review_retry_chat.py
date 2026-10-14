@@ -115,6 +115,40 @@ class ReviewRetryChatTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("confirmed", repeated.lower())
             self.assertEqual(start.call_count, 1)
 
+    async def test_clear_review_retry_runs_in_the_same_streaming_turn(self):
+        async def events(*_args):
+            await self.persistence.update_implementation_task(
+                self.job.job_id, 0, "completed")
+            yield TextEvent("review actually ran")
+
+        service = SimpleNamespace(retry_review=events)
+        with mock.patch.object(dialog_controller, "ImplementationService",
+                               return_value=service) as start:
+            result = await self.say("Retry the WP4 review", stream=True)
+            self.assertIn("review actually ran", result)
+            self.assertEqual(start.call_count, 1)
+            repeated = await self.say("Retry the WP4 review", stream=True)
+            self.assertIn("no paused review was found", repeated)
+            self.assertEqual(start.call_count, 1)
+
+    async def test_natural_coder_retry_runs_the_saved_job(self):
+        await self.persistence.update_implementation_task(
+            self.job.job_id, 0, "awaiting_coder_recovery",
+            error="The model's tool call could not be parsed")
+
+        async def events(*_args):
+            await self.persistence.update_implementation_task(
+                self.job.job_id, 0, "completed")
+            yield TextEvent("coder changed project files")
+
+        service = SimpleNamespace(retry_coder=events)
+        with mock.patch.object(dialog_controller, "ImplementationService",
+                               return_value=service) as start:
+            result = await self.say(
+                "Ok, I understand that u fail, but retry", stream=True)
+        self.assertIn("coder changed project files", result)
+        self.assertEqual(start.call_count, 1)
+
     async def test_stale_confirmation_executes_nothing(self):
         answer = await self.say("Retry the WP4 review")
         token = re.search(r"confirm ([A-Z0-9]{6})", answer).group(1)

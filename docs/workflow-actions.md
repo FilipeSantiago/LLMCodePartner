@@ -27,8 +27,8 @@ User message → interpret against the current workflow state → show proposal
 
 Before confirmation, CodePartner only reads workflow metadata, interprets the
 message, and saves a pending proposal. It never invokes the Coder, Reviewer,
-tests, or mutation tools before a proposal is confirmed. Explicit slash commands
-(`/implement WP4 WP5`, `/apply`, `/spec …`) are proposals too. Ordinary questions
+tests, or mutation tools before a proposal is confirmed. `/implement WP4 WP5`
+starts Work Package planning; `/apply` and `/spec …` remain proposals. Ordinary questions
 are answered through a read-only tool role and do not need confirmation.
 
 The mode picker is a hint to the interpreter, not a required message format.
@@ -65,7 +65,7 @@ The code lives in `agent/workflow/`:
 |---|---|---|
 | `awaiting_contract_resolution` | Stopped before review: TaskContract violated or exhausted | `RETRY_CONTRACT`, `EXPAND_CONTRACT_SCOPE`, `STOP_JOB` |
 | `awaiting_review_resolution` | Reviewer finished; a decision is needed | `RETRY_CODER_AFTER_REVIEW`, `ACCEPT_REVIEW`, `UNDO_IMPLEMENTATION`, `STOP_JOB` |
-| `awaiting_coder_recovery` | Coder interrupted before finishing | `RESOLVE_CODER_RECOVERY` (retry Coder), `UNDO_IMPLEMENTATION`, `STOP_JOB` |
+| `awaiting_coder_recovery` | Coder interrupted, or its handoff reported unresolved gaps | `RESOLVE_CODER_RECOVERY` (retry Coder; `review anyway` sends a blocked handoff to the Reviewer), `UNDO_IMPLEMENTATION`, `STOP_JOB` |
 | `recovery_required` | Mutation journal incomplete | `RESOLVE_CODER_RECOVERY` (inspect, establish baseline), `STOP_JOB` |
 | `awaiting_human_confirmation` | Reviewer asked a question | `ANSWER_REVIEWER_QUESTION`, `RETRY_REVIEW`, `STOP_JOB` |
 | `awaiting_evidence_resolution` | Reviewer could not obtain enough evidence | `RETRY_REVIEW`, `STOP_JOB` |
@@ -115,8 +115,8 @@ name the selector or prefix the task id.
 ### Work Package planning
 
 In every mode except review, a WP implementation request ("Let's do WP4",
-"implement WP1 and WP2") starts an interactive planning session for the first WP
-instead of a `START_IMPLEMENTATION` proposal. Further WPs are planned one at a time,
+"implement WP1 and WP2") starts an interactive planning session for the first WP.
+New task-level starts are directed to their parent WP. Further WPs are planned one at a time,
 each after the previous WP's job completes.
 Planning is read-only, so it runs without a token. While the session is active,
 the conversation phase is `planning`, and:
@@ -208,9 +208,10 @@ Confirmation claims the proposal in one SQLite transaction that checks:
 - the latest TaskContract revision is unchanged;
 - for `APPLY_SPEC`/`DISCARD_SPEC`, the referenced draft is still active.
 
-For `START_IMPLEMENTATION`, the selectors are re-resolved first; if the task list
-changed, nothing runs. Otherwise the claim and job creation happen in the same
-transaction, so repeated confirmation can never create duplicate jobs.
+Pending legacy `START_IMPLEMENTATION` proposals cannot be claimed; new work must
+start through an approved Work Package plan. `APPROVE_WP_PLAN` re-resolves its
+tasks before claiming and creates the job in the same transaction, so repeated
+confirmation cannot create duplicate jobs.
 
 If anything changed, nothing executes. When the action is still valid for the
 task's current state, a refreshed proposal with a new token is shown; otherwise
@@ -306,9 +307,14 @@ On startup, paused tasks from older releases are reclassified:
 | `awaiting_user_decision` | otherwise | `awaiting_manual_resolution` |
 | `awaiting_confirmation` | — | `awaiting_human_confirmation` |
 | `review_pending` (task status) | — | `awaiting_evidence_resolution` |
+| `failed` | recorded operational coder error | `awaiting_coder_recovery` |
 
 The `review_pending` review *verdict* stored in `implementation_reviews` is not
 changed. The migration is idempotent and runs from both the routing and the
 TaskContract persistence initializers, so table creation order does not matter.
 A job that was stuck after a contract escalation becomes resolvable through the
 workflow above.
+
+An explicit `retry` message for a single paused operational coder or reviewer
+failure claims and executes that saved job immediately in a streaming IDE session.
+Other workflow actions retain their confirmation step.

@@ -247,6 +247,8 @@ class ContractExecutionGuard:
     @staticmethod
     def _required_operation(effective: str) -> str | None:
         lower = effective.lower()
+        if lower.startswith("kb_"):
+            return "kb_inspect"
         if "terminal" in lower or "run_configuration" in lower:
             return OP_SHELL_EXECUTE
         if lower in {"read_file", "get_file_text_by_path"}:

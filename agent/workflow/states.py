@@ -53,9 +53,10 @@ ACTIONS_BY_STATE: dict[WorkflowState, tuple[WorkflowAction, ...]] = {
     S.MANUAL_RESOLUTION: (A.STOP_JOB,),
 }
 
-# RESOLVE_CODER_RECOVERY covers two different recovery states.
+# RESOLVE_CODER_RECOVERY covers two different recovery states. `review_handoff`
+# sends a blocked (complete but gap-reporting) coder handoff to the Reviewer.
 RECOVERY_MODES: dict[WorkflowState, tuple[str, ...]] = {
-    S.CODER_RECOVERY: ("retry_coder",),
+    S.CODER_RECOVERY: ("retry_coder", "review_handoff"),
     S.JOURNAL_RECOVERY: ("inspect", "establish_baseline"),
 }
 
@@ -73,7 +74,7 @@ ACTION_DESCRIPTIONS: dict[WorkflowAction, str] = {
     A.RETRY_REVIEW: "run the Reviewer again",
     A.ACCEPT_REVIEW: "accept the implementation (overriding a failed review if needed)",
     A.UNDO_IMPLEMENTATION: "restore this task's changes and stop the job",
-    A.RESOLVE_CODER_RECOVERY: "recover an interrupted Coder run",
+    A.RESOLVE_CODER_RECOVERY: "recover an interrupted or blocked Coder run",
     A.ANSWER_REVIEWER_QUESTION: "answer the Reviewer's question (yes completes the task)",
     A.APPLY_SPEC: "apply the active OpenSpec draft",
     A.DISCARD_SPEC: "discard the active OpenSpec draft",

@@ -8,6 +8,9 @@ _RETRY_REVIEW = re.compile(
 _NEGATED_RETRY = re.compile(
     r"\b(?:do not|don't|dont|never|no)\s+(?:want to\s+)?"
     r"(?:retry|rerun|re-run|run again)\b", re.IGNORECASE)
+_ANY_RETRY = re.compile(
+    r"\b(?:retry|rerun|re-run|run again|try(?:\s+(?:the\s+coder\s+)?)again)\b",
+    re.IGNORECASE)
 _NUMBER = re.compile(r"^[1-9]\d*$")
 _MENU_LINE = re.compile(r"^\s*(\d+)\.\s+(.+)$")
 
@@ -40,3 +43,9 @@ def explicit_retry_request(message: str, history: list[dict]) -> bool:
     """Recognize a review retry even when no paused task can be found."""
     interpreted = offered_choice(message, history) or message.strip()
     return bool(_RETRY_REVIEW.search(interpreted) and not _NEGATED_RETRY.search(interpreted))
+
+
+def explicit_operational_retry_request(message: str, history: list[dict]) -> bool:
+    """An affirmative user request to rerun the paused coder or reviewer."""
+    interpreted = offered_choice(message, history) or message.strip()
+    return bool(_ANY_RETRY.search(interpreted) and not _NEGATED_RETRY.search(interpreted))

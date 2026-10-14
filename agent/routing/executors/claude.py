@@ -39,5 +39,6 @@ class ClaudeCLIExecutor:
             },
             execution_env=env,
             direct_tool_handlers=context.direct_tool_handlers,
+            kb_first=context.kb_first,
         ):
             yield event

@@ -55,6 +55,10 @@ tokens, revalidation, and migration of older paused jobs.
 
 ## Discovery contracts
 
+These remain for existing OpenSpec tasks and investigations that are themselves
+deliverables. New changes do not need preparatory discovery tasks before a
+Work Package implementation; its planner performs that investigation.
+
 Tasks whose OpenSpec `preferred_capability` is `read`, `research`, `inspect`,
 `inspection`, `analysis`, `review`, or `verification` investigate rather than edit.
 Proving that something is absent (for example "no MLflow integration exists")

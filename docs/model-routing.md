@@ -1,12 +1,11 @@
 # Model routing
 
-`/implement WP1-T1` resolves an existing OpenSpec task, selects a model from the
-task's `simple`, `medium`, or `complex` candidate tier, and starts the selected
-authenticated coding CLI. `/implement WP1` expands an entire work package in
-dependency order, while `/implement EPIC1` expands its WPs. Tasks remain the
-routing unit, but the assembled WP is the primary validation and review boundary.
-The legacy `/run` syntax is normalized into the same durable implementation job;
-there is no parallel executor workflow.
+`/implement WP1` plans the Work Package before creating a job. After approval,
+each task selects a model from its `simple`, `medium`, or `complex` candidate tier
+and starts the selected authenticated coding CLI. `/implement EPIC1` plans its WPs
+in sequence. Task selectors and the legacy `/run` command direct users to the
+parent Work Package. Tasks remain the routing unit, and the assembled WP is the
+primary validation and review boundary.
 
 ## Configuration
 
@@ -19,6 +18,9 @@ there is no parallel executor workflow.
   model directly after an operational gateway failure. This applies to coding,
   WP planning, and review calls.
 - `gateway_mode: required` never bypasses the gateway; `disabled` never uses it.
+- The bundled subscription-only configuration disables gateway attempts for every
+  Codex alias: direct Codex login works without a separately scoped Responses API
+  credential. Claude retains gateway-first routing.
 
 The vLLM configuration in `infra/semantic-router/config.yaml` mirrors these
 aliases. At runtime Code Partner calls vLLM's route-preview management endpoint,
@@ -47,11 +49,33 @@ section. See `docs/wp-planner.md`.
 
 The router uses configured order as a deterministic fallback when Semantic Router
 is unavailable or returns an invalid selection. Failed gateway attempts retry the
-same model directly before the next candidate is tried. A different coding model
-is not started after a successful JetBrains write tool result, preventing a
-fallback agent from replaying partial edits. Reviewer fallback is only for
-provider execution failure, not unfavorable findings or failed evidence checks.
-If no reviewer can run, review remains pending/UNVERIFIED.
+same model directly before the next candidate is tried, except a Claude
+subscription/session-limit denial, which skips the redundant same-credential retry.
+Operational coder failures
+then try an eligible agent from the other provider, even after a successful IDE
+write or a tool-result round trip. The next agent first checks the mutation
+journal and current files; it does not replay completed tool calls. If no agent
+can finish, the job pauses for a chat retry. Reviewer provider and output-format
+failures also try another eligible reviewer. Unfavorable findings and failed
+evidence checks remain review results. If no reviewer can run, review remains
+pending/UNVERIFIED.
+
+Approved implementation-job Codex runs preapprove only their private, role-filtered
+IDE MCP tool list. The bridge still enforces allowed operations and journals writes;
+standalone Codex calls keep their prior approval behavior. A missing, invalid, or
+blocked coder handoff pauses the saved task for recovery. It cannot be labeled
+implemented or advance a dependent WP task.
+
+A clear `retry` reply for one paused coder or reviewer runs that saved job in a
+streaming IDE session. If several jobs match, CodePartner asks which task to retry.
+The gateway routes individual provider requests; CodePartner owns CLI agent
+switching and recovery from persisted IDE tool state.
+
+To repair the historical WP3 run that advanced blocked handoffs, use
+`python -m agent.routing.repair_blocked_handoffs --list`, then preview the exact
+job with `--job-id JOB_ID`. Only after reviewing the preview, add `--apply`.
+The command refuses active jobs or any later mutation/review history and preserves
+the original reports and routing audit.
 
 ## Operations
 

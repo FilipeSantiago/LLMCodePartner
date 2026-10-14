@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 from uuid import uuid4
 
+import yaml
+
 from agent.routing.jetbrains_tools import DirectIdeTools
+from agent.spec.bridge_client import DirectMcpFileClient
 from agent.spec.jetbrains_mcp import JetBrainsMcpClient, JetBrainsMcpError
 
 SESSION_TTL_SECONDS = 30 * 60
@@ -25,6 +28,9 @@ class IdeMcpSession:
     expires_at: float
     # Stable, path-free identity of the IDE project this conversation edits.
     project_id: str | None = None
+    knowledge_base: dict | None = None
+    project_path: str | None = None
+    project_name: str | None = None
 
 
 _sessions: OrderedDict[str, IdeMcpSession] = OrderedDict()
@@ -122,7 +128,8 @@ def get_session(conversation_id: str | None) -> IdeMcpSession | None:
         return None
     refreshed = IdeMcpSession(
         session.conversation_id, session.client, session.tools, now + SESSION_TTL_SECONDS,
-        session.project_id,
+        session.project_id, session.knowledge_base,
+        session.project_path, session.project_name,
     )
     _sessions[conversation_id] = refreshed
     _sessions.move_to_end(conversation_id)
@@ -153,11 +160,53 @@ async def configure_session(conversation_id: str, raw_config: str) -> IdeMcpSess
             or any(ord(char) < 32 for char in project_path)):
         raise JetBrainsMcpError("IJ_MCP_SERVER_PROJECT_PATH must be an absolute path")
 
+    knowledge_base = config.get("knowledge_base")
+
     client = JetBrainsMcpClient(url=url, headers={"IJ_MCP_SERVER_PROJECT_PATH": project_path})
     tools = await DirectIdeTools.discover(client)
+    project_files = DirectMcpFileClient(client, tools.specs)
+    project_name = None
+    try:
+        exists = await project_files.file_exists(".codepartner/config.yaml")
+    except JetBrainsMcpError:
+        raise
+    if exists:
+        try:
+            project_config = yaml.safe_load(await project_files.read_file(
+                ".codepartner/config.yaml"))
+        except yaml.YAMLError as exc:
+            raise JetBrainsMcpError(".codepartner/config.yaml must contain valid YAML") from exc
+        if not isinstance(project_config, dict) or not isinstance(project_config.get("project"), dict):
+            raise JetBrainsMcpError(".codepartner/config.yaml requires a project mapping")
+        project = project_config["project"]
+        project_name = project.get("id")
+        if not isinstance(project_name, str) or not project_name.strip():
+            raise JetBrainsMcpError("project.id must be a non-empty string")
+        if "knowledge_base" in project:
+            kb = project["knowledge_base"]
+            if (not isinstance(kb, dict) or kb.get("provider") != "codebase-memory"
+                    or not isinstance(kb.get("project_id"), str)
+                    or not kb["project_id"].strip()):
+                raise JetBrainsMcpError(
+                    "project.knowledge_base requires provider 'codebase-memory' and project_id")
+            knowledge_base = {"enabled": True, "provider": "codebase-memory",
+                              "project_id": kb["project_id"].strip()}
+
+    if knowledge_base is not None:
+        if not isinstance(knowledge_base, dict) or not isinstance(
+                knowledge_base.get("enabled"), bool):
+            raise JetBrainsMcpError("knowledge_base.enabled must be a boolean")
+        if knowledge_base["enabled"] and (
+                knowledge_base.get("provider") != "codebase-memory"
+                or not isinstance(knowledge_base.get("project_id"), str)
+                or not knowledge_base["project_id"].strip()):
+            raise JetBrainsMcpError(
+                "enabled knowledge_base requires provider 'codebase-memory' and project_id")
+
     session = IdeMcpSession(
         conversation_id, client, tools, time.monotonic() + SESSION_TTL_SECONDS,
-        project_id_for(project_path),
+        project_id_for(project_path), knowledge_base,
+        project_path, project_name,
     )
     _sessions[conversation_id] = session
     _sessions.move_to_end(conversation_id)

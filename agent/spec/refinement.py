@@ -36,10 +36,11 @@ def _task_plan(task: Task) -> tuple:
 
 class RefinementService:
     def __init__(self, artifacts: ArtifactStore, adapter: OpenSpecAdapter,
-                 persistence: RoutingPersistence):
+                 persistence: RoutingPersistence, planning_context: str = ""):
         self.artifacts = artifacts
         self.adapter = adapter
         self.persistence = persistence
+        self.planning_context = "\n\n" + planning_context if planning_context else ""
 
     async def start(self, conversation_id: str, target_id: str) -> str:
         kind, change, target = await self.artifacts.object_by_id(target_id)
@@ -55,7 +56,8 @@ class RefinementService:
 
     async def start_draft(self, conversation_id: str, request: str) -> str:
         """Generate a new change as a conversation draft; nothing is written yet."""
-        draft = self._provisional_ids(await self.adapter.generate_change(request))
+        draft = self._provisional_ids(await self.adapter.generate_change(
+            request + self.planning_context))
         await self.persistence.create_refinement(
             str(uuid4()), conversation_id, NEW_CHANGE_TARGET, NEW_CHANGE_KIND, "",
             draft.to_dict())
@@ -68,11 +70,12 @@ class RefinementService:
         current = OpenSpecChange.from_dict(session["draft"])
         if session["target_kind"] == NEW_CHANGE_KIND:
             refined = self._provisional_ids(await self.adapter.refine_change(
-                current, "the whole draft change (all work packages and tasks)", instruction))
+                current, "the whole draft change (all work packages and tasks)",
+                instruction + self.planning_context))
             await self.persistence.update_refinement(session["session_id"], refined.to_dict())
             return self._draft_text("Draft updated", refined)
         refined = await self.adapter.refine_change(
-            current, session["target_id"], instruction)
+            current, session["target_id"], instruction + self.planning_context)
         self._check_scope(current, refined, session["target_kind"], session["target_id"])
         await self.persistence.update_refinement(session["session_id"], refined.to_dict())
         return self._summary(current, refined, session["target_id"])

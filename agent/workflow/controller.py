@@ -205,6 +205,36 @@ class ConversationWorkflow:
                 self._planning_available = False
         return self._planning_available
 
+    async def plan_start_for_selectors(self, artifacts, selectors,
+                                       instruction: str) -> PlanStart | str:
+        if not self.planning_available:
+            return "Work Package planning is unavailable; implementation cannot start."
+        wp_ids = []
+        for selector in selectors:
+            if _WP_ONLY.fullmatch(selector):
+                kind, _, _ = await artifacts.object_by_id(selector)
+                if kind != "work_package":
+                    return f"{selector} is not a Work Package."
+                wp_ids.append(selector)
+            elif re.fullmatch(r"WP\d+-T\d+", selector):
+                parent = selector.split("-T", 1)[0]
+                await artifacts.task_by_id(selector)
+                return (f"Start with `{parent}` so the Work Package can be planned before "
+                        f"implementing {selector}.")
+            elif re.fullmatch(r"EPIC\d+", selector):
+                kind, change, _ = await artifacts.object_by_id(selector)
+                if kind != "epic":
+                    return f"{selector} is not an Epic."
+                wp_ids.extend(package.id for package in change.work_packages
+                              if any(task.status not in {"completed", "cancelled"}
+                                     and not task.completed for task in package.tasks))
+            else:
+                return f"Unknown implementation selector: {selector}."
+        wp_ids = list(dict.fromkeys(wp_ids))
+        if not wp_ids:
+            return "The selected work has no unfinished Work Packages."
+        return PlanStart(tuple(wp_ids), instruction)
+
     @property
     def interpreter(self) -> WorkflowInterpreter:
         if self._interpreter is None:
@@ -243,14 +273,8 @@ class ConversationWorkflow:
         if action == "START_IMPLEMENTATION":
             if artifacts is None:
                 return "An IDE MCP session is needed to identify the tasks. Nothing was executed."
-            if (self.planning_available and selectors
-                    and all(_WP_ONLY.fullmatch(selector) for selector in selectors)):
-                return PlanStart(tuple(selectors), message.strip())
-            intent = ImplementationIntent(
-                selectors, instruction, classification["confidence"], (),
-                "conversation-intent")
-            return await self.propose_start(
-                conversation_id, fingerprint(message), intent, artifacts)
+            return await self.plan_start_for_selectors(
+                artifacts, selectors, instruction or message.strip())
         if action == "CODING":
             if mode_hint == "review":
                 return "Review mode is read-only. Nothing was executed."
@@ -672,6 +696,13 @@ class ConversationWorkflow:
             return ClaimResult(proposal["status"], proposal, (
                 f"Proposal {token} is {proposal['status']}; nothing was executed."))
         intent = WorkflowIntent.from_proposal(proposal)
+        if intent.action == A.START_IMPLEMENTATION:
+            if proposal["status"] == "pending":
+                await self.persistence.resolve_workflow_proposal(
+                    proposal["proposal_id"], "stale")
+            return ClaimResult("stale", proposal, (
+                "New implementation requires an approved Work Package plan. "
+                "Start with its Work Package selector; nothing was executed."))
         job = tasks = None
         if (intent.action in {A.START_IMPLEMENTATION, A.APPROVE_WP_PLAN}
                 and proposal["status"] == "pending"):
@@ -795,6 +826,9 @@ class ConversationWorkflow:
                 events = service.inspect_recovery(job_id, position)
             elif mode == "establish_baseline":
                 events = service.establish_new_baseline(
+                    job_id, position, messages, specs, instruction, handlers, guidance)
+            elif mode == "review_handoff":
+                events = service.review_blocked_handoff(
                     job_id, position, messages, specs, instruction, handlers, guidance)
             else:
                 events = service.retry_coder(

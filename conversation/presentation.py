@@ -6,6 +6,7 @@ run together.
 """
 
 import json
+import re
 
 STATUS = {
     "approved": "✅ Approved",
@@ -21,6 +22,14 @@ VALIDATION_ICONS = {"satisfied": "✅", "failed": "❌", "unverified": "⚠️",
 
 def one_line(text: str) -> str:
     return " ".join(str(text).split())
+
+
+def first_sentence(text: str, limit: int = 200) -> str:
+    """The opening sentence of a summary, on one line and at most `limit` characters."""
+    text = one_line(text)
+    match = re.search(r"[.!?](?=\s)", text)
+    sentence = text[:match.end()] if match else text
+    return sentence if len(sentence) <= limit else sentence[:limit - 1].rstrip() + "…"
 
 
 def block(text: str) -> str:
@@ -125,7 +134,7 @@ def coder_handoff(handoff: dict) -> str:
                      "_No structured handoff was returned._")
     lines = ["**Coder handoff** (unverified until review)"]
     if handoff.get("summary"):
-        lines.append(one_line(handoff["summary"]))
+        lines.append(first_sentence(handoff["summary"]))
     changed = [entry for entry in handoff.get("changed_files") or []
                if isinstance(entry, dict) and entry.get("path")]
     if changed:

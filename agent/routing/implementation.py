@@ -1,5 +1,6 @@
 """Sequential, durable execution and outcome review of OpenSpec tasks."""
 
+import asyncio
 import json
 import logging
 import re
@@ -8,8 +9,10 @@ from collections.abc import AsyncIterator
 from dataclasses import asdict, replace
 
 from agent.planning.models import ApprovedWPPlan
+from agent.kb_first import KbFirstPolicy, evidence_seed
 from agent.planning.render import coder_context, reviewer_context
 from agent.routing.config import load_routing_config
+from agent.routing.gateway import brief_failure
 from conversation import presentation as ui
 from agent.routing.models import HALTED_JOB_STATUSES, ImplementationJob, ImplementationJobTask
 from agent.routing.persistence import RoutingPersistence
@@ -27,7 +30,9 @@ from agent.spec.models import (CompletionReview, Task, ValidationContract,
 from agent.task_contracts.contractor import TaskContractor, requested_paths, USER_RESOLUTION_REASON
 from agent.task_contracts.persistence import TaskContractPersistence
 from mcp_bridge import bridge
-from mcp_bridge.models import DoneEvent, ErrorEvent, Event, Run, TextEvent, ToolCallEvent
+from mcp_bridge.activity import describe_call
+from mcp_bridge.models import (DoneEvent, ErrorEvent, Event, ProgressEvent, Run,
+                               TextEvent, ToolCallEvent)
 from mcp_bridge.registry import ToolSpec
 
 
@@ -35,11 +40,33 @@ log = logging.getLogger("codepartner.implementation")
 REVISION_BUDGET = 3
 _REVIEWER_CONTEXT_MARKER = "BEGIN CODEPARTNER REVIEWER REVISION CONTEXT"
 _REVIEWER_CONTEXT_END = "END CODEPARTNER REVIEWER REVISION CONTEXT"
-# Coder failures where the model itself broke down mid-task. Files written so far
-# stay in place, so the user chooses between another model and undo.
-_RECOVERABLE_CODER_FAILURE = re.compile(r"tool call could not be parsed", re.IGNORECASE)
+# A failed provider run stays attached to its implementation job. The next
+# attempt starts from the journaled project state, not from a chat-only answer.
 CODER_RECOVERY_STATUS = "awaiting_coder_recovery"
 _REQUIRES_TESTS = re.compile(r"\b(?:tests?|pytest|unit[- ]tests?)\b", re.IGNORECASE)
+
+
+def handoff_blocker(report: str, task_id: str) -> str | None:
+    """Reject invalid handoffs and coder-declared blocked task criteria."""
+    handoff = _handoff(report)
+    if (handoff.get("schema_version") != 1 or handoff.get("task_id") != task_id
+            or not isinstance(handoff.get("summary"), str)
+            or not handoff["summary"].strip()):
+        return "Coder handoff invalid: missing the versioned result for this task"
+    criteria = handoff.get("criteria")
+    if (not isinstance(criteria, list) or not criteria
+            or any(not isinstance(item, dict)
+                   or item.get("status") not in {"satisfied", "blocked"}
+                   for item in criteria)):
+        return "Coder handoff invalid: criteria must report satisfied or blocked"
+    gaps = handoff.get("remaining_gaps")
+    if not isinstance(gaps, list) or any(not isinstance(gap, str) for gap in gaps):
+        return "Coder handoff invalid: remaining_gaps must be an array of strings"
+    # A gap can describe work assigned to a later task. Let the reviewer judge
+    # its relevance to this task instead of stopping the sequential job here.
+    if any(item["status"] == "blocked" for item in criteria):
+        return "Coder handoff blocked: active-task acceptance criteria are unresolved"
+    return None
 
 
 def _requires_test_run(package) -> bool:
@@ -59,7 +86,8 @@ class ImplementationService:
                  task_execution: TaskExecutionService | None = None,
                  persistence: RoutingPersistence | None = None,
                  reviewer: ReviewService | None = None,
-                 contract_persistence: TaskContractPersistence | None = None):
+                 contract_persistence: TaskContractPersistence | None = None,
+                 kb_refresh=None):
         self.artifacts = artifacts
         self.task_execution = task_execution or TaskExecutionService()
         self.persistence = persistence or self.task_execution.persistence
@@ -70,6 +98,7 @@ class ImplementationService:
         self.config = (getattr(self.reviewer, "config", None)
                        or getattr(self.task_execution, "config", None)
                        or load_routing_config())
+        self.kb_refresh = kb_refresh
 
     def _coder_line(self, model: str | None, fallbacks: tuple[str, ...] = ()) -> str:
         """Which model routing picked for the coder."""
@@ -96,7 +125,7 @@ class ImplementationService:
         if failure:
             events.append(("failure", failure[:500], None))
         if handoff.get("summary"):
-            events.append(("decisions", str(handoff["summary"])[:1000], None))
+            events.append(("decisions", str(handoff["summary"])[:3000], None))
         changed = [entry.get("path") for entry in handoff.get("changed_files") or []
                    if isinstance(entry, dict) and isinstance(entry.get("path"), str)]
         if changed:
@@ -303,15 +332,12 @@ class ImplementationService:
         return "".join((
             ui.heading("⛔", f"{task_id} — Coding failed",
                        f"coder: {coder_label} · reviewer: not run"),
-            ui.quote(f"Reason: {error}"),
+            ui.quote(f"Reason: {brief_failure(error)}"),
             ui.block(f"Implementation job {ui.short_job(job_id)} stopped."),
         ))
 
     async def _coder_failed(self, job_id: str, position: int, error: str) -> str:
-        """Record a coder failure; recoverable ones wait for the user instead of stopping."""
-        if not _RECOVERABLE_CODER_FAILURE.search(error):
-            await self._fail(job_id, position, error)
-            return await self._failed_text(job_id, position, error)
+        """Keep an exhausted operational failure available for a later chat retry."""
         await self.persistence.update_implementation_task(
             job_id, position, CODER_RECOVERY_STATUS, error=error)
         item = await self.persistence.implementation_task(job_id, position)
@@ -321,15 +347,34 @@ class ImplementationService:
         except ReviewError:
             coder_label = coder_model or "unknown"
         task_id = item.task_id if item else f"position {position}"
+        if error.startswith("Coder handoff blocked"):
+            # The coder finished and reported gaps; the Reviewer can still judge it.
+            report = await self.persistence.coder_report_for(job_id, position)
+            gaps = [gap for gap in _handoff(report or "").get("remaining_gaps") or []
+                    if isinstance(gap, str) and gap.strip()]
+            return "".join((
+                ui.heading("⏸", f"{task_id} — Coder reported unresolved gaps",
+                           f"coder: {coder_label} · reviewer: not run yet"),
+                ui.quote(f"Reason: {brief_failure(error)}"),
+                *(ui.quote("Gap: " + gap) for gap in gaps),
+                ui.block(f"{task_id} (job {ui.short_job(job_id)}): choose what to do next."),
+                ui.menu((
+                    "1. Reply `review anyway` to send the coder's report to the Reviewer, "
+                    "which judges the acceptance criteria; the job continues if it passes.",
+                    "2. Reply `try coder again: <guidance>` to rerun the coder under the same "
+                    "task contract.",
+                    "3. Reply `undo` to restore only this task's changes and stop the job.",
+                )),
+            ))
         return "".join((
             ui.heading("⏸", f"{task_id} — Coding interrupted",
                        f"coder: {coder_label} · reviewer: not run (the coder did not finish)"),
-            ui.quote(f"Reason: {error}"),
+            ui.quote(f"Reason: {brief_failure(error)}"),
             ui.block("Files written before the interruption are still in the project."),
             ui.block(f"{task_id} (job {ui.short_job(job_id)}): choose what to do next."),
             ui.menu((
                 "1. Reply `try coder again` (optionally `try coder again: <guidance>`) to "
-                "continue this task on a different model, keeping the current files.",
+                "continue this task from the saved files.",
                 "2. Reply `undo` to restore only this task's changes and stop the job.",
             )),
         ))
@@ -384,9 +429,12 @@ class ImplementationService:
                 failed = event.message
             if isinstance(event, ToolCallEvent):
                 paused = True
+                yield ProgressEvent(
+                    ui.progress_line("tool", describe_call(event.name, event.arguments)))
             if isinstance(event, DoneEvent):
                 terminal = event
-            else:
+            elif not isinstance(event, TextEvent):
+                # Coder prose is kept in the saved report, not echoed to chat.
                 yield event
         await self.persistence.save_coder_report(job_id, position, report)
         if paused:
@@ -399,15 +447,33 @@ class ImplementationService:
             if terminal is not None:
                 yield terminal
             return
+        if not failed and getattr(self.task_execution, "strict_handoff", False):
+            blocker = handoff_blocker(
+                report, run.metadata.get("implementation_task_id", ""))
+            if blocker:
+                if blocker.startswith("Coder handoff invalid"):
+                    item = await self.persistence.implementation_task(job_id, position)
+                    async for event in self._continue_after_coder_failure(
+                            item, messages, specs,
+                            run.metadata.get("implementation_instruction", ""),
+                            run.direct_tool_handlers, blocker):
+                        yield event
+                else:
+                    yield TextEvent(await self._coder_failed(job_id, position, blocker))
+                return
         if failed:
-            yield TextEvent(await self._coder_failed(job_id, position, failed))
+            item = await self.persistence.implementation_task(job_id, position)
+            async for event in self._continue_after_coder_failure(
+                    item, messages, specs, run.metadata.get("implementation_instruction", ""),
+                    run.direct_tool_handlers, failed):
+                yield event
         else:
             async for event in self._task_finished(
                     job_id, position, messages, specs,
                     run.metadata.get("implementation_instruction", ""),
                     run.direct_tool_handlers, report, run.metadata.get("model")):
                 yield event
-        if terminal is not None:
+        if terminal is not None and not failed:
             yield terminal
 
     async def finish_child(self, run: Run, messages: list[dict],
@@ -447,12 +513,20 @@ class ImplementationService:
                         exclude_models: frozenset[str] = frozenset()) -> AsyncIterator[Event]:
         change, task = await self.artifacts.task_by_id(item.task_id)
         plan = await self._approved_plan(item.job_id)
+        prior_events = [event for event in await self.persistence.reviewer_context_events(
+                            plan.plan_id, item.job_id)
+                        if event["position"] < item.position] if plan else []
         contract = await self.contract_persistence.latest(item.job_id, item.position)
         if contract is None:
             contract = self.contractor.initial_contract(
                 task, specs, instruction,
                 task_context=plan.tasks.get(task.id) if plan else None)
             await self.contract_persistence.save(item.job_id, item.position, contract)
+        if contract.excluded_files:
+            specs = [spec for spec in specs if not spec.name.startswith("kb_")]
+            direct_tool_handlers = {name: handler for name, handler in
+                                    direct_tool_handlers.items()
+                                    if not name.startswith("kb_")}
         await self.persistence.update_implementation_task(item.job_id, item.position, "running")
         yield TextEvent(ui.heading(
             "🛠", f"{task.id} · {task.title}",
@@ -476,16 +550,39 @@ class ImplementationService:
             declared_artifacts("\n".join((
                 task.title, task.description, task.context,
             ))))
+        project_id = (await self.persistence.implementation_job_project_id(item.job_id)
+                      if hasattr(self.persistence, "implementation_job_project_id") else None)
+        async def recent_mutations(since):
+            return (await self.persistence.recent_mutations(project_id, since)
+                    if project_id else [])
+        discovery = getattr(self.config, "discovery", None)
+        policy = (KbFirstPolicy(
+            role="coder", tool_names=[spec.name for spec in specs],
+            outline_gate_lines=discovery.outline_gate_lines,
+            search_gate_max=discovery.search_gate_max,
+            excluded_files=contract.excluded_files,
+            recent_mutations=recent_mutations,
+            seed=evidence_seed("\n".join((task.title, task.description,
+                                         task.context, task.acceptance_criteria
+                                         if isinstance(task.acceptance_criteria, str)
+                                         else " ".join(task.acceptance_criteria or ())))),
+            mode=discovery.mode_for("coder"), tier=task.complexity,
+            advisory_thresholds=discovery.thresholds_for("coder", task.complexity),
+            small_file_bytes=discovery.small_file_bytes)
+            if (discovery is not None and discovery.enabled and not contract.excluded_files
+                and any(spec.name == "kb_search_graph" for spec in specs)) else None)
         async for event in self.task_execution.execute(
                 task, change.id, messages, specs, on_decision=record_decision,
                 execution_instruction=instruction,
                 direct_tool_handlers=tracked_handlers, exclude_models=exclude_models,
+                **({"kb_first": policy} if policy else {}),
                 contract=contract, owner_metadata={
                     "implementation_job_id": item.job_id,
                     "implementation_position": item.position,
                     "implementation_task_id": task.id,
                     **({"plan_id": plan.plan_id} if plan else {}),
-                }, **({"plan_context": coder_context(plan, task.id)} if plan else {})):
+                }, **({"plan_context": coder_context(plan, task.id, prior_events)}
+                   if plan else {})):
             if routed is not None and not announced:
                 announced = True
                 yield TextEvent(self._coder_line(
@@ -493,6 +590,8 @@ class ImplementationService:
             if isinstance(event, TextEvent):
                 report_parts.append(event.text)
             if isinstance(event, ToolCallEvent):
+                yield ProgressEvent(ui.progress_line(
+                    "tool", describe_call(event.name, event.arguments)))
                 paused = True
                 run = bridge.run_for(event.tool_call_id)
                 if run is not None:
@@ -506,12 +605,9 @@ class ImplementationService:
                 await self.persistence.update_implementation_task(item.job_id, item.position, "waiting")
             if isinstance(event, ErrorEvent):
                 failure = event.message
-            if isinstance(event, TextEvent):
-                # Coder notes are shown quoted; the JSON handoff is summarized below.
-                prose = _without_handoff(event.text)
-                if prose.strip():
-                    yield TextEvent(ui.quote(prose))
-            elif not isinstance(event, DoneEvent):
+            # Coder prose stays in the saved report; the chat shows one line per
+            # tool call (from the bridge) and the summarized handoff below.
+            if not isinstance(event, (TextEvent, DoneEvent)):
                 yield event
         report = "".join(report_parts)
         await self.persistence.save_coder_report(item.job_id, item.position, report)
@@ -526,13 +622,87 @@ class ImplementationService:
                                      f"{task.id} was not reviewed and no further tasks will run."))
             return
         if failure:
-            yield TextEvent(await self._coder_failed(item.job_id, item.position, failure))
+            async for event in self._continue_after_coder_failure(
+                    item, messages, specs, instruction, direct_tool_handlers, failure,
+                    exclude_models):
+                yield event
         else:
+            blocker = (handoff_blocker(report, task.id)
+                       if getattr(self.task_execution, "strict_handoff", False) else None)
+            if blocker:
+                if blocker.startswith("Coder handoff invalid"):
+                    async for event in self._continue_after_coder_failure(
+                            item, messages, specs, instruction, direct_tool_handlers,
+                            blocker, exclude_models):
+                        yield event
+                else:
+                    yield TextEvent(await self._coder_failed(
+                        item.job_id, item.position, blocker))
+                return
             coder_model = await self.persistence.actual_model_for(decision_id)
             async for event in self._task_finished(
                     item.job_id, item.position, messages, specs, instruction,
                     direct_tool_handlers, report, coder_model):
                 yield event
+
+    async def _continue_after_coder_failure(
+            self, item: ImplementationJobTask, messages: list[dict], specs: list[ToolSpec],
+            instruction: str, direct_tool_handlers: dict, error: str,
+            excluded: frozenset[str] = frozenset()) -> AsyncIterator[Event]:
+        """Start one untried agent after verifying earlier writes are journaled."""
+        item = await self.persistence.implementation_task(item.job_id, item.position)
+        attempted_lookup = getattr(self.persistence, "attempted_models_for", None)
+        attempted = (await attempted_lookup(item.decision_id)
+                     if attempted_lookup else frozenset())
+        failed_model = await self.persistence.actual_model_for(item.decision_id)
+        attempted = frozenset(excluded | attempted |
+                              ({failed_model} if failed_model else set()))
+        _, task = await self.artifacts.task_by_id(item.task_id)
+        remaining = [name for name in self.config.candidates_for(task.complexity)
+                     if name not in attempted]
+        if failed_model in self.config.models:
+            provider = self.config.models[failed_model].provider
+            remaining.sort(key=lambda name: self.config.models[name].provider == provider)
+        if await self._halted(item.job_id):
+            return
+        if not remaining:
+            yield TextEvent(await self._coder_failed(item.job_id, item.position, error))
+            return
+        journal = RollbackJournal(self.persistence, item.job_id, item.position,
+                                  specs, direct_tool_handlers)
+        issues = await journal.integrity_issues()
+        if issues:
+            await self.persistence.update_implementation_task(
+                item.job_id, item.position, "recovery_required",
+                error="mutation journal integrity could not be verified")
+            yield TextEvent(ui.block(
+                f"⛔ {item.task_id}: a prior edit cannot be verified in the mutation "
+                "journal. Reply `inspect recovery` before retrying."))
+            return
+        manifest = await journal.review_manifest()
+        paths = [entry["path"] for entry in manifest]
+        if not await self.persistence.claim_auto_coder_fallback(
+                item.job_id, item.position, item.decision_id):
+            return
+        await self.persistence.record_resolution_action(
+            item.job_id, item.position, "coder_auto_fallback", {
+                "failed_model": failed_model, "error": error,
+                "next_candidates": remaining, "changed_paths": paths,
+            })
+        yield TextEvent(ui.progress_line(
+            "note", f"{failed_model or 'Coder'} stopped; continuing {item.task_id} "
+                    f"with {remaining[0]} from the saved project state"))
+        resume_instruction = "\n".join(filter(None, (
+            instruction,
+            f"The previous coder stopped: {error}. Inspect the current project before "
+            "editing. Keep valid changes already made and finish the remaining acceptance "
+            "criteria; do not replay completed tool calls.",
+            f"Journaled changed paths: {', '.join(paths) if paths else 'none'}.",
+        )))
+        async for event in self._run_item(
+                item, messages, specs, resume_instruction, direct_tool_handlers,
+                exclude_models=attempted):
+            yield event
 
     async def _task_finished(self, job_id: str, position: int,
                              messages: list[dict], specs: list[ToolSpec],
@@ -666,6 +836,13 @@ class ImplementationService:
                 f"Task {row.task_id} coder handoff:\n{task_report}"
                 for row, task_report in zip(package_rows, reports)
             )
+        contracts = [await self.contract_persistence.latest(job_id, row.position)
+                     for row in package_rows]
+        if any(contract and contract.excluded_files for contract in contracts):
+            specs = [spec for spec in specs if not spec.name.startswith("kb_")]
+            direct_tool_handlers = {name: handler for name, handler in
+                                    direct_tool_handlers.items()
+                                    if not name.startswith("kb_")}
         if wp_boundary:
             yield TextEvent(ui.block(
                 f"🔍 _Reviewing work package {package.id} against its "
@@ -755,8 +932,42 @@ class ImplementationService:
                                    reviewer_context(plan, events, reviewed))
                 object.__setattr__(review_task, "_planner_relevant_files",
                                    tuple(dict.fromkeys(planned_files)))
-            decision = await self.reviewer.review(
-                change, review_task, report, coder_model, specs, direct_tool_handlers)
+            if isinstance(self.reviewer, ReviewService):
+                progress_queue: asyncio.Queue[str | None] = asyncio.Queue()
+                outcome: dict = {}
+
+                async def review_progress(message: str) -> None:
+                    await progress_queue.put(message)
+
+                async def run_review() -> None:
+                    try:
+                        outcome["decision"] = await self.reviewer.review(
+                            change, review_task, report, coder_model, specs,
+                            direct_tool_handlers, progress=review_progress,
+                            plan_id=plan.plan_id if plan else None, job_id=job_id)
+                    except Exception as exc:
+                        outcome["error"] = exc
+                    finally:
+                        await progress_queue.put(None)
+
+                review_run = asyncio.create_task(run_review())
+                try:
+                    while (message := await progress_queue.get()) is not None:
+                        yield ProgressEvent(ui.progress_line("tool", message))
+                    await review_run
+                finally:
+                    if not review_run.done():
+                        review_run.cancel()
+                        try:
+                            await review_run
+                        except asyncio.CancelledError:
+                            pass
+                if "error" in outcome:
+                    raise outcome["error"]
+                decision = outcome["decision"]
+            else:
+                decision = await self.reviewer.review(
+                    change, review_task, report, coder_model, specs, direct_tool_handlers)
             review = CompletionReview(
                 coder=model_identity(self.config, coder_model),
                 reviewer=model_identity(self.config, decision.reviewer_model, review=True),
@@ -785,6 +996,7 @@ class ImplementationService:
                     job_id, position, coder_model, exc.reviewer_model,
                     "review_pending", str(exc), None, {
                         "run_status": "ran_incomplete",
+                        "reviewer_routing_attempts": list(exc.routing_attempts),
                         "findings_schema_version": 1,
                         "findings": [finding.as_dict() for finding in exc.findings],
                         "retry_requires_evidence_change": owners == {"evidence_service"},
@@ -847,6 +1059,7 @@ class ImplementationService:
                         "findings": [finding.as_dict() for finding in decision.findings],
                         "unresolved_references": list(decision.unresolved_references),
                         "reviewer_routing_reason": decision.routing_reason,
+                        "reviewer_routing_attempts": list(decision.routing_attempts),
                         "reviewer_gateway_used": decision.gateway_used,
                     })
                 await self.persistence.update_implementation_task(
@@ -864,6 +1077,7 @@ class ImplementationService:
                     "findings": [finding.as_dict() for finding in decision.findings],
                     "unresolved_references": list(decision.unresolved_references),
                     "reviewer_routing_reason": decision.routing_reason,
+                    "reviewer_routing_attempts": list(decision.routing_attempts),
                     "reviewer_gateway_used": decision.gateway_used,
                 })
             await self.persistence.update_implementation_task(
@@ -899,6 +1113,7 @@ class ImplementationService:
                 "findings": [finding.as_dict() for finding in decision.findings],
                 "unresolved_references": list(decision.unresolved_references),
                 "reviewer_routing_reason": decision.routing_reason,
+                "reviewer_routing_attempts": list(decision.routing_attempts),
                 "reviewer_gateway_used": decision.gateway_used,
             })
         log.info("implementation_review job_id=%s task_id=%s coder_model=%s "
@@ -952,6 +1167,15 @@ class ImplementationService:
             ),
             completed=True,
         )
+        if self.kb_refresh is not None:
+            try:
+                refresh_message = await self.kb_refresh(job_id, package.id)
+                if refresh_message:
+                    yield TextEvent(ui.block(refresh_message))
+            except Exception as exc:
+                log.exception("kb_refresh_hook_failed job_id=%s wp_id=%s", job_id, package.id)
+                yield TextEvent(ui.block(
+                    f"KB refresh failed for {package.id}: {exc}. The accepted review remains valid."))
         for row in package_rows:
             await self.persistence.update_implementation_task(
                 job_id, row.position, "completed")
@@ -1216,8 +1440,34 @@ class ImplementationService:
                                        instruction: str, direct_tool_handlers: dict,
                                        guidance: str) -> AsyncIterator[Event]:
         failed_model = await self.persistence.actual_model_for(item.decision_id)
-        if not await self.persistence.restart_revision_cycle(
-                item.job_id, item.position, REVISION_BUDGET):
+        attempted_lookup = getattr(self.persistence, "attempted_models_for", None)
+        attempted = (await attempted_lookup(item.decision_id)
+                     if attempted_lookup else frozenset())
+        attempted = frozenset(attempted | ({failed_model} if failed_model else set()))
+        candidates = self.config.candidates_for(
+            (await self.artifacts.task_by_id(item.task_id))[1].complexity)
+        if (item.error or "").startswith(("Coder handoff blocked", "Coder handoff invalid")):
+            # A repaired IDE tool policy makes the same direct Codex model usable.
+            attempted = (frozenset(name for name in candidates if name != failed_model)
+                         if failed_model in candidates else frozenset())
+        if not any(name not in attempted for name in candidates):
+            # An explicit retry is a fresh attempt even when all configured
+            # models have previously failed; prefer the other provider.
+            attempted = (frozenset({failed_model})
+                         if any(name != failed_model for name in candidates)
+                         else frozenset())
+        journal = RollbackJournal(self.persistence, item.job_id, item.position,
+                                  specs, direct_tool_handlers)
+        if await journal.integrity_issues():
+            await self.persistence.update_implementation_task(
+                item.job_id, item.position, "recovery_required",
+                error="mutation journal integrity could not be verified")
+            yield TextEvent(ui.block(
+                "The saved edits could not be verified. Reply `inspect recovery` "
+                "before another coder changes the project."))
+            return
+        manifest = await journal.review_manifest()
+        if not await self.persistence.claim_coder_recovery(item.job_id, item.position):
             yield ErrorEvent("This task is no longer awaiting a coder recovery decision.")
             return
         await self.persistence.record_resolution_action(
@@ -1226,17 +1476,19 @@ class ImplementationService:
                 "guidance": guidance.strip(),
             })
         yield TextEvent(ui.block(
-            f"Continuing {item.task_id} on a different model than "
-            f"{failed_model or 'the interrupted coder'}; files written so far are kept."))
+            f"Continuing {item.task_id} from the saved project state; "
+            "files written so far are kept."))
         revised_instruction = "\n".join(filter(None, [
             instruction, guidance.strip(),
             "A previous coder attempt on this task was interrupted before finishing "
             f"({item.error}). Inspect the current state of the files it touched and "
-            "continue from there rather than starting over.",
+            "continue from there rather than starting over. Do not replay completed tool calls.",
+            "Journaled changed paths: " + ", ".join(
+                entry["path"] for entry in manifest),
         ]))
         async for event in self._run_item(
                 item, messages, specs, revised_instruction, direct_tool_handlers,
-                exclude_models=frozenset({failed_model}) if failed_model else frozenset()):
+                exclude_models=attempted):
             yield event
 
     async def establish_new_baseline(self, job_id: str, position: int,
@@ -1312,6 +1564,38 @@ class ImplementationService:
         yield TextEvent(ui.block(
             f"Stopped implementation job {job_id} at {item.task_id}. No automatic undo "
             "was attempted; inspect and repair the current project state manually."))
+
+    async def review_blocked_handoff(self, job_id: str, position: int,
+                                     messages: list[dict], specs: list[ToolSpec],
+                                     instruction: str, direct_tool_handlers: dict,
+                                     guidance: str = "") -> AsyncIterator[Event]:
+        """Send a complete handoff that reported gaps to the Reviewer as it stands."""
+        item = await self.persistence.implementation_task(job_id, position)
+        report = await self.persistence.coder_report_for(job_id, position) if item else ""
+        blocker = handoff_blocker(report or "", item.task_id) if item else None
+        if (item is None or item.status != CODER_RECOVERY_STATUS
+                or not (item.error or "").startswith("Coder handoff blocked")
+                or (blocker is not None and not blocker.startswith("Coder handoff blocked"))):
+            yield ErrorEvent("This task has no blocked coder handoff to review; "
+                             "only `try coder again` or `undo` apply.")
+            return
+        if not await self.persistence.claim_coder_recovery(job_id, position):
+            yield ErrorEvent("This task is no longer awaiting a coder recovery decision.")
+            return
+        handoff = _handoff(report)
+        await self.persistence.record_resolution_action(
+            job_id, position, "review_blocked_handoff", {
+                "error": item.error,
+                "remaining_gaps": handoff.get("remaining_gaps") or [],
+                "guidance": guidance.strip(),
+            })
+        yield TextEvent(ui.block(
+            f"Sending {item.task_id}'s coder report to the Reviewer with its reported gaps."))
+        coder_model = await self.persistence.actual_model_for(item.decision_id)
+        async for event in self._task_finished(
+                job_id, position, messages, specs, instruction,
+                direct_tool_handlers, report, coder_model):
+            yield event
 
     async def accept_anyway(self, job_id: str, position: int,
                             messages: list[dict], specs: list[ToolSpec],
@@ -1514,28 +1798,3 @@ def _handoff(report: str) -> dict:
         if isinstance(value, dict) and "summary" in value:
             found = value
     return found
-
-
-
-def _without_handoff(text: str) -> str:
-    """Coder prose with any JSON handoff object removed (the report keeps it verbatim)."""
-    decoder = json.JSONDecoder()
-    index = 0
-    kept = []
-    while index < len(text):
-        start = text.find("{", index)
-        if start < 0:
-            kept.append(text[index:])
-            break
-        try:
-            value, end = decoder.raw_decode(text[start:])
-        except json.JSONDecodeError:
-            kept.append(text[index:start + 1])
-            index = start + 1
-            continue
-        kept.append(text[index:start])
-        if not (isinstance(value, dict) and "summary" in value):
-            kept.append(text[start:start + end])
-        index = start + end
-    prose = "".join(kept)
-    return re.sub(r"```(?:json)?\s*```", "", prose).strip()

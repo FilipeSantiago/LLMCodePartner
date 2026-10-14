@@ -58,6 +58,7 @@ class ExecutionContext:
     direct_tool_handlers: dict[str, Any] = field(default_factory=dict)
     # Owner identity (implementation job/position) stamped on the run at creation.
     owner_metadata: dict[str, Any] = field(default_factory=dict)
+    kb_first: Any | None = None
 
 
 @dataclass(frozen=True)
