@@ -1,0 +1,49 @@
+# Opt in with: docker compose -f compose.yaml -f compose.kb.yaml up --build
+services:
+  codepartner:
+    group_add:
+      - ${KB_GID:?Set KB_GID to the group owning KB_DATA_PATH}
+    volumes:
+      - kb-bridge-socket:/run/kb-bridge
+    depends_on:
+      kb-bridge:
+        condition: service_healthy
+
+  kb-bridge:
+    build:
+      context: .
+      dockerfile: infra/kb-bridge/Dockerfile
+    init: true
+    network_mode: none
+    # Codebase Memory keeps its daemon socket and locks in /tmp; a fresh tmpfs on
+    # every start keeps stale ones from a crash or reboot from blocking startup.
+    tmpfs:
+      - /tmp
+    environment:
+      KB_UID: ${KB_UID:?Set KB_UID to the owner of KB_DATA_PATH}
+      KB_GID: ${KB_GID:?Set KB_GID to the group owning KB_DATA_PATH}
+      CBM_CACHE_DIR: /var/lib/codebase-memory-mcp
+      CBM_LOG_LEVEL: info
+    volumes:
+      - type: bind
+        source: ${KB_BINARY_PATH:?Set KB_BINARY_PATH to the host Codebase Memory executable}
+        target: /usr/local/bin/codebase-memory-mcp
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${KB_DATA_PATH:?Set KB_DATA_PATH to the host Codebase Memory storage directory}
+        target: /var/lib/codebase-memory-mcp
+        bind:
+          create_host_path: false
+      - kb-bridge-socket:/run/kb-bridge
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "/opt/kb-bridge/bridge.py", "--health"]
+      interval: 20s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  kb-bridge-socket:

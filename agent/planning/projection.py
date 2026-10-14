@@ -54,6 +54,10 @@ def validate_draft(draft: WPPlanDraft, task_ids: list[str]) -> list[str]:
                     if task_id not in expected})
     if stray:
         gaps.append(f"findings reference unknown task ids: {', '.join(stray)}")
+    unknown_discovery = sorted({task_id for entry in draft.discovery
+                                for task_id in entry.task_ids if task_id not in expected})
+    if unknown_discovery:
+        gaps.append("discovery references unknown task ids: " + ", ".join(unknown_discovery))
     return gaps
 
 
@@ -105,6 +109,7 @@ def project(draft: WPPlanDraft, *, plan_id: str, session_id: str, change_id: str
         wp_fingerprint=wp_fingerprint, wp_complexity=wp_complexity, revision=draft.revision,
         planner_model=planner_model, summary=draft.summary, plan_markdown=draft.plan_markdown,
         shared=shared, tasks=tasks, reviewer=reviewer, findings=list(draft.findings),
+        discovery=list(draft.discovery),
         decisions=list(draft.decisions), provenance=dict(provenance or {}),
     )
     content = json.dumps(plan.to_dict(), sort_keys=True, ensure_ascii=False)

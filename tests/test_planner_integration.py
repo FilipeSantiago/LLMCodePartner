@@ -10,11 +10,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from agent.planning.models import WPPlanDraft
-from agent.planning.projection import project
+from agent.planning.knowledge_base import KB_READING_GUIDANCE
+from agent.planning.models import ApprovedWPPlan, WPPlanDraft
+from agent.planning.projection import project, validate_draft
+from agent.planning.prompts import SYSTEM
+from agent.planning.render import coder_context, reviewer_context
 from agent.routing.implementation import ImplementationService
 from agent.routing.persistence import RoutingPersistence
 from agent.routing.review import ReviewDecision, ReviewService
+from agent.routing.task_execution import TaskExecutionService
 from agent.spec.models import OpenSpecChange, render_tasks
 from agent.spec.openspec_adapter import CliOpenSpecAdapter, OpenSpecError
 from mcp_bridge.models import DoneEvent, TextEvent
@@ -61,6 +65,74 @@ class WorkPackageComplexitySpecTests(unittest.TestCase):
         legacy = change.to_dict()
         legacy["work_packages"][0].pop("complexity")
         self.assertIsNone(OpenSpecChange.from_dict(legacy).work_packages[0].complexity)
+
+
+class DiscoveryHandoffTests(unittest.TestCase):
+    def test_plan_projects_compact_discovery_to_the_right_agents(self):
+        payload = plan_payload(task_ids=WP1_TASKS)
+        payload["discovery"] = [
+            {"file": "src/registry.py", "reason": "Defines the loader registry",
+             "relevant_symbols": [{"name": "Registry.register", "start_line": 12,
+                                   "end_line": 31}], "task_ids": ["WP1-T1"]},
+            {"file": "src/trainer.py", "reason": "Calls the loader factory",
+             "relevant_symbols": [{"name": "train"}], "task_ids": []},
+        ]
+        draft = WPPlanDraft.from_dict(payload, "WP1", 1)
+        self.assertEqual(validate_draft(draft, list(WP1_TASKS)), [])
+        plan = project(draft, plan_id="plan_x_r1", session_id="x", change_id="CHG1",
+                       wp_fingerprint="f", wp_complexity="medium",
+                       planner_model="claude-sonnet")
+        restored = ApprovedWPPlan.from_dict(json.loads(json.dumps(plan.to_dict())))
+        first = coder_context(restored, "WP1-T1")
+        second = coder_context(restored, "WP1-T2")
+        review = reviewer_context(restored, [], ["WP1-T1"])
+        self.assertIn("Registry.register lines 12–31", first)
+        self.assertNotIn("Registry.register lines 12–31", second)
+        self.assertIn("src/trainer.py", second)
+        self.assertIn("Registry.register lines 12–31", review)
+        self.assertIn("navigation only", review)
+
+    def test_coder_context_carries_earlier_task_results(self):
+        draft = WPPlanDraft.from_dict(plan_payload(task_ids=WP1_TASKS), "WP1", 1)
+        plan = project(draft, plan_id="plan_x_r1", session_id="x", change_id="CHG1",
+                       wp_fingerprint="f", wp_complexity="medium",
+                       planner_model="claude-sonnet")
+        events = [
+            {"position": 0, "task_id": "WP1-T1", "kind": "decisions", "summary": "first try"},
+            {"position": 0, "task_id": "WP1-T1", "kind": "tests", "summary": "1 failed"},
+            {"position": 0, "task_id": "WP1-T1", "kind": "decisions",
+             "summary": "Inventory: Registry.register is reusable"},
+            {"position": 0, "task_id": "WP1-T1", "kind": "changed_files",
+             "summary": "src/registry.py"},
+        ]
+        context = coder_context(plan, "WP1-T2", events)
+        self.assertIn("EARLIER TASK RESULTS", context)
+        self.assertIn("Result: Inventory: Registry.register is reusable", context)
+        self.assertIn("Changed files: src/registry.py", context)
+        self.assertNotIn("first try", context)
+        self.assertNotIn("1 failed", context)
+        self.assertNotIn("EARLIER TASK RESULTS", coder_context(plan, "WP1-T1", events))
+        self.assertNotIn("EARLIER TASK RESULTS", coder_context(plan, "WP1-T2"))
+
+    def test_missing_or_stale_discovery_remains_optional(self):
+        legacy = WPPlanDraft.from_dict(plan_payload(task_ids=WP1_TASKS), "WP1", 1)
+        self.assertEqual(legacy.discovery, [])
+        payload = plan_payload(task_ids=WP1_TASKS)
+        payload["discovery"] = [
+            {"file": "src/old.py", "reason": "Indexed lead", "relevant_symbols": [
+                {"name": "old", "start_line": 9, "end_line": 11}], "task_ids": []},
+            {"file": "../unsafe.py", "reason": "Invalid path"},
+        ]
+        draft = WPPlanDraft.from_dict(payload, "WP1", 1)
+        self.assertEqual(len(draft.discovery), 1)
+        self.assertEqual(validate_draft(draft, list(WP1_TASKS)), [])
+
+    def test_shared_guidance_reaches_planner_and_coder(self):
+        self.assertIn(KB_READING_GUIDANCE, SYSTEM)
+        self.assertIn("Before edits or review verdicts, inspect exact current IDE source", KB_READING_GUIDANCE)
+        prompt = TaskExecutionService._execution_messages(task(), [], "")[0]["content"]
+        self.assertIn(KB_READING_GUIDANCE, prompt)
+        self.assertIn("KB search and outline seeds", prompt)
 
 
 class _CapturingReviewer:
@@ -150,6 +222,37 @@ class ReviewerPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.verdict, "done")
         self.assertIn("Approved WP plan context", provider.prompt)
         self.assertIn("Objective: one factory", provider.prompt)
+        self.assertIn(KB_READING_GUIDANCE, provider.prompt)
+        self.assertIn("not correctness evidence", provider.prompt)
+
+    async def test_planner_only_file_is_not_eagerly_read_when_change_is_known(self):
+        class Provider:
+            async def tools(self, messages, specs, **kwargs):
+                self.prompt = messages[0]["content"]
+                yield TextEvent(json.dumps({
+                    "verdict": "done", "rationale": "Factory inspected",
+                    "evidence": ["Factory exists"], "inspected_paths": ["src/factory.py"],
+                    "findings": []}))
+                yield DoneEvent("endTurn")
+
+        reads = []
+
+        async def read_file(arguments):
+            reads.append(arguments["file_path"])
+            return "L1: class Factory: pass"
+
+        queued = task()
+        object.__setattr__(queued, "_planner_relevant_files", ("src/old_dependency.py",))
+        provider = Provider()
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            decision = await ReviewService().review(
+                SimpleNamespace(title="Factory", work_packages=[]), queued,
+                "Changed `src/factory.py`.", "claude-haiku",
+                [ToolSpec("read_file", "Read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}}})], {"read_file": read_file})
+        self.assertEqual(decision.verdict, "done")
+        self.assertEqual(reads, ["src/factory.py"])
+        self.assertIn("src/old_dependency.py", provider.prompt)
 
 
 class PlanningMigrationTests(unittest.TestCase):

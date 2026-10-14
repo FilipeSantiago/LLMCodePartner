@@ -14,6 +14,8 @@ from dataclasses import asdict, dataclass, field
 from uuid import uuid4
 
 import providers
+from agent.kb_first import (DiscoveryTracker, EvidenceSeed, KbFirstPolicy,
+                            evidence_seed)
 from agent.planning.complexity import effective_wp_complexity
 from agent.planning.models import ApprovedWPPlan, WPPlanDraft, plan_id_for
 from agent.planning.projection import project, validate_draft
@@ -25,6 +27,7 @@ from agent.routing.review import model_identity
 from agent.routing.tool_metrics import instrument_handlers, read_only_handlers
 from agent.spec.models import WorkPackage
 from conversation.presentation import progress_line
+from mcp_bridge.activity import describe_call
 from mcp_bridge.models import DoneEvent, ErrorEvent, TextEvent, ToolCallEvent
 from mcp_bridge.registry import ROLE_OPTIMIZER, ToolSpec
 
@@ -85,6 +88,8 @@ async def _silent(_text: str) -> None:
 def describe_tool(name: str, arguments: dict, reads: frozenset[str],
                   searches: frozenset[str]) -> str:
     """What a read-only tool call inspects, in a few words (no model tokens involved)."""
+    if name.rsplit("__", 1)[-1].startswith("kb_"):
+        return describe_call(name, arguments)
     if name in reads:
         path = arguments.get("file_path") or arguments.get("path") or "a file"
         offset, limit = arguments.get("offset"), arguments.get("limit")
@@ -94,9 +99,7 @@ def describe_tool(name: str, arguments: dict, reads: frozenset[str],
     if name in searches:
         query = next((arguments[key] for key in _SEARCH_KEYS if arguments.get(key)), None)
         return f"Searching for `{query}`" if query else f"Searching (`{name}`)"
-    target = (arguments.get("directoryPath") or arguments.get("path")
-              or arguments.get("file_path") or "")
-    return f"`{name}`" + (f" on `{target}`" if target else "")
+    return describe_call(name, arguments)
 
 
 def narration_lines(text: str) -> list[str]:
@@ -169,6 +172,10 @@ def active_task_ids(package: WorkPackage) -> list[str]:
     return [task.id for task in package.tasks if task.status != "cancelled"]
 
 
+def _kb_offered(specs: list[ToolSpec]) -> bool:
+    return any(spec.name.rsplit("__", 1)[-1].startswith("kb_") for spec in specs)
+
+
 def _plan_json(text: str) -> dict | None:
     """The last JSON object in the reply that looks like a plan."""
     decoder = json.JSONDecoder()
@@ -211,7 +218,8 @@ class WPPlannerService:
                     project_id: str | None = None,
                     queued_wp_ids: tuple[str, ...] = (),
                     progress: Progress | None = None,
-                    heading: str | None = None) -> PlanningTurn:
+                    heading: str | None = None,
+                    kb_status: str = "") -> PlanningTurn:
         change, package = await self._package(wp_id)
         if not active_task_ids(package):
             raise PlanningError(f"{package.id} has no tasks to plan")
@@ -233,10 +241,11 @@ class WPPlannerService:
         await progress(progress_line("header", (heading or f"Investigating {package.id}")
                                      + f" (planner: {self._label(decision.model)})"))
         return await self._turn(session, change, package, message, specs, handlers, "plan",
-                                progress)
+                                progress, kb_status)
 
     async def discuss(self, conversation_id: str, message: str, specs: list[ToolSpec],
-                      handlers: dict, progress: Progress | None = None) -> PlanningTurn:
+                      handlers: dict, progress: Progress | None = None,
+                      kb_status: str = "") -> PlanningTurn:
         session = await self.persistence.active_planning(conversation_id)
         if session is None:
             raise PlanningError("no Work Package is being planned in this conversation")
@@ -246,7 +255,7 @@ class WPPlannerService:
             "header", f"Revising the {package.id} plan "
                       f"(planner: {self._label(session['planner_model'])})"))
         return await self._turn(session, change, package, message, specs, handlers, "discuss",
-                                progress)
+                                progress, kb_status)
 
     async def abandon(self, conversation_id: str) -> dict | None:
         session = await self.persistence.active_planning(conversation_id)
@@ -289,15 +298,21 @@ class WPPlannerService:
 
     async def _turn(self, session: dict, change, package: WorkPackage, message: str,
                     specs: list[ToolSpec], handlers: dict, kind: str,
-                    progress: Progress = _silent) -> PlanningTurn:
+                    progress: Progress = _silent, kb_status: str = "") -> PlanningTurn:
         revision = session["revision"] + 1
         task_ids = active_task_ids(package)
-        prompt = turn_prompt(wp_brief(change, package, session["wp_complexity"]),
-                             session["discussion"], session["draft"], message,
-                             narrate=self.config.planner.narrate)
+        brief = wp_brief(change, package, session["wp_complexity"])
+        prompt = turn_prompt(brief, session["discussion"], session["draft"], message,
+                             narrate=self.config.planner.narrate, kb_status=kb_status,
+                             discovery_guidance=(
+                                 self.config.planner.discovery.mode_for("planner") == "advise"),
+                             kb_tools=(_kb_offered(specs)
+                                       and self.config.planner.discovery.enabled))
+        mode = self.config.planner.discovery.mode_for("planner")
+        evidence = evidence_seed(brief + "\n" + message, kb_status) if mode != "off" else None
         conversation = [{"role": "user", "content": prompt}]
         reply = await self._call(session, revision, kind, message, conversation, specs, handlers,
-                                 progress)
+                                 progress, evidence)
         draft, gaps = self._parse(reply, session["wp_id"], revision, task_ids)
         if draft is None or gaps:
             problems = gaps or ["the reply contained no plan JSON object with plan_markdown"]
@@ -306,7 +321,7 @@ class WPPlannerService:
             await progress(progress_line(
                 "note", "Completing the structured plan: " + "; ".join(problems)[:160]))
             repaired = await self._call(session, revision, "repair", None, conversation,
-                                        specs, handlers, progress)
+                                        specs, handlers, progress, evidence)
             repaired_draft, repaired_gaps = self._parse(
                 repaired, session["wp_id"], revision, task_ids)
             if repaired_draft is not None:
@@ -341,7 +356,8 @@ class WPPlannerService:
 
     async def _call(self, session: dict, revision: int, kind: str, message: str | None,
                     conversation: list[dict], specs: list[ToolSpec], handlers: dict,
-                    progress: Progress = _silent) -> str:
+                    progress: Progress = _silent,
+                    evidence: EvidenceSeed | None = None) -> str:
         narrate = self.config.planner.narrate
         readable, reads, searches = read_only_handlers(specs, handlers)
         current = session["planner_model"]
@@ -359,7 +375,7 @@ class WPPlannerService:
                 failure_kind = await self._attempt_planner(
                     session, revision, kind, message, conversation, specs, progress,
                     readable, reads, searches, name, model, effort, narrate,
-                    attempt, use_gateway)
+                    attempt, use_gateway, evidence)
                 if failure_kind[0] is None:
                     if name != current:
                         await self.persistence.update_planning_model(
@@ -396,23 +412,46 @@ class WPPlannerService:
                                readable: dict, reads: frozenset[str],
                                searches: frozenset[str], name: str, model,
                                effort: str | None, narrate: bool, attempt: int,
-                               use_gateway: bool) -> tuple[str | None, str]:
-        budget_reported = False
+                               use_gateway: bool, evidence: EvidenceSeed | None = None
+                               ) -> tuple[str | None, str]:
+        reported: set[str] = set()
+        notes = {"calls": "Investigation budget reached; concluding with what I found",
+                 "reads": "File-read budget reached; concluding from what was found"}
 
-        async def on_call(tool: str, arguments: dict, refused: bool) -> None:
-            nonlocal budget_reported
+        async def on_call(tool: str, arguments: dict, refused: str | None) -> None:
             if not refused:
                 await progress(progress_line("tool", describe_tool(tool, arguments,
                                                                    reads, searches)))
-            elif not budget_reported:
-                budget_reported = True
-                await progress(progress_line(
-                    "note", "Investigation budget reached; concluding with what I found"))
+            elif refused not in reported:
+                reported.add(refused)
+                await progress(progress_line("note", notes[refused]))
 
-        wrapped, metrics = instrument_handlers(readable, reads, searches,
-                                               self.config.planner.max_tool_calls, on_call)
+        discovery = self.config.planner.discovery
+        planner_mode = discovery.mode_for("planner")
+        # In observe the tracker changes nothing; in advise it may append advisories.
+        tracker = (DiscoveryTracker(
+            evidence, discovery.small_file_bytes, _kb_offered(specs),
+            thresholds=(discovery.thresholds_for("planner", session["wp_complexity"])
+                        if planner_mode == "advise" else None),
+            tier=session["wp_complexity"])
+                   if evidence is not None and planner_mode != "off" else None)
+        if tracker is not None:
+            tracker.prompt(conversation)
+        # KB-first whenever Codebase Memory is offered, whatever the discovery mode.
+        wrapped, metrics = instrument_handlers(
+            readable, reads, searches, self.config.planner.max_tool_calls, on_call,
+            max_reads=self.config.planner.max_file_reads, tracker=tracker)
+        policy = (KbFirstPolicy(
+            role="planner", tool_names=[spec.name for spec in specs],
+            seed=evidence, tracker=tracker,
+            outline_gate_lines=discovery.outline_gate_lines,
+            search_gate_max=getattr(discovery, "search_gate_max", 5),
+            mode=discovery.mode_for("planner"), tier=session["wp_complexity"],
+            small_file_bytes=discovery.small_file_bytes)
+            if _kb_offered(specs) and getattr(discovery, "enabled", True) else None)
         kwargs = {"model": model.cli_model, "role": ROLE_OPTIMIZER,
                   "direct_tool_handlers": wrapped,
+                  "kb_first": policy,
                   "run_metadata": {"planner": True, "planner_model": name,
                                    "planning_session_id": session["session_id"],
                                    "wp_id": session["wp_id"],
@@ -428,6 +467,7 @@ class WPPlannerService:
         usage = None
         completed = False
         hard_failure = False
+        cancelled: asyncio.CancelledError | None = None
         started = time.monotonic()
         try:
             async for event in self.provider_lookup(model.provider).tools(
@@ -446,6 +486,10 @@ class WPPlannerService:
                 elif isinstance(event, DoneEvent):
                     completed = True
                     usage = event.usage
+        except asyncio.CancelledError as exc:
+            # A stopped run still records what it consumed, then stops.
+            cancelled = exc
+            errors.append("cancelled")
         except Exception as exc:
             errors.append(f"{type(exc).__name__}: {exc}")
         reply = "".join(parts)
@@ -455,17 +499,24 @@ class WPPlannerService:
                 and len(reply) < 1000 and _plan_json(reply) is None
                 and _failure_kind(reply) in {"quota", "unavailable"}):
             failure = reply.strip()
-        classification = _failure_kind(failure, use_gateway) if failure else None
+        classification = ("cancelled" if cancelled else
+                          _failure_kind(failure, use_gateway) if failure else None)
         await self.persistence.record_planning_turn({
             "session_id": session["session_id"], "revision": revision, "kind": kind,
             "user_message": message, "output": reply, "model": name, "usage": usage,
             "cost_usd": (usage or {}).get("total_cost_usd"),
             "tool_metrics": {**metrics.summary(), "narrate": narrate,
                              "gateway_used": use_gateway, "gateway_attempt": attempt,
-                             "failure_kind": classification},
+                             "failure_kind": classification,
+                             **({"cancelled": True} if cancelled else {}),
+                             **({"outline_gate": policy.outline.summary()} if policy else {}),
+                             **({"discovery": policy.summary()} if policy else
+                                {"discovery": tracker.summary()} if tracker else {})},
             "latency_ms": int((time.monotonic() - started) * 1000),
             "error": failure,
         })
+        if cancelled is not None:
+            raise cancelled
         self.router.health.record(name, model.executor, use_gateway, failure is None)
         if failure is None:
             return None, reply

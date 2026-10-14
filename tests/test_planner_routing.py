@@ -71,6 +71,57 @@ class PlannerConfigTests(unittest.TestCase):
         with self.assertRaises(RoutingConfigError):
             _load(lambda raw: raw["planner"].update(narrate="yes"))
 
+    def test_file_read_budget_defaults_and_is_validated(self):
+        self.assertEqual(_load().planner.max_file_reads, 25)
+        self.assertEqual(_load(lambda raw: raw["planner"].pop("max_file_reads")
+                               ).planner.max_file_reads, 25)
+        self.assertEqual(_load(lambda raw: raw["planner"].update(max_file_reads=10)
+                               ).planner.max_file_reads, 10)
+        for bad in (0, True, "10"):
+            with self.assertRaisesRegex(RoutingConfigError, "max_file_reads"):
+                _load(lambda raw, bad=bad: raw["planner"].update(max_file_reads=bad))
+
+    def test_discovery_defaults_to_advise_and_is_validated(self):
+        discovery = _load().planner.discovery
+        self.assertEqual(discovery.mode, "advise")
+        self.assertEqual(discovery.small_file_bytes, 6000)
+        self.assertEqual(discovery.thresholds["low"]["full_reads"], 2)
+        default = _load(lambda raw: raw.pop("discovery")).planner.discovery
+        self.assertEqual(default.mode, "advise")
+        self.assertEqual(_load(lambda raw: raw["discovery"].update(mode="off")
+                               ).planner.discovery.mode, "off")
+        merged = _load(lambda raw: raw["discovery"].update(
+            thresholds={"high": {"tool_calls": 20}})).planner.discovery.thresholds
+        self.assertEqual(merged["high"]["tool_calls"], 20)
+        self.assertEqual(merged["high"]["full_reads"], 6)
+        self.assertEqual(merged["low"], discovery.thresholds["low"])
+        for bad in ({"mode": "loud"}, {"small_file_bytes": 0}, {"small_file_bytes": True},
+                    {"thresholds": {"huge": {}}}, {"thresholds": {"low": {"files": 3}}},
+                    {"thresholds": {"low": {"tool_calls": -1}}}):
+            with self.assertRaisesRegex(RoutingConfigError, "discovery"):
+                _load(lambda raw, bad=bad: raw["discovery"].update(bad))
+
+    def test_outline_gate_lines_default_and_validation(self):
+        self.assertEqual(_load().planner.discovery.outline_gate_lines, 120)
+        self.assertEqual(_load(lambda raw: raw["discovery"].update(
+            outline_gate_lines=200)).planner.discovery.outline_gate_lines, 200)
+        for bad in (0, True, "120"):
+            with self.assertRaisesRegex(RoutingConfigError, "outline_gate_lines"):
+                _load(lambda raw, bad=bad: raw["discovery"].update(
+                    outline_gate_lines=bad))
+
+    def test_advise_mode_is_default(self):
+        self.assertEqual(_load(lambda raw: raw["discovery"].update(mode="advise")
+                               ).planner.discovery.mode, "advise")
+
+    def test_discovery_role_thresholds_and_global_disable(self):
+        discovery = _load().discovery
+        self.assertTrue(discovery.enabled)
+        self.assertEqual(discovery.mode_for("coder"), "advise")
+        self.assertEqual(discovery.thresholds_for("coder", "simple")["discovery_calls"], 18)
+        self.assertFalse(_load(lambda raw: raw["discovery"].update(enabled=False)
+                               ).discovery.enabled)
+
     def test_config_without_planner_or_roles_still_loads(self):
         def legacy(raw):
             raw.pop("planner")

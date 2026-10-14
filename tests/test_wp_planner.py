@@ -9,22 +9,50 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from api import dialog_controller
 from agent.planning import service as planning_service
 from agent.planning.models import ApprovedWPPlan, WPPlanDraft, plan_id_for
+from agent.planning.prompts import wp_brief
 from agent.planning.projection import project, validate_draft
 from agent.planning.render import coder_context
-from agent.planning.service import PlanningError, WPPlannerService
+from agent.planning.service import PlanningError, WPPlannerService, describe_tool
 from agent.routing.config import load_routing_config
 from agent.routing.implementation import ImplementationService
 from agent.routing.persistence import RoutingPersistence
 from agent.routing.task_execution import TaskExecutionService
-from agent.spec.models import Task, WorkPackage
+from agent.spec.models import Capability, Requirement, Scenario, Task, WorkPackage
 from agent.task_contracts.contractor import TaskContractor
 from mcp_bridge.models import DoneEvent, ErrorEvent, TextEvent
 from model.chat import ChatMessage
 from tests.test_turn_routing import _Artifacts, _Execution, _WorldTest, _specs
 
 TASKS = ("WP4-T1", "WP4-T2")
+
+
+class KbToolFeedbackTests(unittest.TestCase):
+    def test_kb_tool_calls_have_readable_progress(self):
+        self.assertEqual(describe_tool("kb_search_graph", {"query": "private terms"},
+                                       frozenset(), frozenset()),
+                         "Searching Codebase Memory graph")
+        self.assertEqual(describe_tool("kb_get_file_outline", {
+            "file_path": "src/registry.py"}, frozenset(), frozenset()),
+            "Reading indexed outline of `src/registry.py`")
+
+    def test_planner_brief_contains_referenced_requirement_details(self):
+        package = _package()
+        package = replace(package, requirement_refs=["loaders#Create loader"])
+        change = _change(package)
+        change.capabilities = [Capability(
+            path="loaders", purpose="Create loaders by name for callers in the project.",
+            requirements=[Requirement(
+                name="Create loader", statement="The system SHALL create a loader by name.",
+                scenarios=[Scenario(name="Known loader", when="a name is registered",
+                                    then="the matching loader is returned")])])]
+        brief = json.loads(wp_brief(change, package, "high"))
+        self.assertEqual(brief["work_package"]["requirements"][0]["statement"],
+                         "The system SHALL create a loader by name.")
+        self.assertEqual(brief["work_package"]["requirements"][0]["scenarios"][0]["then"],
+                         "the matching loader is returned")
 
 
 def _task(task_id):
@@ -201,6 +229,11 @@ class PlannerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("execution_env", calls[1][2])
 
     async def test_gateway_401_retries_codex_direct_after_claude_quota(self):
+        # Exercise the opt-in gateway mode even though the bundled
+        # subscription-only Codex aliases are now direct-only.
+        self.config = replace(self.config, models={**self.config.models,
+            "codex-sol-high": replace(self.config.models["codex-sol-high"],
+                                       gateway_mode="preferred")})
         gateway_error = ("Reconnecting... 1/5 (unexpected status 401 Unauthorized: "
                          "Missing scopes: api.responses.write, "
                          "url: http://agentgateway:4000/v1/responses, "
@@ -236,6 +269,9 @@ class PlannerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(approved.planner_model, "codex-sol-high")
 
     async def test_gateway_and_direct_401_keep_diagnostics_but_shorten_error(self):
+        self.config = replace(self.config, models={**self.config.models,
+            "codex-sol-high": replace(self.config.models["codex-sol-high"],
+                                       gateway_mode="preferred")})
         gateway_error = ("unexpected status 401 Unauthorized: "
                          "Missing scopes: api.responses.write, request id: req_private")
         planner, calls = self.planner_by_provider({
@@ -364,14 +400,14 @@ class PlannerServiceTests(unittest.IsolatedAsyncioTestCase):
                          [True, False])
         self.assertEqual([row["cost_usd"] for row in attempts], [0.01, 0.02])
 
-    async def test_codex_planner_uses_gateway_and_keeps_reasoning_effort(self):
+    async def test_codex_planner_uses_direct_auth_and_keeps_reasoning_effort(self):
         self.config = replace(self.config, planner=replace(
             self.config.planner, tiers={**self.config.planner.tiers,
                                         "high": ("codex-sol-high", "claude-opus")}))
         provider = PlannerProvider(plan_payload())
         turn = await self.planner(provider).start("conv", "WP4", "go", _specs(), {})
         self.assertEqual(turn.planner_model, "codex-sol-high")
-        self.assertEqual(provider.calls[0]["gateway_url"], self.config.agentgateway_url)
+        self.assertNotIn("gateway_url", provider.calls[0])
         self.assertEqual(provider.calls[0]["reasoning_effort"], "high")
         self.assertTrue(provider.calls[0]["reviewer_mode"])
 
@@ -467,6 +503,40 @@ class PlannerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turns[0]["tool_metrics"]["tool_calls"], 1)
         self.assertEqual(turns[0]["tool_metrics"]["refused_over_budget"], 2)
 
+    async def test_kb_lookups_are_free_and_file_reads_have_their_own_budget(self):
+        from agent.routing.tool_metrics import (BUDGET_EXHAUSTED, READ_BUDGET_EXHAUSTED,
+                                                instrument_handlers)
+
+        async def handler(_arguments):
+            return "ok"
+
+        seen = []
+
+        async def on_call(name, _arguments, refused):
+            seen.append((name, refused))
+
+        wrapped, metrics = instrument_handlers(
+            {"read_file": handler, "search_text": handler, "kb_get_file_outline": handler},
+            frozenset({"read_file"}), frozenset({"search_text"}), max_calls=3,
+            on_call=on_call, max_reads=1)
+        self.assertEqual(await wrapped["read_file"]({"file_path": "a.py"}), "ok")
+        self.assertEqual(await wrapped["read_file"]({"file_path": "b.py"}),
+                         READ_BUDGET_EXHAUSTED)
+        for _ in range(4):
+            self.assertEqual(await wrapped["kb_get_file_outline"]({"file_path": "c.py"}), "ok")
+        self.assertEqual(await wrapped["search_text"]({"q": "x"}), "ok")
+        self.assertEqual(await wrapped["search_text"]({"q": "y"}), "ok")
+        self.assertEqual(await wrapped["search_text"]({"q": "z"}), BUDGET_EXHAUSTED)
+        summary = metrics.summary()
+        self.assertEqual((summary["tool_calls"], summary["kb_calls"], summary["file_reads"],
+                          summary["refused_reads"], summary["refused_over_budget"],
+                          summary["other_calls"]), (3, 4, 1, 1, 1, 0))
+        self.assertEqual(summary["kb_outline_calls"], 4)
+        self.assertEqual(summary["whole_file_reads"], 1)
+        self.assertEqual(summary["ranged_source_reads"], 0)
+        self.assertEqual(summary["source_response_bytes"], 2)
+        self.assertEqual([refused for _, refused in seen if refused], ["reads", "calls"])
+
     async def test_new_session_supersedes_and_abandon_closes(self):
         provider = PlannerProvider(plan_payload(), plan_payload())
         planner = self.planner(provider)
@@ -490,6 +560,11 @@ class ArtifactTests(unittest.TestCase):
 
     def draft(self, **overrides):
         return WPPlanDraft.from_dict(plan_payload(**overrides), "WP4", 1)
+
+    def test_planner_prompt_keeps_discovery_tasks_read_only(self):
+        from agent.planning.prompts import SYSTEM
+        self.assertIn("inspection", SYSTEM)
+        self.assertIn("Never plan file writes for them", SYSTEM)
 
     def test_validation_reports_dangling_ids_and_unknown_tasks(self):
         payload = plan_payload()
@@ -565,8 +640,7 @@ class PlanModeConversationTests(_WorldTest):
         responses = {
             "claude": [[ErrorEvent("You've hit your session limit (API status 429)"),
                         DoneEvent("endTurn")]],
-            "codex": [[ErrorEvent(gateway_error), DoneEvent("endTurn")],
-                      [ErrorEvent("HTTP 401 Unauthorized"), DoneEvent("endTurn")]],
+            "codex": [[ErrorEvent(gateway_error), DoneEvent("endTurn")]],
         }
 
         class Provider:
@@ -581,7 +655,7 @@ class PlanModeConversationTests(_WorldTest):
                                side_effect=lambda name: Provider(name)):
             answer = await self.say("Let's do WP4")
         self.assertIn("Nothing was executed", answer)
-        self.assertIn("gateway authorization denied", answer)
+        self.assertIn("provider unavailable or authentication denied", answer)
         self.assertNotIn("Reconnecting", answer)
         self.assertNotIn("api.responses.write", answer)
         self.assertNotIn("req_private", answer)
@@ -659,6 +733,33 @@ class PlanModeConversationTests(_WorldTest):
         prompt = self.provider.calls[0]["conversation"][0]["content"]
         self.assertIn("Progress notes: before each tool call", prompt)
 
+    async def test_kb_progress_precedes_planner_file_inspection(self):
+        self.world.sessions["conv"].knowledge_base = {
+            "enabled": True, "provider": "codebase-memory", "project_id": "target"}
+        self.provider.read = ["src/registry.py"]
+        self.world.sessions["conv"].tools.handlers = {"read_file": _read}
+
+        async def kb_context(config, stage, request, progress=None):
+            self.assertEqual(config["project_id"], "target")
+            self.assertEqual(stage, "implementation")
+            self.assertIn("Load data through one factory", request)
+            await progress("Checking Codebase Memory project and index status")
+            await progress("Reading indexed architecture")
+            return "Indexed architecture for the planner"
+
+        with mock.patch.object(dialog_controller, "planning_context", kb_context), \
+                mock.patch.object(dialog_controller, "configured_planner_tools",
+                                  return_value=([], {}, "")):
+            answer = await self.say("Let's do WP4")
+        self.assertLess(answer.index("Checking Codebase Memory project"),
+                        answer.index("Reading indexed architecture"))
+        self.assertLess(answer.index("Reading indexed architecture"),
+                        answer.index("**Investigating WP4"))
+        self.assertLess(answer.index("**Investigating WP4"),
+                        answer.index("Reading `src/registry.py`"))
+        self.assertIn("Indexed architecture for the planner",
+                      self.provider.calls[0]["conversation"][0]["content"])
+
     async def test_narration_can_be_turned_off(self):
         config = load_routing_config()
         quiet = replace(config, planner=replace(config.planner, narrate=False))
@@ -677,10 +778,32 @@ class PlanModeConversationTests(_WorldTest):
         self.assertIn("Planning for WP4 closed", answer)
         self.assertIsNone(await self.world.persistence.active_planning("conv"))
 
-    async def test_task_selector_keeps_the_direct_flow(self):
+    async def test_task_selector_requires_parent_wp_plan(self):
         answer = await self.say("implement WP4-T1")
-        self.assertIn("Action: Start implementation", answer)
+        self.assertIn("Start with `WP4`", answer)
         self.assertEqual(self.provider.calls, [])
+
+    async def test_implement_command_starts_wp_planning(self):
+        answer = await self.say("/implement WP4")
+        self.assertIn("## Plan for WP4 (revision 1)", answer)
+        self.assertEqual(self.world.execution.started, [])
+
+    async def test_plan_approval_reports_an_active_job_conflict(self):
+        job = await self.world.job("WP4", "other-chat")
+        answer = await self.say("/implement WP4")
+        self.assertIn("## Plan for WP4 (revision 1)", answer)
+        self.assertIn("WP4 (started from another chat) is recorded as running", answer)
+        self.assertEqual(self.world.job_status(job.job_id), "running")
+        self.assertEqual(self.world.execution.started, [])
+        approved = await self.say("yes")
+        self.assertIn("Stopped WP4", approved)
+        self.assertEqual(self.world.job_status(job.job_id), "stopped")
+        self.assertTrue(self.world.execution.started)
+
+    async def test_run_command_directs_to_parent_wp(self):
+        answer = await self.say("/run WP4-T1")
+        self.assertIn("Start with `WP4`", answer)
+        self.assertEqual(self.world.execution.started, [])
 
     async def test_every_mode_plans_a_wp_before_coding(self):
         answer = await self.world.say("implement WP4", model="codepartner-implement")

@@ -7,6 +7,7 @@ later knowledge base or provenance layer can persist and index it unchanged.
 """
 
 from dataclasses import asdict, dataclass, field, fields
+from pathlib import PurePosixPath
 
 SCHEMA_VERSION = 1
 FINDING_KINDS = ("file", "symbol", "architecture", "constraint", "test",
@@ -36,6 +37,52 @@ def _text(value) -> str:
 def _known(cls, value: dict) -> dict:
     names = {item.name for item in fields(cls)}
     return {key: item for key, item in value.items() if key in names}
+
+
+@dataclass(frozen=True)
+class DiscoverySymbol:
+    name: str
+    start_line: int | None = None
+    end_line: int | None = None
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "DiscoverySymbol | None":
+        name = _text(value.get("name"))
+        start, end = value.get("start_line"), value.get("end_line")
+        if (not name or start is not None and (type(start) is not int or start < 1)
+                or end is not None and (type(end) is not int or end < 1)
+                or start is not None and end is not None and end < start):
+            return None
+        return cls(name, start, end)
+
+
+@dataclass(frozen=True)
+class DiscoveryFile:
+    file: str
+    reason: str
+    relevant_symbols: list[DiscoverySymbol] = field(default_factory=list)
+    task_ids: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "DiscoveryFile | None":
+        path, reason = _text(value.get("file")), _text(value.get("reason"))
+        parts = path.split("/")
+        if (not path or not reason or PurePosixPath(path).is_absolute()
+                or any(part in {"", ".", "..", ".git"} for part in parts)
+                or "\\" in path):
+            return None
+        raw_symbols = value.get("relevant_symbols") or []
+        if not isinstance(raw_symbols, list):
+            return None
+        symbols = [symbol for item in raw_symbols if isinstance(item, dict)
+                   if (symbol := DiscoverySymbol.from_dict(item)) is not None]
+        return cls(path, reason, symbols,
+                   [item.upper() for item in _strings(value.get("task_ids"))])
+
+
+def _discovery(value) -> list[DiscoveryFile]:
+    return [entry for item in value if isinstance(item, dict)
+            if (entry := DiscoveryFile.from_dict(item)) is not None] if isinstance(value, list) else []
 
 
 @dataclass(frozen=True)
@@ -169,6 +216,7 @@ class WPPlanDraft:
     decisions: list[str] = field(default_factory=list)
     open_questions: list[str] = field(default_factory=list)
     findings: list[PlannerFinding] = field(default_factory=list)
+    discovery: list[DiscoveryFile] = field(default_factory=list)
     schema_version: int = SCHEMA_VERSION
 
     def to_dict(self) -> dict:
@@ -200,6 +248,7 @@ class WPPlanDraft:
             open_questions=_strings(value.get("open_questions")),
             findings=[PlannerFinding.from_dict(item) for item in value.get("findings") or []
                       if isinstance(item, dict)],
+            discovery=_discovery(value.get("discovery")),
         )
 
 
@@ -221,6 +270,7 @@ class ApprovedWPPlan:
     tasks: dict[str, TaskContext]
     reviewer: ReviewerContext
     findings: list[PlannerFinding]
+    discovery: list[DiscoveryFile] = field(default_factory=list)
     decisions: list[str] = field(default_factory=list)
     provenance: dict = field(default_factory=dict)
     approved_at: float = 0.0
@@ -240,6 +290,7 @@ class ApprovedWPPlan:
                       for key, item in (value.get("tasks") or {}).items()},
             "reviewer": ReviewerContext.from_dict(value.get("reviewer") or {}, wp_id),
             "findings": [PlannerFinding.from_dict(item) for item in value.get("findings") or []],
+            "discovery": _discovery(value.get("discovery")),
             "decisions": list(value.get("decisions") or []),
             "provenance": dict(value.get("provenance") or {}),
         })

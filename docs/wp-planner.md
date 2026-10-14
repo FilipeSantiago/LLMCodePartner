@@ -4,8 +4,10 @@ Every Work Package implementation request ("Let's do WP4", "implement WP1 and WP
 goes through a planning stage first, in every mode except review. A strong model
 investigates and plans the whole WP once, then hands structured context to each
 task's coder and to the reviewer. Task execution, coder routing, and review are
-unchanged; they gain context. Task selectors (`WP4-T2`), EPIC selectors, and the
-legacy `/implement` command keep the direct flow.
+unchanged; they gain context. New implementation starts require Work Package
+planning. An EPIC selector queues its unfinished Work Packages; an individual
+task selector directs the user to its parent Work Package. Saved jobs still
+resume and recover directly.
 
 When a request names several WPs, they are planned **just in time**: plan WP1, you
 approve, WP1 is implemented and reviewed, then WP2 is planned against the code WP1
@@ -102,6 +104,9 @@ human-readable `plan_markdown` and the full structured state:
 - `reviewer`: the `ReviewerContext`, holding expected behavior, task boundaries,
   risks, assumptions, and validation expectations.
 
+The planner brief includes the statement and scenarios of every requirement
+referenced by the Work Package, as well as task descriptions and design context.
+
 On each discuss turn the planner revises this state in place and keeps its ids
 stable. `validate_draft` checks the state after every turn. On failure the planner
 gets one repair request listing the exact gaps; if gaps remain, the plan is shown
@@ -151,6 +156,78 @@ All of this lives in the routing SQLite database:
 Coder usage and reads are already recorded per job (`execution_attempts`,
 `telemetry_aci_attempts`). Joining these through `plan_id` and `job_id` gives the
 planner-vs-downstream cost comparison.
+
+### KB-first discovery
+
+The shared run-local policy now serves planner, coder and reviewer through the
+normal request-scoped tool dispatch. Generated KB lookups and IDE reads undergo
+the same registry, adapter, stop, journal, budget and reviewer-path checks as
+direct agent calls. Set top-level discovery.enabled to false to disable it.
+discovery.search_gate_max defaults to five. See
+[Codebase Memory](codebase-memory.md) for search interception, current-source
+verification and edit freshness.
+
+Whenever Codebase Memory tools are offered to the planner, in any discovery mode:
+- The planner prompt carries a KB-first discovery order: prefetched context, then
+  `kb_search_graph` / `kb_trace_path`, then `kb_get_file_outline` before reading a
+  code file, then ranged `read_file` for the needed symbols. Text and regex search
+  are reserved for what the graph cannot answer. Current IDE source stays
+  authoritative; the KB is the map.
+- **Outline gate.** A broad read (from the start, no end line, no `limit` or one
+  above `discovery.outline_gate_lines`, default 120) of a code file that
+  has not yet been outlined, range-read or gated returns the file's KB outline
+  instead, with "Read not performed …". Repeating the same read returns the file.
+  - Served outlines count as KB calls, not reads, and are served even when the
+    read budget is exhausted.
+  - These pass straight through to the IDE: non-code files, files the index lacks
+    (e.g. `.venv`), files whose outline ends before `outline_gate_lines`, outline
+    errors, and full reads after the planner's own outline or ranged read.
+  - Each turn records `outline_gate: {served, passthrough: {repeat, after_outline,
+    small, not_indexed, non_code, error}}` in `tool_metrics`.
+- The read-budget refusal no longer points to Codebase Memory as an after-budget
+  fallback.
+
+A stopped planning run is recorded too: its turn row has `error: "cancelled"`,
+`tool_metrics.cancelled: true`, and the metrics collected up to the stop.
+
+### Discovery telemetry (`discovery`)
+
+The top-level default is `mode: advise` for planner, coder and reviewer; soft
+thresholds never refuse a call. `mode: observe` records without advisory text.
+Set `enabled: false` to turn KB-first off for every role. Planner turns record
+`tool_metrics.discovery`; coder attempts record `metrics_json.kb_first`, and
+reviewer attempts record the same with plan and job identifiers. Actual
+provider usage remains separate from estimated added-context tokens.
+
+It records:
+- `retrieval_levels`, counting calls at each level:
+  - **L1:** KB, search, listing and symbol calls;
+  - **L2:** ranged reads, and whole reads whose *returned* response is under `small_file_bytes`;
+  - **L3:** other whole reads.
+- `l3_direct` / `l3_escalated`: an L3 read is escalated when an earlier L1 or L2 call targeted the same path.
+- `evidence_strength`: reads grouped as strong, moderate, weak or none, by why the path might matter:
+  - **strong:** WP text, or KB prefetch symbol matches;
+  - **moderate:** searches or graph calls aimed at a WP identifier or a strong path;
+  - **weak:** broad listings and keyword matches.
+
+  Reading or outlining a path never adds evidence for it. `unexplained_reads` counts weak and none reads, with up to 20 example `unexplained_paths`. "Unexplained" does not mean irrelevant.
+- `kb_prefetch`, `kb_tools_offered`, `kb_used` and `kb_fallback`.
+- `est_prompt_tokens`, `est_tool_result_tokens` and `est_added_tokens`: newly added context estimated from delivered UTF-8 bytes / 4. Provider-reported `usage` is a separate, cumulative figure.
+
+With `mode: advise` (the default), the planner prompt also gets planner-only
+discovery guidance: outline, then targeted ranges, then whole files only when
+needed, plus a sufficiency checklist. The first time a per-tier soft threshold
+is reached (`tool_calls`, `full_reads`, `est_added_tokens`,
+`repeated_or_unexplained_reads`), one `[Planning advisory, not a limit]` line is
+appended to that tool result and recorded in `threshold_crossings`. Advisories
+never refuse a call; the hard caps above stay in force. The guidance shared with
+coders and reviewers also receive the shared KB-first guidance. The baseline and rollout status are in
+`openspec/changes/optimize-planner-discovery/design.md`. To compare benchmark arms:
+
+```
+uv run python scripts/bench_planner.py --arm baseline=wpplan_a,wpplan_b,wpplan_c \
+    --truth changed_files.txt --rubric rubric.json
+```
 
 ## Future compatibility
 

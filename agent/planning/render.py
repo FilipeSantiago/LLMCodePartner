@@ -1,7 +1,7 @@
 """Text renderings of planning state for the user, the coder, and the reviewer."""
 
 from agent.planning.models import (
-    ApprovedWPPlan, PlannerFinding, ReviewerContext, TaskContext, WPPlanDraft,
+    ApprovedWPPlan, DiscoveryFile, PlannerFinding, ReviewerContext, TaskContext, WPPlanDraft,
 )
 
 _MAX_INSPECTED = 10
@@ -67,8 +67,49 @@ def _findings(findings: list[PlannerFinding]) -> list[str]:
     return ["Planner findings:", *lines] if lines else []
 
 
-def coder_context(plan: ApprovedWPPlan, task_id: str) -> str:
-    """Approved WP context plus this task's context, for the coder prompt."""
+def _discovery(entries: list[DiscoveryFile]) -> list[str]:
+    if not entries:
+        return []
+    lines = ["Discovery leads (navigation only; verify current source and line ranges):"]
+    for entry in entries:
+        symbols = ", ".join(
+            symbol.name + (f" lines {symbol.start_line}–{symbol.end_line}"
+                           if symbol.start_line is not None and symbol.end_line is not None
+                           else "") for symbol in entry.relevant_symbols)
+        lines.append(f"- {entry.file}: {entry.reason}" + (f"; {symbols}" if symbols else ""))
+    return lines
+
+
+_PRIOR_KINDS = ("decisions", "changed_files", "deviations", "unresolved")
+_PRIOR_LABELS = {"decisions": "Result", "changed_files": "Changed files",
+                 "deviations": "Deviations from plan", "unresolved": "Unresolved"}
+
+
+def _prior_results(events: list[dict], task_id: str) -> list[str]:
+    """Latest handoff facts per earlier task, so later coders build on them."""
+    latest: dict[tuple[str, str], dict] = {}
+    order: list[str] = []
+    for event in events:
+        prior = event.get("task_id")
+        if not prior or prior == task_id or event.get("kind") not in _PRIOR_KINDS:
+            continue
+        if prior not in order:
+            order.append(prior)
+        latest[(prior, event["kind"])] = event
+    lines = []
+    for prior in order:
+        lines.append(f"{prior}:")
+        lines += [f"- {_PRIOR_LABELS[kind]}: {latest[(prior, kind)]['summary']}"
+                  for kind in _PRIOR_KINDS if (prior, kind) in latest]
+    if not lines:
+        return []
+    return ["", "EARLIER TASK RESULTS (this job; already done, build on them rather than "
+            "re-deriving them)", *lines]
+
+
+def coder_context(plan: ApprovedWPPlan, task_id: str,
+                  prior_events: list[dict] | tuple[dict, ...] = ()) -> str:
+    """Approved WP context, earlier tasks' results, and this task's context."""
     shared = plan.shared
     task: TaskContext | None = plan.tasks.get(task_id)
     lines = ["BEGIN APPROVED WP PLAN CONTEXT",
@@ -83,7 +124,10 @@ def coder_context(plan: ApprovedWPPlan, task_id: str) -> str:
              *_list("Validated assumptions", shared.validated_assumptions),
              *_list("Do not modify", shared.do_not_modify),
              *_list("WP test strategy", shared.test_strategy),
-             *_findings(shared.findings)]
+             *_findings(shared.findings),
+             *_discovery([entry for entry in plan.discovery
+                          if not entry.task_ids or task_id in entry.task_ids]),
+             *_prior_results(list(prior_events), task_id)]
     if task is not None:
         lines += ["", f"TASK CONTEXT ({task.task_id})",
                   f"Objective: {task.objective}",
@@ -117,7 +161,10 @@ def reviewer_context(plan: ApprovedWPPlan, events: list[dict],
              *_list("Risks", reviewer.risks),
              *_list("Assumptions", reviewer.assumptions),
              *_list("Validation expectations", reviewer.validation_expectations),
-             *_findings(reviewer.findings)]
+             *_findings(reviewer.findings),
+             *_discovery([entry for entry in plan.discovery
+                          if task_ids is None or not entry.task_ids
+                          or any(task_id in task_ids for task_id in entry.task_ids)])]
     selected = [event for event in events
                 if task_ids is None or event.get("task_id") in task_ids]
     if selected:

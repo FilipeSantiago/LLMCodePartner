@@ -6,11 +6,14 @@ read/search handlers wrap those handlers here instead.
 
 from dataclasses import dataclass, field
 
+from mcp_bridge.read_metrics import SourceReadStats
 from mcp_bridge.registry import (DOMAIN_SOURCE, OP_FILE_READ, OP_FILE_SEARCH,
                                  ROLE_OPTIMIZER, ToolRegistry, ToolSpec, allowed_for)
 
 BUDGET_EXHAUSTED = ("Tool budget exhausted. Do not call more tools; conclude now with "
                     "the findings you already have.")
+READ_BUDGET_EXHAUSTED = ("File-read budget exhausted. Conclude with the findings you have; "
+                         "use outlines or searches only for a specific open question.")
 
 
 @dataclass
@@ -21,14 +24,18 @@ class ToolMetrics:
     other: int = 0
     failures: int = 0
     refused_over_budget: int = 0
+    refused_reads: int = 0
+    kb_calls: int = 0
     files: set[str] = field(default_factory=set)
+    source: SourceReadStats = field(default_factory=SourceReadStats)
 
     def summary(self) -> dict:
         return {
             "tool_calls": self.calls, "file_reads": self.reads, "searches": self.searches,
             "other_calls": self.other, "failures": self.failures,
             "refused_over_budget": self.refused_over_budget,
-            "unique_files_read": len(self.files),
+            "refused_reads": self.refused_reads, "kb_calls": self.kb_calls,
+            "unique_files_read": len(self.files), **self.source.summary(),
         }
 
 
@@ -46,22 +53,48 @@ def read_only_handlers(specs: list[ToolSpec], handlers: dict
 
 def instrument_handlers(handlers: dict, reads: frozenset[str], searches: frozenset[str],
                         max_calls: int | None = None,
-                        on_call=None) -> tuple[dict, ToolMetrics]:
-    """Wrap direct handlers to count calls; past `max_calls`, refuse instead of calling.
+                        on_call=None, max_reads: int | None = None,
+                        tracker=None, gate=None) -> tuple[dict, ToolMetrics]:
+    """Wrap direct handlers to count calls; past a budget, refuse instead of calling.
 
-    `on_call(name, arguments, refused)` is awaited before each call, for progress display.
+    Codebase Memory (`kb_`) calls are graph lookups and do not consume `max_calls`;
+    file reads additionally stop at `max_reads`. `on_call(name, arguments, refused)` is
+    awaited before each call for progress display, with `refused` set to None, "calls"
+    or "reads". An optional `tracker` (planner discovery telemetry) observes each
+    response; only in advise mode may it append a one-line advisory to a result.
+    An optional `gate` (planner `OutlineGate`) may answer a broad read of a large code
+    file with its Codebase Memory outline; that counts as a KB call, not a read, and is
+    checked before the read budget.
     """
     metrics = ToolMetrics()
 
     def wrap(name, handler):
         async def call(arguments):
-            refused = max_calls is not None and metrics.calls >= max_calls
+            if gate is not None and name in reads:
+                gated = await gate.check(arguments)
+                if gated is not None:
+                    return await outline_instead(*gated)
+            kb = name.startswith("kb_")
+            refused = ("calls" if not kb and max_calls is not None
+                       and metrics.calls >= max_calls else
+                       "reads" if name in reads and max_reads is not None
+                       and metrics.reads >= max_reads else None)
             if on_call is not None:
                 await on_call(name, arguments, refused)
-            if refused:
+            if refused == "calls":
                 metrics.refused_over_budget += 1
+                if tracker is not None:
+                    tracker.delivered(BUDGET_EXHAUSTED)
                 return BUDGET_EXHAUSTED
-            metrics.calls += 1
+            if refused == "reads":
+                metrics.refused_reads += 1
+                if tracker is not None:
+                    tracker.delivered(READ_BUDGET_EXHAUSTED)
+                return READ_BUDGET_EXHAUSTED
+            if kb:
+                metrics.kb_calls += 1
+            else:
+                metrics.calls += 1
             if name in reads:
                 metrics.reads += 1
                 path = arguments.get("file_path") or arguments.get("path")
@@ -69,13 +102,36 @@ def instrument_handlers(handlers: dict, reads: frozenset[str], searches: frozens
                     metrics.files.add(path)
             elif name in searches:
                 metrics.searches += 1
-            else:
+            elif not kb:
                 metrics.other += 1
             try:
-                return await handler(arguments)
+                result = await handler(arguments)
+                repeated_before = metrics.source.repeated_source_reads
+                metrics.source.observe(name, arguments, result, read=name in reads)
+                if gate is not None:
+                    gate.note(name, arguments, read=name in reads)
+                if tracker is not None:
+                    advisory = tracker.observe(
+                        name, arguments, result, read=name in reads,
+                        repeated=metrics.source.repeated_source_reads > repeated_before)
+                    if advisory and isinstance(result, str):
+                        result = result + "\n\n" + advisory
+                return result
             except Exception:
                 metrics.failures += 1
                 raise
         return call
+
+    async def outline_instead(path: str, outline: str) -> str:
+        arguments = {"file_path": path}
+        if on_call is not None:
+            await on_call("kb_get_file_outline", arguments, None)
+        metrics.kb_calls += 1
+        metrics.source.observe("kb_get_file_outline", arguments, outline, read=False)
+        if tracker is not None:
+            advisory = tracker.observe("kb_get_file_outline", arguments, outline, read=False)
+            if advisory:
+                outline = outline + "\n\n" + advisory
+        return outline
 
     return {name: wrap(name, handler) for name, handler in handlers.items()}, metrics

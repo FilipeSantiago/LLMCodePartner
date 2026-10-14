@@ -62,9 +62,46 @@ planner:
   reasoning_effort:
     complex: xhigh
   max_tool_calls: 60
+  # File reads within max_tool_calls; Codebase Memory (kb_) lookups count toward neither.
+  max_file_reads: 25
   # One short "what I'm checking and why" line before each tool call
   # (~15-25 output tokens per call). Turn off to compare planner cost.
   narrate: true
+# Shared KB-first discovery and advisory telemetry (docs/codebase-memory.md).
+# Global disable preserves the original authorized tool behavior; advisories
+# never replace the hard planner caps above.
+discovery:
+  enabled: true
+  mode: advise
+  search_gate_max: 5
+  small_file_bytes: 6000
+  outline_gate_lines: 120
+  roles:
+    planner:
+      mode: advise
+      thresholds:
+        low: {discovery_calls: 15, full_reads: 2, est_added_tokens: 40000, repeated_or_unexplained_reads: 3}
+        medium: {discovery_calls: 25, full_reads: 4, est_added_tokens: 70000, repeated_or_unexplained_reads: 4}
+        high: {discovery_calls: 35, full_reads: 6, est_added_tokens: 100000, repeated_or_unexplained_reads: 6}
+        complex: {discovery_calls: 45, full_reads: 8, est_added_tokens: 140000, repeated_or_unexplained_reads: 8}
+    coder:
+      mode: advise
+      thresholds:
+        simple: {discovery_calls: 18, full_reads: 3, est_added_tokens: 30000, repeated_or_unexplained_reads: 4}
+        medium: {discovery_calls: 25, full_reads: 4, est_added_tokens: 60000, repeated_or_unexplained_reads: 5}
+        complex: {discovery_calls: 35, full_reads: 6, est_added_tokens: 100000, repeated_or_unexplained_reads: 7}
+    reviewer:
+      mode: advise
+      thresholds:
+        low: {discovery_calls: 15, full_reads: 2, est_added_tokens: 25000, repeated_or_unexplained_reads: 3}
+        medium: {discovery_calls: 20, full_reads: 3, est_added_tokens: 40000, repeated_or_unexplained_reads: 4}
+        high: {discovery_calls: 30, full_reads: 5, est_added_tokens: 70000, repeated_or_unexplained_reads: 6}
+        complex: {discovery_calls: 40, full_reads: 6, est_added_tokens: 100000, repeated_or_unexplained_reads: 8}
+  thresholds:
+    low: {tool_calls: 15, full_reads: 2, est_added_tokens: 40000, repeated_or_unexplained_reads: 3}
+    medium: {tool_calls: 25, full_reads: 4, est_added_tokens: 70000, repeated_or_unexplained_reads: 4}
+    high: {tool_calls: 35, full_reads: 6, est_added_tokens: 100000, repeated_or_unexplained_reads: 6}
+    complex: {tool_calls: 45, full_reads: 8, est_added_tokens: 140000, repeated_or_unexplained_reads: 8}
 
 models:
   claude-haiku:
@@ -81,7 +118,7 @@ models:
     cli_model: gpt-5.6-luna
     reasoning_effort: low
     review_reasoning_effort: medium
-    gateway_mode: preferred
+    gateway_mode: disabled
 
   claude-sonnet:
     capability: 3
@@ -96,7 +133,7 @@ models:
     executor: codex-cli
     cli_model: gpt-5.6-luna
     reasoning_effort: medium
-    gateway_mode: preferred
+    gateway_mode: disabled
 
   codex-sol-medium:
     capability: 3
@@ -104,7 +141,7 @@ models:
     executor: codex-cli
     cli_model: gpt-6.1-sol
     reasoning_effort: medium
-    gateway_mode: preferred
+    gateway_mode: disabled
 
   claude-opus:
     capability: 5
@@ -119,4 +156,4 @@ models:
     executor: codex-cli
     cli_model: gpt-6.1-sol
     reasoning_effort: high
-    gateway_mode: preferred
+    gateway_mode: disabled

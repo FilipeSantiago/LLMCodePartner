@@ -3,7 +3,9 @@
 import json
 from dataclasses import asdict
 
+from agent.planning.knowledge_base import KB_READING_GUIDANCE
 from agent.spec.models import OpenSpecChange, WorkPackage
+from agent.task_contracts.policy import DISCOVERY_CAPABILITIES
 
 _SHAPE = {
     "summary": "Two or three sentences: what this WP will deliver and how",
@@ -16,6 +18,13 @@ _SHAPE = {
         "statement": "One verified fact or explicit assumption",
         "evidence": [{"path": "project/relative/path.py", "symbol": "optional", "lines": "optional"}],
         "validated": True,
+        "task_ids": ["WP4-T1"],
+    }],
+    "discovery": [{
+        "file": "project/relative/path.py",
+        "relevant_symbols": [{"name": "module.function", "start_line": 10,
+                              "end_line": 35}],
+        "reason": "Short explanation of task relevance",
         "task_ids": ["WP4-T1"],
     }],
     "shared": {
@@ -78,14 +87,30 @@ SYSTEM = (
     "`finding_ids` and list the tasks they matter to in `task_ids`.\n"
     "- Paths are project-relative. Name real files and symbols you inspected; mark files that "
     "do not exist yet as planned in the approach text.\n"
+    "- Put compact file and symbol leads in `discovery` when you identify relevant code. "
+    "Use line ranges from an outline only as hints; do not copy source into the plan. "
+    "An empty task_ids list makes a lead shared. KB-only leads are not validated findings; "
+    "validate implementation claims against current IDE source.\n"
     "- Do not invent requirements beyond the OpenSpec WP and the user's instructions.\n"
+    "- Tasks whose preferred_capability is one of "
+    f"{', '.join(sorted(DISCOVERY_CAPABILITIES))} run read-only: the coder cannot create "
+    "or edit files, and its findings are delivered in its report. Never plan file writes "
+    "for them; any file the WP needs belongs to an implementation task.\n"
     "- When revising, update the current state in place: keep existing finding ids and task "
     "ids stable, and change only what the user's message or new evidence requires.\n\n"
-    f"JSON shape:\n{json.dumps(_SHAPE, indent=2)}"
+    f"\n{KB_READING_GUIDANCE}\n\nJSON shape:\n{json.dumps(_SHAPE, indent=2)}"
 )
 
 
 def wp_brief(change: OpenSpecChange, package: WorkPackage, complexity: str) -> str:
+    referenced = set(package.requirement_refs)
+    requirements = [{
+        "ref": f"{capability.path}#{requirement.name}",
+        "statement": requirement.statement,
+        "scenarios": [asdict(scenario) for scenario in requirement.scenarios],
+    } for capability in getattr(change, "capabilities", ())
+        for requirement in capability.requirements
+        if f"{capability.path}#{requirement.name}" in referenced]
     tasks = [{
         "id": task.id, "title": task.title, "description": task.description,
         "complexity": task.complexity, "definition_of_done": task.acceptance_criteria,
@@ -101,6 +126,7 @@ def wp_brief(change: OpenSpecChange, package: WorkPackage, complexity: str) -> s
             "objective": package.objective, "complexity": complexity,
             "acceptance_criteria": package.acceptance_criteria,
             "requirement_refs": package.requirement_refs,
+            "requirements": requirements,
             "validation": asdict(package.validation), "depends_on": package.depends_on,
             "tasks": tasks,
         },
@@ -114,9 +140,45 @@ NARRATION = (
     "the final JSON object.")
 
 
+# Planner-only (planner.discovery.mode: advise); the shared KB_READING_GUIDANCE used by
+# coders and reviewers is unchanged.
+DISCOVERY_GUIDANCE = (
+    "Discovery: retrieve progressively and stop once the plan is actionable.\n"
+    "1. Outline: use the prefetched context, Codebase Memory graph tools when available, "
+    "searches and file outlines to find the modules, files, symbols and dependencies the WP "
+    "touches.\n"
+    "2. Targeted inspection: read only the line ranges of the functions or classes you need.\n"
+    "3. Full file: read a whole file only when it is small or a narrower read cannot settle "
+    "a specific question that matters to the plan.\n"
+    "Before each read, know which question it answers; skip files that neither the WP, the "
+    "prefetched context nor a search result connects to the work, and do not re-read regions "
+    "you already have.\n"
+    "Sufficiency checklist: stop investigating and return the plan when, for every task, you "
+    "can name the components and files to change or reuse, their dependencies, the task's "
+    "implementation responsibilities, and how the result is verified (tests and acceptance "
+    "criteria). Correctness comes first: keep investigating while any of these is uncertain. "
+    "A tool result may end with a short planning advisory; it is guidance, not a limit.")
+
+
+# Planner-specific sufficiency checklist next to the shared KB-first guidance.
+KB_FIRST_GUIDANCE = (
+    "Planner checklist: for every task, identify the components and current files, "
+    "their dependencies, the implementation responsibility and the verification "
+    "criteria. Treat indexed locations as discovery leads; use current IDE source "
+    "for any implementation detail the plan relies on. Stop once those questions "
+    "are answered, unless a specific gap remains.")
+
+
 def turn_prompt(brief: str, discussion: list[dict], current: dict | None, message: str,
-                narrate: bool = False) -> str:
-    parts = [SYSTEM, *(["", NARRATION] if narrate else []), "", "OpenSpec Work Package:", brief]
+                narrate: bool = False, kb_status: str = "",
+                discovery_guidance: bool = False, kb_tools: bool = False) -> str:
+    parts = [SYSTEM, *(["", NARRATION] if narrate else []),
+             *(["", DISCOVERY_GUIDANCE] if discovery_guidance else []),
+             "", "OpenSpec Work Package:", brief]
+    if kb_tools:
+        parts += ["", KB_FIRST_GUIDANCE]
+    if kb_status:
+        parts += ["", "Codebase Memory context (prefetched for this WP):", kb_status]
     if discussion:
         parts += ["", "Planning discussion so far (oldest first):",
                   *(f"- [revision {item['revision']}] user: {item['text']}" for item in discussion)]
