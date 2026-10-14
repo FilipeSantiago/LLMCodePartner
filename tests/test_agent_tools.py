@@ -1,6 +1,7 @@
 """Behavioral checks for the coder-facing interface at the IDE boundary."""
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,10 +11,29 @@ from mcp_bridge.agent_tools import AgentToolInterface, _check_command, _command_
 from mcp_bridge.edit_validation import validate_postimages
 from mcp_bridge.models import Run
 from mcp_bridge.registry import ToolSpec
+from telemetry.storage import TelemetryStorage
 
 
 def _spec(name, properties=None):
     return ToolSpec(name, name, {"type": "object", "properties": properties or {}})
+
+
+class TelemetryMigrationTests(unittest.TestCase):
+    def test_existing_aci_table_accepts_new_read_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "telemetry.sqlite3"
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE telemetry_aci_attempts ("
+                           "run_id TEXT PRIMARY KEY, metrics_json TEXT NOT NULL)")
+            storage = TelemetryStorage(path)
+            storage.record_aci_attempt("review_1", {"task_id": "WP1-T1"},
+                                       {"kb_outline_calls": 1}, {"input_tokens": 7})
+            with sqlite3.connect(path) as db:
+                row = db.execute("SELECT task_id, metrics_json, usage_json "
+                                 "FROM telemetry_aci_attempts WHERE run_id='review_1'").fetchone()
+            self.assertEqual(row[0], "WP1-T1")
+            self.assertEqual(json.loads(row[1])["kb_outline_calls"], 1)
+            self.assertEqual(json.loads(row[2])["input_tokens"], 7)
 
 
 class AgentToolInterfaceTests(unittest.IsolatedAsyncioTestCase):
@@ -75,6 +95,19 @@ class AgentToolInterfaceTests(unittest.IsolatedAsyncioTestCase):
         result = await self.interface.execute("codepartner_read_file", arguments, self.backend)
         self.assertIn("READ COMPLETE", result)
         self.assertEqual(len(self.calls), 1)
+
+    async def test_read_metrics_count_delivered_ranges_and_repeats(self):
+        self.run.tool_interface = self.interface
+        self.run.direct_tool_handlers = {
+            "read_file": lambda arguments: self.backend("read_file", arguments)}
+        arguments = {"path": "src/app.py", "start_line": 140, "end_line": 145}
+        await bridge.call_tool(self.run, "codepartner_read_file", arguments)
+        await bridge.call_tool(self.run, "codepartner_read_file", arguments)
+        summary = self.interface.summary()
+        self.assertEqual(summary["ranged_source_reads"], 2)
+        self.assertEqual(summary["whole_file_reads"], 0)
+        self.assertEqual(summary["repeated_source_reads"], 1)
+        self.assertGreater(summary["source_response_bytes"], 0)
 
     async def test_path_only_read_returns_full_file(self):
         self.run.tool_interface = self.interface

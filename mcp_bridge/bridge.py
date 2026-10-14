@@ -4,7 +4,8 @@ import os
 import shlex
 from uuid import uuid4
 
-from mcp_bridge.models import MutationEvent, Run, ToolCallEvent
+from mcp_bridge.activity import describe_call
+from mcp_bridge.models import MutationEvent, ProgressEvent, Run, ToolCallEvent
 from mcp_bridge.agent_tools import tool_failed
 from mcp_bridge.registry import is_mutating_tool, operations_for
 from logger.diagnostic import debug
@@ -55,12 +56,19 @@ async def call_tool(run: Run, name: str, arguments: dict) -> str:
     the future until the client returns a `role:"tool"` result. Raises
     `asyncio.TimeoutError` if the client doesn't answer within `TOOL_TIMEOUT`.
     """
-    if run.tool_interface is not None:
+    async def dispatch(tool_name: str, tool_args: dict) -> str:
+        if run.tool_interface is None:
+            return await _call_backend(run, tool_name, tool_args)
         result = await run.tool_interface.execute(
-            name, arguments, lambda tool_name, tool_args: _call_backend(run, tool_name, tool_args))
+            tool_name, tool_args,
+            lambda actual_name, actual_args: _call_backend(run, actual_name, actual_args))
         run.tool_interface.metrics["model_output_bytes"] += len(result.encode())
+        run.tool_interface.record_delivered_result(tool_name, tool_args, result)
         return result
-    return await _call_backend(run, name, arguments)
+
+    if run.kb_first is not None:
+        return await run.kb_first.call(name, arguments, dispatch, run=run)
+    return await dispatch(name, arguments)
 
 
 async def _call_backend(run: Run, name: str, arguments: dict) -> str:
@@ -99,6 +107,9 @@ async def _call_direct(run: Run, handler, name: str, arguments: dict,
                        effective_name: str | None) -> str:
     log.info("mcp_tool_route route=direct_ide_mcp trace_id=%s run_id=%s name=%s",
              run.metadata.get("trace_id"), run.run_id, name)
+    if run.metadata.get("task_execution"):
+        icon = "✏️" if effective_name else "🔎"
+        await run.put(ProgressEvent(f"- {icon} {describe_call(name, arguments)}\n"))
     try:
         debug(log, "bridge.direct_tool_started", trace_id=run.metadata.get("trace_id"),
               run_id=run.run_id, tool_name=name, arguments=arguments)

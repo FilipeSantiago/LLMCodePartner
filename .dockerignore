@@ -12,3 +12,4 @@ __pycache__
 .env.*
 !.env.example
 data
+node_modules

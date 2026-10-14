@@ -20,6 +20,13 @@ class TextEvent:
 
 
 @dataclass
+class ProgressEvent:
+    """Human-readable activity; never part of a coder's final report."""
+
+    text: str
+
+
+@dataclass
 class ToolCallEvent:
     tool_call_id: str
     name: str
@@ -50,7 +57,7 @@ class DoneEvent:
 
 
 # The neutral events a provider's `tools()` may yield, as one name.
-Event = TextEvent | ToolCallEvent | MutationEvent | ErrorEvent | DoneEvent
+Event = TextEvent | ProgressEvent | ToolCallEvent | MutationEvent | ErrorEvent | DoneEvent
 
 
 @dataclass
@@ -88,6 +95,8 @@ class Run:
     # Populated only for coding runs. Trusted OpenSpec artifact reads bypass this
     # presentation layer so rollback snapshots remain complete.
     tool_interface: Any | None = None
+    # Optional per-run KB-first discovery policy. None preserves the original route.
+    kb_first: Any | None = None
 
     async def put(self, event: Any) -> None:
         await self.queue.put(event)

@@ -24,6 +24,15 @@ Tool responses state completion, failure, truncation, and available expansion.
 Commands expose an exit code when the IDE reports one. Unknown exit codes remain
 unknown. Test output is reduced to totals and a small number of failure lines;
 the authorized original output can be retrieved if more detail is needed.
+`codepartner_get_observation(observation_id="search", query=...)` runs a BM25
+full-text search over this run's observations and lists matching IDs with a snippet.
+
+With `CODEPARTNER_COMPRESS_ENABLED=true`, eligible results are additionally
+compressed after shaping; a `compressed=<mode> bytes=<in>→<out>` line names the
+observation that holds the original. Content identical to an earlier large
+result is replaced by an `IDENTICAL RESULT` pointer. After an edit, observations
+that refer to the edited files carry a `STALE:` header when reloaded. See
+[context-compression.md](context-compression.md).
 
 Repeated reads reuse the run-local result without another IDE request. Pass
 `refresh=true` to force a new read; mutations clear cached reads. The IDE does

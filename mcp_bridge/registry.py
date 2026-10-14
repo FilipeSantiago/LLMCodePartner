@@ -29,6 +29,7 @@ DEFINITIONS = (
     # the exact ``file_search`` operation.
     _d(("find_text", "exact_search", "search_in_files_by_text", "search_regex", "search_text"), (CAP_READ, CAP_SEARCH), DOMAIN_SOURCE, ("file_text_search",), "search"),
     _d(("list_files_in_folder", "list_directory_tree", "get_symbol_info", "get_file_problems", "get_all_open_file_paths", "get_git_diff_all", "get_vcs_log", "open_commit", "documentation_search", "get_project_dependencies", "get_project_modules", "find_usages"), (CAP_READ,), DOMAIN_PROJECT, ("project_inspect",), "inspect"),
+    _d(("kb_get_architecture", "kb_search_graph", "kb_trace_path", "kb_get_file_outline", "kb_get_code_snippet", "kb_index_status"), (CAP_READ,), DOMAIN_PROJECT, ("kb_inspect",), "inspect"),
     _d(("create_new_file", "create_new_file_with_text"), (CAP_WRITE,), DOMAIN_SOURCE, (OP_FILE_CREATE,), "create"),
     _d(("replace_file_text_by_path", "replace_specific_text", "replace_text_in_file"), (CAP_WRITE,), DOMAIN_SOURCE, (OP_FILE_REPLACE,), "replace"),
     _d(("apply_patch",), (CAP_WRITE,), DOMAIN_SOURCE, (OP_FILE_PATCH,), "patch"),

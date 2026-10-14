@@ -83,7 +83,40 @@ class TelemetryStorage:
                   metrics_json TEXT NOT NULL, usage_json TEXT,
                   cost_usd REAL, created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS context_observations (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  run_id TEXT NOT NULL, job_id TEXT, task_id TEXT, attempt INTEGER,
+                  observation_id TEXT, tool TEXT NOT NULL, category TEXT NOT NULL,
+                  resources_json TEXT NOT NULL, args_sha256 TEXT NOT NULL,
+                  content_sha256 TEXT NOT NULL, delivered_sha256 TEXT NOT NULL,
+                  mode TEXT, compressor_version TEXT,
+                  bytes_in INTEGER NOT NULL, bytes_out INTEGER NOT NULL,
+                  est_tokens_in INTEGER NOT NULL, est_tokens_out INTEGER NOT NULL,
+                  applied INTEGER NOT NULL, reason TEXT NOT NULL,
+                  duplicate_of TEXT, stale INTEGER NOT NULL, created_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS context_observations_run
+                  ON context_observations(run_id, observation_id);
+                CREATE INDEX IF NOT EXISTS context_observations_sha
+                  ON context_observations(content_sha256);
             """)
+            try:
+                # Original text is stored only when CODEPARTNER_COMPRESS_PERSIST=true.
+                db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS context_observation_text "
+                           "USING fts5(run_id UNINDEXED, observation_id UNINDEXED, "
+                           "created_at UNINDEXED, content, tokenize='porter unicode61')")
+            except sqlite3.OperationalError:
+                pass  # SQLite without FTS5: provenance still works, text is not kept.
+            # Older telemetry databases predate some ACI columns. The metrics
+            # writer is shared by coder and reviewer attempts, so keep it usable
+            # without replacing or discarding those existing rows.
+            columns = {row[1] for row in db.execute("PRAGMA table_info(telemetry_aci_attempts)")}
+            for name, kind in (("job_id", "TEXT"), ("task_id", "TEXT"),
+                               ("decision_id", "TEXT"), ("provider", "TEXT"),
+                               ("model", "TEXT"), ("usage_json", "TEXT"),
+                               ("cost_usd", "REAL"), ("created_at", "REAL")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE telemetry_aci_attempts ADD COLUMN {name} {kind}")
 
     def record_aci_attempt(self, run_id: str, metadata: dict,
                            metrics: dict, usage: dict | None) -> None:
@@ -98,6 +131,38 @@ class TelemetryStorage:
                 json.dumps(usage, sort_keys=True) if usage else None,
                 metadata.get("cost_usd"), time.time(),
             ))
+
+    def record_context_observations(self, run_id: str, metadata: dict, records: list[dict],
+                                    texts: dict[str, str] | None = None,
+                                    *, retention_days: int = 7) -> None:
+        """Provenance for one run's observations; original text only if `texts`."""
+        now = time.time()
+        with self._database() as db:
+            db.executemany("""INSERT INTO context_observations
+              (run_id, job_id, task_id, attempt, observation_id, tool, category,
+               resources_json, args_sha256, content_sha256, delivered_sha256, mode,
+               compressor_version, bytes_in, bytes_out, est_tokens_in, est_tokens_out,
+               applied, reason, duplicate_of, stale, created_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", [(
+                run_id, metadata.get("implementation_job_id"),
+                metadata.get("implementation_task_id") or metadata.get("task_id"),
+                metadata.get("attempt"), r["observation_id"], r["tool"], r["category"],
+                json.dumps(r["resources"]), r["args_sha256"], r["content_sha256"],
+                r["delivered_sha256"], r["mode"], r["version"], r["bytes_in"], r["bytes_out"],
+                r["est_tokens_in"], r["est_tokens_out"], int(r["applied"]), r["reason"],
+                r["duplicate_of"], int(r["stale"]), r["created_at"],
+            ) for r in records])
+            if not texts:
+                return
+            keys = {r["observation_id"] for r in records if r["observation_id"]}
+            try:
+                db.execute("DELETE FROM context_observation_text WHERE created_at < ?",
+                           (now - retention_days * 86400,))
+                db.executemany("INSERT INTO context_observation_text VALUES (?, ?, ?, ?)",
+                               [(run_id, key, now, texts[key]) for key in sorted(keys)
+                                if key in texts])
+            except sqlite3.OperationalError:
+                pass
 
     def start_tool_call(self, activity: ToolActivity) -> None:
         c = activity.context

@@ -6,9 +6,12 @@ only calls made by a coder and the text delivered back to that coder.
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import re
 import shlex
+import sqlite3
 import time
 from collections import Counter
 from pathlib import PurePosixPath
@@ -17,6 +20,7 @@ from typing import Awaitable, Callable
 from mcp_bridge.adapters import mutation_targets
 from mcp_bridge.edit_validation import validate_postimages, validator_for
 from mcp_bridge.registry import DEFINITIONS, ToolSpec, is_mutating_tool
+from mcp_bridge.read_metrics import SourceReadStats
 
 # The IDE's read_file tool rejects a single request above 5,000 lines. This is
 # a transport constraint, not a limit on what the coder may request.
@@ -72,10 +76,12 @@ def tool_specs() -> list[ToolSpec]:
                  }, "required": ["path", "query"]}),
         ToolSpec("codepartner_get_observation",
                  "Reload the complete earlier authorized result by id. "
-                 "Use observation_id='index' to list observed ranges and edits.",
+                 "Use observation_id='index' to list observed ranges and edits, or "
+                 "observation_id='search' with query to find text in this run's results.",
                  {"type": "object", "properties": {
                      "observation_id": {"type": "string"},
                      "offset": {"type": "integer", "minimum": 0},
+                     "query": {"type": "string"},
                  }, "required": ["observation_id"]}),
     ]
 
@@ -361,24 +367,65 @@ def _safe_generic_text(raw: str, exclusions: tuple[str, ...]) -> str:
                      and not any(item and item in line for item in exclusions))
 
 
+def _split_header(result: str) -> tuple[str, str]:
+    """Shaped results start with a status block that ends at `truncated=…`."""
+    lines = result.split("\n")
+    for index, line in enumerate(lines[:6]):
+        if line.startswith("truncated="):
+            return "\n".join(lines[:index + 1]) + "\n", "\n".join(lines[index + 1:])
+    return "", result
+
+
+def _resources(arguments: dict, body: str) -> list[str]:
+    """Project paths an observation was read from or refers to."""
+    found = [path for path in _paths(arguments)]
+    if isinstance(arguments.get("path"), str):
+        found.append(arguments["path"])
+    for match in re.finditer(r"^([\w./-]+\.\w+)(?::\d+)?\b", body, re.M):
+        found.append(match.group(1))
+        if len(found) >= 200:
+            break
+    return sorted(dict.fromkeys(path for path in found if not _path_reason(path)))
+
+
 class AgentToolInterface:
-    def __init__(self, run, *, compact: bool = True):
+    def __init__(self, run, *, compact: bool = True, compression=None):
         self.run = run
         self.compact = compact
+        # ContextCompressionService, or None: results are then byte-identical
+        # to the uncompressed interface.
+        self.compression = compression
+        self.provenance: list[dict] = []
+        self.stale: set[str] = set()
+        self._digests: dict[str, str] = {}
+        self._delivery: tuple[str | None, str, str] | None = None
+        self._last_paths: list[str] = []
+        self._fts: sqlite3.Connection | None = None
+        self._fts_keys: set[str] = set()
         self.observations: dict[str, str] = {}
         self.prior: dict[tuple, tuple[str, str]] = {}
         self.complete_reads: dict[str, str] = {}
         self.prior_search: dict[tuple, str] = {}
         self.counter = 0
         self.metrics: Counter[str] = Counter()
+        self.source_metrics = SourceReadStats()
         self.files_read: set[str] = set()
         self.observed: list[str] = []
         self.started_at = time.monotonic()
 
     def summary(self) -> dict:
-        return {**dict(self.metrics), "unique_files_read": sorted(self.files_read),
+        return {**dict(self.metrics), **self.source_metrics.summary(),
+                "unique_files_read": sorted(self.files_read),
                 "elapsed_ms": int((time.monotonic() - self.started_at) * 1000),
-                "observation_mode": "compact" if self.compact else "baseline"}
+                "observation_mode": "compact" if self.compact else "baseline",
+                "compression_mode": (self.compression.config.mode
+                                     if self.compression is not None else "off")}
+
+    def record_delivered_result(self, name: str, arguments: dict, result: str) -> None:
+        bare = _bare(name)
+        if bare == "execute_tool":
+            bare, arguments = _dispatcher(arguments)
+        self.source_metrics.observe(bare, arguments, result, read=bare in _READ)
 
     def _remember(self, result: str, raw: str, *, category: str) -> str:
         self.counter += 1
@@ -386,12 +433,141 @@ class AgentToolInterface:
         self.metrics[f"{category}_calls"] += 1
         if raw and raw != result:
             self.observations[key] = raw
+            self._delivery = (key, category, raw)
             suffix = f"\nFull authorized output: codepartner_get_observation(observation_id={key!r})"
             return result + suffix
+        self._delivery = (None, category, raw)
         return result
+
+    def _new_observation(self, content: str) -> str:
+        self.counter += 1
+        key = f"obs-{self.counter}"
+        self.observations[key] = content
+        return key
+
+    def _mark_stale(self, paths: list[str]) -> None:
+        changed = set(paths)
+        for record in self.provenance:
+            if not record["stale"] and changed.intersection(record["resources"]):
+                record["stale"] = True
+                if record["observation_id"]:
+                    self.stale.add(record["observation_id"])
+        self._digests = {digest: key for digest, key in self._digests.items()
+                         if key not in self.stale}
+
+    async def execute(self, name: str, arguments: dict,
+                      backend: Callable[[str, dict], Awaitable[str]]) -> str:
+        self._delivery = None
+        result = await self._execute(name, arguments, backend)
+        if self.compression is None or self._delivery is None:
+            return result
+        return await self._compress_delivery(name, arguments, result)
+
+    async def _compress_delivery(self, name: str, arguments: dict, result: str) -> str:
+        """Compress one shaped result, record its provenance, keep the original."""
+        key, category, raw = self._delivery
+        self._delivery = None
+        if category == "edit":
+            if result.startswith("EDIT APPLIED"):
+                self._mark_stale(self._last_paths)
+            return result
+        if category == "read" or not self.compression.eligible(category):
+            # Never compressed, but tracked so a later edit marks it stale.
+            if key:
+                self._record(name, arguments, key, category,
+                             self.compression.unchanged(raw, "not_eligible"), raw, result, None)
+            return result
+        suffix = f"\nFull authorized output: codepartner_get_observation(observation_id={key!r})"
+        original = result[:-len(suffix)] if key and result.endswith(suffix) else result
+        header, body = _split_header(original)
+        failed = tool_failed(raw) or header.startswith(
+            ("SEARCH FAILED", "TOOL FAILED", "COMMAND FAILED", "ACCESS DENIED"))
+        outcome = await self.compression.compress(category, body, failed=failed)
+        large = outcome.bytes_in >= self.compression.config.min_bytes
+        duplicate_of = self._digests.get(outcome.content_sha256) if large else None
+        delivered = result
+        if duplicate_of:
+            outcome = dataclasses.replace(outcome, applied=False, reason="duplicate")
+            self.metrics["dedup_hits"] += 1
+            self.metrics["est_tokens_saved"] += outcome.est_tokens_in
+            delivered = (header + "IDENTICAL RESULT\nSame content as "
+                         f"{duplicate_of} (sha256={outcome.content_sha256[:12]}); not repeated. "
+                         f"Reload it with codepartner_get_observation(observation_id={duplicate_of!r}).")
+        elif outcome.applied:
+            key = key or self._new_observation(original)
+            self.metrics["compress_applied"] += 1
+            self.metrics["compress_bytes_before"] += outcome.bytes_in
+            self.metrics["compress_bytes_after"] += outcome.bytes_out
+            self.metrics["est_tokens_saved"] += outcome.est_tokens_in - outcome.est_tokens_out
+            delivered = (header + f"compressed={outcome.mode} bytes={outcome.bytes_in}→"
+                         f"{outcome.bytes_out} sha256={outcome.content_sha256[:12]}; original: "
+                         f"codepartner_get_observation(observation_id={key!r})\n" + outcome.text)
+        elif outcome.reason == "backend_error":
+            self.metrics["compress_fallbacks"] += 1
+        elif outcome.reason in {"identifier_lost", "error_line_lost", "json_changed",
+                                "empty_output", "insufficient_saving"}:
+            self.metrics["compress_guard_rejections"] += 1
+        if large and not duplicate_of:
+            key = key or self._new_observation(original)
+            self._digests.setdefault(outcome.content_sha256, key)
+        self._record(name, arguments, key, category, outcome, body, delivered, duplicate_of)
+        return delivered
+
+    def _record(self, name: str, arguments: dict, key: str | None, category: str,
+                outcome, body: str, delivered: str, duplicate_of: str | None) -> None:
+        bare = _bare(name)
+        tool, inner = _dispatcher(arguments) if bare == "execute_tool" else (bare, arguments)
+        self.provenance.append({
+            **outcome.as_record(),
+            "observation_id": key,
+            "tool": tool,
+            "category": category,
+            "resources": _resources(inner, body),
+            "args_sha256": hashlib.sha256(
+                json.dumps(arguments, sort_keys=True, default=str).encode()).hexdigest(),
+            "delivered_sha256": hashlib.sha256(delivered.encode()).hexdigest(),
+            "duplicate_of": duplicate_of,
+            "stale": False,
+            "created_at": time.time(),
+        })
+
+    def persistable_keys(self) -> set[str]:
+        """Originals of compression-eligible results; never whole-file reads."""
+        return {record["observation_id"] for record in self.provenance
+                if record["observation_id"] and record["category"] not in {"read", "edit"}}
+
+    def _search_observations(self, query: object) -> str:
+        if not isinstance(query, str) or not query.strip():
+            return "OBSERVATION ERROR\nquery must be a nonempty string."
+        terms = query.split()[:12]
+        try:
+            if self._fts is None:
+                self._fts = sqlite3.connect(":memory:")
+                self._fts.execute("CREATE VIRTUAL TABLE observation USING "
+                                  "fts5(key UNINDEXED, content, tokenize='porter unicode61')")
+            fresh = [(key, text) for key, text in self.observations.items()
+                     if key not in self._fts_keys]
+            self._fts.executemany("INSERT INTO observation VALUES (?, ?)", fresh)
+            self._fts_keys.update(key for key, _ in fresh)
+            match = " ".join('"' + term.replace('"', '""') + '"' for term in terms)
+            rows = self._fts.execute(
+                "SELECT key, snippet(observation, 1, '[', ']', '…', 12) FROM observation "
+                "WHERE observation MATCH ? ORDER BY bm25(observation) LIMIT 10",
+                (match,)).fetchall()
+        except sqlite3.Error:
+            needle = query.lower()
+            rows = [(key, text[max(0, text.lower().find(needle) - 60):][:160])
+                    for key, text in self.observations.items() if needle in text.lower()][:10]
+        listing = "\n".join(
+            f"{key}{' [STALE]' if key in self.stale else ''}: {' '.join(snippet.split())}"
+            for key, snippet in rows)
+        return (f"OBSERVATION SEARCH\nquery={query!r}\n{len(rows)} matches returned (max 10)\n"
+                "truncated=false\n" + (listing or "No observation in this run matches."))
 
     def _reload(self, arguments: dict) -> str:
         key = arguments.get("observation_id")
+        if key == "search":
+            return self._search_observations(arguments.get("query"))
         if key == "index":
             listing = "\n".join(self.observed) or "No observations recorded yet."
             return (f"OBSERVATION INDEX\n{len(self.observed)} entries recorded\n"
@@ -407,8 +583,10 @@ class AgentToolInterface:
             return "OBSERVATION ERROR\noffset must be a nonnegative integer."
         data = raw.encode()
         segment = data[offset:].decode("utf-8", errors="replace")
+        stale = ("STALE: a resource in this observation was modified after it was "
+                 "recorded; rerun the tool for current content.\n" if key in self.stale else "")
         return (f"OBSERVATION COMPLETE\nid={key}\nbytes={offset}–{len(data)} of {len(data)}\n"
-                "truncated=false\n" + segment)
+                "truncated=false\n" + stale + segment)
 
     async def _fetch_read(self, name: str, path: str, start: int, count: int | None,
                           backend: Callable[[str, dict], Awaitable[str]],
@@ -519,8 +697,8 @@ class AgentToolInterface:
                 messages.append(f"{path}: IDE inspection unavailable")
         return "IDE inspection:\n" + "\n".join(messages)
 
-    async def execute(self, name: str, arguments: dict,
-                      backend: Callable[[str, dict], Awaitable[str]]) -> str:
+    async def _execute(self, name: str, arguments: dict,
+                       backend: Callable[[str, dict], Awaitable[str]]) -> str:
         bare = _bare(name)
         effective, inner = _dispatcher(arguments) if bare == "execute_tool" else (bare, arguments)
         self.metrics["agent_calls"] += 1
@@ -704,6 +882,7 @@ class AgentToolInterface:
                         and len(numbered) == max(numbered)):
                     self.complete_reads[path] = raw
             return self._remember(result, raw, category="read")
+        self._last_paths = list(paths)
         raw = await backend(name, arguments)
         if mutating:
             self.prior.clear()

@@ -63,8 +63,20 @@ async def _run(run: Run, prompt: str, system: str | None,
         if run.tool_interface is not None:
             try:
                 from telemetry.storage import TelemetryStorage
-                TelemetryStorage().record_aci_attempt(
-                    run.run_id, run.metadata, run.tool_interface.summary(), run.usage)
+                storage = TelemetryStorage()
+                storage.record_aci_attempt(
+                    run.run_id, run.metadata,
+                    {**run.tool_interface.summary(),
+                     **({"kb_first": run.kb_first.summary()} if run.kb_first else {})},
+                    run.usage)
+                compression = run.tool_interface.compression
+                if compression is not None and run.tool_interface.provenance:
+                    storage.record_context_observations(
+                        run.run_id, run.metadata, run.tool_interface.provenance,
+                        {key: text for key, text in run.tool_interface.observations.items()
+                         if key in run.tool_interface.persistable_keys()}
+                        if compression.config.persist else None,
+                        retention_days=compression.config.persist_days)
             except Exception:
                 log.exception("could not record ACI metrics run_id=%s", run.run_id)
         await run.put(DoneEvent(terminal, usage=run.usage, model_usage=run.model_usage))
@@ -86,8 +98,11 @@ def start_run(prompt: str, system: str | None, specs: list[ToolSpec],
     run.direct_tool_handlers = dict(direct_tool_handlers or {})
     if agent_tool_interface:
         from mcp_bridge.agent_tools import AgentToolInterface, tool_specs
+        from mcp_bridge.compression import shared_service
         compact = os.getenv("CODEPARTNER_ACI_ENABLED", "true").lower() != "false"
-        run.tool_interface = AgentToolInterface(run, compact=compact)
+        # Compression shapes compact observations only; the baseline stays raw.
+        run.tool_interface = AgentToolInterface(
+            run, compact=compact, compression=shared_service() if compact else None)
         if compact:
             shaped = []
             for spec in specs:

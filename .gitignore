@@ -21,3 +21,6 @@ __pycache__/
 
 # Runtime data (local, in-memory workflow — not source)
 /data/*.json
+
+# Local compress-bridge install (npm ci in infra/compress-bridge)
+node_modules/
