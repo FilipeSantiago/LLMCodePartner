@@ -14,6 +14,16 @@ from agent.routing.tool_metrics import instrument_handlers
 from mcp_bridge.models import DoneEvent, TextEvent
 from mcp_bridge.registry import ToolSpec
 from tests.test_wp_planner import PlanArtifacts, WPPlannerService, plan_payload
+from tests import ide_mode
+
+
+def setUpModule():
+    ide_mode.pin()
+
+
+def tearDownModule():
+    ide_mode.unpin()
+
 
 BIG = "x" * 7000
 KB_CONTEXT = (
@@ -415,7 +425,9 @@ class KbFirstServiceTests(unittest.IsolatedAsyncioTestCase):
         plain = _Script(script)
         row = await self.plan(plain, _specs()[:2], {"read_file": _source})
         self.assertNotIn(KB_FIRST_GUIDANCE, plain.seen[0]["conversation"][0]["content"])
-        self.assertNotIn("outline_gate", row["tool_metrics"])
+        # The strict policy is present even without KB tools; this scripted
+        # provider calls handlers directly, so no outline interception occurs.
+        self.assertEqual(row["tool_metrics"]["outline_gate"]["served"], 0)
         self.assertTrue(all(result.startswith("line") for result in plain.seen[0]["results"]))
 
     async def test_a_stopped_run_is_recorded_then_stops(self):

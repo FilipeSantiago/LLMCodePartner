@@ -7,6 +7,15 @@ from unittest.mock import patch
 
 from agent.spec.ide_mcp_sessions import configure_session
 from agent.spec.jetbrains_mcp import JetBrainsMcpError
+from tests import temp_db
+
+
+def setUpModule():
+    temp_db.start()
+
+
+def tearDownModule():
+    temp_db.stop()
 
 
 _IDE = {"type": "streamable-http", "url": "http://127.0.0.1:64462/stream",

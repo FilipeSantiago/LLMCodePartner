@@ -40,7 +40,8 @@ active task (simple→low, medium→medium, complex→high) and recorded as
 
 `config/model-routing.yaml` → `planner.tiers` maps WP complexity to planner
 candidates. `agent/planning/routing.py` picks the first healthy candidate
-deterministically, and the planner floor (`roles.planner.min_capability`) applies.
+deterministically. No planner capability floor is configured by default; an
+explicit `roles.planner.min_capability` would still apply.
 The selected model follows its gateway policy: `preferred` tries agentgateway
 then retries directly on a gateway transport or HTTP 401/403 authorization
 failure; `required` uses only the gateway; `disabled` uses only the direct CLI.
@@ -159,8 +160,15 @@ planner-vs-downstream cost comparison.
 
 ### KB-first discovery
 
-The shared run-local policy now serves planner, coder and reviewer through the
-normal request-scoped tool dispatch. Generated KB lookups and IDE reads undergo
+The shared run-local policy serves the planner, and, when `discovery.policy` is
+`kb_first`, coders and reviewers too, through the normal request-scoped tool dispatch.
+In `kb_first`, all roles use controlled IDE tools rather than native file access.
+For each file, the first attempted read obtains a KB outline; subsequent reads
+must name a bounded line range. If the KB has no outline, a file-scoped search
+must precede the bounded read. The reviewer checks changed paths without sending
+full-file snapshots to the model.
+With the default `selective` policy, coders and reviewers use the KB on demand: no
+interception, no advisories, telemetry only. Generated KB lookups and IDE reads undergo
 the same registry, adapter, stop, journal, budget and reviewer-path checks as
 direct agent calls. Set top-level discovery.enabled to false to disable it.
 discovery.search_gate_max defaults to five. See
@@ -220,8 +228,9 @@ needed, plus a sufficiency checklist. The first time a per-tier soft threshold
 is reached (`tool_calls`, `full_reads`, `est_added_tokens`,
 `repeated_or_unexplained_reads`), one `[Planning advisory, not a limit]` line is
 appended to that tool result and recorded in `threshold_crossings`. Advisories
-never refuse a call; the hard caps above stay in force. The guidance shared with
-coders and reviewers also receive the shared KB-first guidance. The baseline and rollout status are in
+never refuse a call; the hard caps above stay in force. Coders and reviewers get the
+context-first `KB_SELECTIVE_GUIDANCE` under the default `selective` policy, and the
+shared KB-first guidance under `kb_first`. The baseline and rollout status are in
 `openspec/changes/optimize-planner-discovery/design.md`. To compare benchmark arms:
 
 ```

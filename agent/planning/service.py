@@ -15,7 +15,7 @@ from uuid import uuid4
 
 import providers
 from agent.kb_first import (DiscoveryTracker, EvidenceSeed, KbFirstPolicy,
-                            evidence_seed)
+                            evidence_seed, enforced_reads, native_gate_metadata)
 from agent.planning.complexity import effective_wp_complexity
 from agent.planning.models import ApprovedWPPlan, WPPlanDraft, plan_id_for
 from agent.planning.projection import project, validate_draft
@@ -26,6 +26,7 @@ from agent.routing.gateway import gateway_attempts, gateway_kwargs
 from agent.routing.review import model_identity
 from agent.routing.tool_metrics import instrument_handlers, read_only_handlers
 from agent.spec.models import WorkPackage
+from agent.workspace import plan_native, read_only_session
 from conversation.presentation import progress_line
 from mcp_bridge.activity import describe_call
 from mcp_bridge.models import DoneEvent, ErrorEvent, TextEvent, ToolCallEvent
@@ -307,7 +308,10 @@ class WPPlannerService:
                              discovery_guidance=(
                                  self.config.planner.discovery.mode_for("planner") == "advise"),
                              kb_tools=(_kb_offered(specs)
-                                       and self.config.planner.discovery.enabled))
+                                       and self.config.planner.discovery.enabled),
+                             native=plan_native(self.config.models[
+                                 session["planner_model"]].provider,
+                                 controlled_reads=enforced_reads(self.config.discovery)).native)
         mode = self.config.planner.discovery.mode_for("planner")
         evidence = evidence_seed(brief + "\n" + message, kb_status) if mode != "off" else None
         conversation = [{"role": "user", "content": prompt}]
@@ -426,6 +430,12 @@ class WPPlannerService:
                 reported.add(refused)
                 await progress(progress_line("note", notes[refused]))
 
+        plan = plan_native(model.provider,
+                           controlled_reads=enforced_reads(self.config.discovery))
+        if plan.mode == "native" and not plan.native:
+            raise PlanningError(f"native execution is unavailable: {plan.reason}")
+        # Read-only native run: its own file tools, the KB on demand, no KB-first gates.
+        native = read_only_session(plan.project) if plan.native else None
         discovery = self.config.planner.discovery
         planner_mode = discovery.mode_for("planner")
         # In observe the tracker changes nothing; in advise it may append advisories.
@@ -434,7 +444,8 @@ class WPPlannerService:
             thresholds=(discovery.thresholds_for("planner", session["wp_complexity"])
                         if planner_mode == "advise" else None),
             tier=session["wp_complexity"])
-                   if evidence is not None and planner_mode != "off" else None)
+                   if evidence is not None and planner_mode != "off" and native is None
+                   else None)
         if tracker is not None:
             tracker.prompt(conversation)
         # KB-first whenever Codebase Memory is offered, whatever the discovery mode.
@@ -447,12 +458,16 @@ class WPPlannerService:
             outline_gate_lines=discovery.outline_gate_lines,
             search_gate_max=getattr(discovery, "search_gate_max", 5),
             mode=discovery.mode_for("planner"), tier=session["wp_complexity"],
-            small_file_bytes=discovery.small_file_bytes)
-            if _kb_offered(specs) and getattr(discovery, "enabled", True) else None)
+            small_file_bytes=discovery.small_file_bytes,
+            enforce_reads=enforced_reads(discovery))
+            if getattr(discovery, "enabled", True)
+            and native is None else None)
         kwargs = {"model": model.cli_model, "role": ROLE_OPTIMIZER,
                   "direct_tool_handlers": wrapped,
-                  "kb_first": policy,
+                  "kb_first": policy, "native": native,
                   "run_metadata": {"planner": True, "planner_model": name,
+                                   # Planners are KB-first under every policy.
+                                   **native_gate_metadata(discovery, always=True),
                                    "planning_session_id": session["session_id"],
                                    "wp_id": session["wp_id"],
                                    "gateway_used": use_gateway}}
@@ -506,6 +521,8 @@ class WPPlannerService:
             "user_message": message, "output": reply, "model": name, "usage": usage,
             "cost_usd": (usage or {}).get("total_cost_usd"),
             "tool_metrics": {**metrics.summary(), "narrate": narrate,
+                             **({"execution_mode": "native",
+                                 "native_tool_metrics": native.metrics} if native else {}),
                              "gateway_used": use_gateway, "gateway_attempt": attempt,
                              "failure_kind": classification,
                              **({"cancelled": True} if cancelled else {}),

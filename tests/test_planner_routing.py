@@ -1,4 +1,4 @@
-"""Role-aware planner routing: separate tiers and capability floors per role."""
+"""Role-aware planner routing with an optional planner capability floor."""
 
 import copy
 import tempfile
@@ -42,19 +42,18 @@ class PlannerConfigTests(unittest.TestCase):
     def test_default_config_has_independent_planner_tiers(self):
         config = _load()
         self.assertEqual(set(config.planner.tiers), {"low", "medium", "high", "complex"})
-        self.assertEqual(config.role_floors["planner"], 3)
+        self.assertNotIn("planner", config.role_floors)
+        self.assertEqual(config.planner.tiers["low"][0], "claude-haiku")
         self.assertNotEqual(config.planner.tiers["low"], config.tiers["simple"])
 
-    def test_low_planner_must_outrank_every_simple_coder(self):
-        def weak_planner(raw):
-            raw["roles"]["planner"]["min_capability"] = 1
+    def test_low_planner_can_match_simple_coder_capability(self):
+        def low_cost_planner(raw):
             raw["planner"]["tiers"]["low"] = ["claude-haiku"]
-        with self.assertRaisesRegex(RoutingConfigError, "strictly more capable"):
-            _load(weak_planner)
+        self.assertEqual(_load(low_cost_planner).planner.tiers["low"], ("claude-haiku",))
 
-    def test_planner_floor_is_enforced(self):
+    def test_planner_floor_remains_optional_and_enforced_when_set(self):
         def below_floor(raw):
-            raw["planner"]["tiers"]["medium"] = ["codex-luna-medium"]
+            raw["roles"]["planner"] = {"min_capability": 3}
         with self.assertRaisesRegex(RoutingConfigError, "below the planner floor"):
             _load(below_floor)
 
@@ -117,7 +116,17 @@ class PlannerConfigTests(unittest.TestCase):
     def test_discovery_role_thresholds_and_global_disable(self):
         discovery = _load().discovery
         self.assertTrue(discovery.enabled)
+        self.assertEqual(discovery.policy, "kb_first")
+        # kb_first (configured): every role is gated.
         self.assertEqual(discovery.mode_for("coder"), "advise")
+        self.assertTrue(discovery.gated("reviewer"))
+        # Selective: planners keep KB-first gates; coders and reviewers only observe.
+        selective = _load(lambda raw: raw["discovery"].update(policy="selective")).discovery
+        self.assertEqual(selective.mode_for("planner"), "advise")
+        self.assertEqual(selective.mode_for("coder"), "observe")
+        self.assertFalse(selective.gated("reviewer"))
+        with self.assertRaisesRegex(RoutingConfigError, "policy"):
+            _load(lambda raw: raw["discovery"].update(policy="always"))
         self.assertEqual(discovery.thresholds_for("coder", "simple")["discovery_calls"], 18)
         self.assertFalse(_load(lambda raw: raw["discovery"].update(enabled=False)
                                ).discovery.enabled)
@@ -146,7 +155,7 @@ class PlannerRoutingTests(unittest.TestCase):
 
     def test_wp_complexity_selects_the_planner_tier(self):
         router = PlannerRoutingService(_load())
-        self.assertEqual(router.route("low").model, "claude-sonnet")
+        self.assertEqual(router.route("low").model, "claude-haiku")
         decision = router.route("complex")
         self.assertEqual(decision.model, "claude-opus")
         self.assertEqual(decision.reasoning_effort, "xhigh")
@@ -154,15 +163,15 @@ class PlannerRoutingTests(unittest.TestCase):
     def test_unhealthy_planner_falls_through_to_next_candidate(self):
         router = PlannerRoutingService(_load())
         for _ in range(router.config.failure_threshold):
-            router.health.record("claude-sonnet", "claude-cli", True, False)
-            router.health.record("claude-sonnet", "claude-cli", False, False)
+            router.health.record("claude-haiku", "claude-cli", True, False)
+            router.health.record("claude-haiku", "claude-cli", False, False)
         self.assertEqual(router.route("low").model, "codex-sol-medium")
 
     def test_gateway_failure_does_not_disqualify_healthy_direct_planner(self):
         router = PlannerRoutingService(_load())
         for _ in range(router.config.failure_threshold):
-            router.health.record("claude-sonnet", "claude-cli", True, False)
-        self.assertEqual(router.route("low").model, "claude-sonnet")
+            router.health.record("claude-haiku", "claude-cli", True, False)
+        self.assertEqual(router.route("low").model, "claude-haiku")
 
     def test_planner_routing_requires_a_planner_section(self):
         config = _load(lambda raw: raw.pop("planner"))

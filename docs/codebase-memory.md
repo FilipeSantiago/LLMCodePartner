@@ -1,6 +1,6 @@
 # Optional Codebase Memory for planning and review
 
-Code Partner can use an existing Codebase Memory v0.11.0 index before OpenSpec
+Code Partner can use an existing Codebase Memory v0.11.0 or v0.12.x index before OpenSpec
 planning and Work Package planning, then refresh it after a passing WP review.
 The project remains accessible through
 IntelliJ MCP for exact source verification. Neither Code Partner nor the KB bridge
@@ -12,7 +12,7 @@ This integration is off by default. Ordinary `docker compose up` and existing
 ## Find the host paths and project ID
 
 Run `command -v codebase-memory-mcp` and `codebase-memory-mcp --version` on the
-host. The binary must be a Linux v0.11.0 executable for the container architecture.
+host. The binary must be a Linux v0.11.0 or v0.12.x executable for the container architecture.
 Codebase Memory stores SQLite indexes in `CBM_CACHE_DIR`, defaulting to
 `~/.cache/codebase-memory-mcp`; check your host environment for an override.
 Confirm that the chosen directory already contains the project's `.db` file.
@@ -88,7 +88,61 @@ source evidence and may become stale after edits. Graph results may lag current
 edits, so coders verify implementation details with IntelliJ MCP source reads
 and reviewers base decisions on current source and captured execution evidence.
 Small, recently modified, and non-code files may still need broader reads.
-All three agent roles use the KB-first policy when KB tools are offered. A bare
+**Discovery policy.** `discovery.policy` in `config/model-routing.yaml` decides
+which roles get the KB-first gates described below:
+- **`selective`.** Only the WP planner gets the gates. Coders and
+  reviewers start from the task, the approved plan context and current source.
+  They query the KB on demand for architecture, dependency or impact questions.
+  Their KB calls are still recorded, but nothing is intercepted and no advisories
+  are added.
+- **`kb_first` (configured).** All three roles use controlled IDE tools, even when
+  native execution is configured. The first read of each file obtains its KB outline
+  without returning source content. Subsequent reads require a line range of at most
+  `discovery.outline_gate_lines` lines. When an outline is unavailable, a successful
+  file-scoped search is required before a bounded read. This applies to code, tests,
+  documentation, configuration, and notebooks. The planner always follows these rules.
+  Coders and reviewers use the KB to locate code, not to stand in for files the KB
+  cannot know. Their first read of such a file returns current source without an
+  outline, and later reads need a line range. These files are plan files (the approved
+  plan's shared and task `relevant_files`), files changed in the run or the job,
+  files changed since the index (`recent_mutations`), and code files whose outline is
+  empty. An empty outline's read carries a stale-index note. After an edit or a
+  terminal command, files already located are read directly instead of being outlined
+  again. `read_enforcement` counts `direct_plan`, `direct_changed` and
+  `direct_stale_index`.
+
+**Index catch-up.** Before WP planning and at the start of each implementation job,
+Code Partner compares the KB `indexed_at` with the project's applied or verified
+mutations. If accepted edits are newer, it runs the same host reindex as the
+post-review refresh. This covers refreshes that never ran. A failed catch-up is
+logged (`kb_catch_up_failed`) and never blocks the run.
+
+KB results never override current files.
+
+**Native agents** (docs/native-execution.md) remain available under `selective` or
+when discovery is disabled. Their searches use their own tools, which the IDE gates
+never see:
+- Under `selective`, coder and reviewer prompts give KB-on-demand guidance. The
+  planner remains KB-first for discovery questions, while source reads are not
+  strictly mediated in this mode.
+- Native **Claude** planner runs also get a one-time nudge (`providers/kb_gate.py`,
+  a Claude Code `PreToolUse` hook):
+  - until the agent's first `kb_*` call, a broad identifier-only search is not run;
+    instead the agent is told to call `kb_search_graph`/`kb_trace_path`. Such a search
+    means a Grep over the project or a directory, or a simple `grep -r`/`rg`/`git grep`
+    command;
+  - the first repository-wide Glob gets the same treatment, pointing to
+    `kb_get_architecture`;
+  - repeating the identical call runs it;
+  - at most `discovery.search_gate_max` calls are advised per run;
+  - searches inside a single file, literal, import and usage searches, tests/docs/config
+    paths, pipelines, reads and edits always run.
+- Native **Codex** runs search through their shell, which CodePartner cannot intercept,
+  so they get the guidance only.
+- Native metrics record `kb_calls` and, for Claude, `kb_gate: {advised, repeated_anyway,
+  kb_used}` in `native_tool_metrics`.
+
+When the gates apply to a role and KB tools are offered, the following happens. A bare
 definition-style repository text search first shows indexed graph definitions
 under a conspicuous "TEXT SEARCH NOT EXECUTED" header; repeating the identical
 search executes it unchanged. Usage, import, literal, test, documentation and

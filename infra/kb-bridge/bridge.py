@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import re
 import stat
 import sys
 from pathlib import Path
@@ -19,6 +20,9 @@ BIN = Path("/usr/local/bin/codebase-memory-mcp")
 DATA = Path("/var/lib/codebase-memory-mcp")
 SOCKET_DIR = Path("/run/kb-bridge")
 SOCKET = SOCKET_DIR / "mcp.sock"
+# Versions whose scout profile, storage layout and daemon are known to work; the
+# REQUIRED tool check below still guards each start.
+SUPPORTED_VERSION = re.compile(rb"codebase-memory-mcp 0\.(?:11\.0|12\.\d+)")
 REQUIRED = {"list_projects", "index_status", "get_architecture", "search_graph",
             "trace_path", "get_file_outline", "get_code_snippet"}
 
@@ -39,7 +43,7 @@ def validate_paths() -> tuple[int, int]:
         raise RuntimeError("KB_UID/KB_GID must match the storage directory owner and group")
     mode = DATA.stat().st_mode
     if not mode & stat.S_IWUSR:
-        raise RuntimeError("Codebase Memory v0.11.0 needs writable KB storage")
+        raise RuntimeError("Codebase Memory needs writable KB storage")
     return uid, gid
 
 
@@ -76,8 +80,8 @@ async def run() -> None:
         str(BIN), "--version", stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE)
     stdout, stderr = await version.communicate()
-    if version.returncode or stdout.strip() != b"codebase-memory-mcp 0.11.0":
-        raise RuntimeError("KB_BINARY_PATH must provide Codebase Memory v0.11.0: " +
+    if version.returncode or not SUPPORTED_VERSION.fullmatch(stdout.strip()):
+        raise RuntimeError("KB_BINARY_PATH must provide Codebase Memory v0.11.0 or v0.12.x: " +
                            (stderr or stdout).decode(errors="replace"))
 
     SOCKET_DIR.mkdir(exist_ok=True)

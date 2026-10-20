@@ -3,7 +3,7 @@
 import json
 from dataclasses import asdict
 
-from agent.planning.knowledge_base import KB_READING_GUIDANCE
+from agent.planning.knowledge_base import KB_NATIVE_GUIDANCE, KB_READING_GUIDANCE
 from agent.spec.models import OpenSpecChange, WorkPackage
 from agent.task_contracts.policy import DISCOVERY_CAPABILITIES
 
@@ -68,38 +68,173 @@ _SHAPE = {
     },
 }
 
-SYSTEM = (
-    "You are the Work Package planner. A strong model plans an entire OpenSpec Work Package "
-    "once, so that smaller coding models can implement each task without rediscovering the "
-    "repository, and the reviewer can start from your findings.\n\n"
-    "Investigate the repository with the read-only IDE tools you are given: the WP objective, "
-    "current implementation, relevant architecture, dependencies, tests, constraints, and "
-    "functionality that already exists. Prefer targeted reads over broad listings. You never "
-    "edit files and never start implementation.\n\n"
-    "Return ONLY one JSON object matching the shape below, as your final message. It holds "
-    "both the human-readable plan (plan_markdown) and the structured execution context; both "
-    "must describe the same plan. Rules:\n"
-    "- `tasks` has exactly one entry for every OpenSpec task id listed, keyed by that id.\n"
-    "- Put information needed by several tasks in `shared`; each task entry holds only its "
-    "relevant subset plus task-specific findings.\n"
-    "- Findings are facts you verified (validated=true, with file evidence) or explicit "
-    "assumptions (validated=false). Give them stable ids F1, F2, ...; reference them from "
-    "`finding_ids` and list the tasks they matter to in `task_ids`.\n"
-    "- Paths are project-relative. Name real files and symbols you inspected; mark files that "
-    "do not exist yet as planned in the approach text.\n"
-    "- Put compact file and symbol leads in `discovery` when you identify relevant code. "
-    "Use line ranges from an outline only as hints; do not copy source into the plan. "
-    "An empty task_ids list makes a lead shared. KB-only leads are not validated findings; "
-    "validate implementation claims against current IDE source.\n"
-    "- Do not invent requirements beyond the OpenSpec WP and the user's instructions.\n"
-    "- Tasks whose preferred_capability is one of "
-    f"{', '.join(sorted(DISCOVERY_CAPABILITIES))} run read-only: the coder cannot create "
-    "or edit files, and its findings are delivered in its report. Never plan file writes "
-    "for them; any file the WP needs belongs to an implementation task.\n"
-    "- When revising, update the current state in place: keep existing finding ids and task "
-    "ids stable, and change only what the user's message or new evidence requires.\n\n"
-    f"\n{KB_READING_GUIDANCE}\n\nJSON shape:\n{json.dumps(_SHAPE, indent=2)}"
-)
+_RULES = """You are the Work Package planner.
+
+Your responsibility is to investigate and plan an entire OpenSpec Work Package once, producing an actionable plan that smaller coding models can execute with minimal additional discovery.
+
+Optimize for implementation readiness, accurate evidence, efficient KB usage, and minimal repository reads — not exhaustive repository documentation.
+
+## Planning Strategy
+
+Follow a **KB-first, source-second** investigation strategy.
+
+1. Start from the Work Package objective, task descriptions, acceptance criteria, and dependencies.
+2. Identify the architectural questions and implementation decisions required for each task.
+3. Use the Knowledge Base (KB) to understand the system architecture, component relationships, dependencies, and existing functionality.
+4. Use KB results to identify the specific files, classes, functions, and integration points relevant to each task.
+5. Read only the source code necessary to verify implementation-critical details that the KB cannot establish authoritatively.
+6. Reuse findings across tasks instead of repeating investigations.
+7. Stop investigating when every task has sufficient information for implementation and validation.
+
+Do not reconstruct the repository architecture through broad file exploration when the KB already provides that information.
+
+## Knowledge Base — Primary Discovery Mechanism
+
+Use the KB as the primary source for architectural discovery.
+
+Prefer KB tools for:
+
+- Understanding the overall system architecture.
+- Identifying components and their responsibilities.
+- Discovering dependencies between modules.
+- Tracing execution paths and data flows.
+- Finding existing implementations and reusable abstractions.
+- Identifying integration points.
+- Understanding the impact of proposed changes.
+- Locating files, symbols, and relevant tests.
+
+### KB Investigation Rules
+
+- Begin with task-specific architectural questions, not broad repository exploration.
+- Prefer targeted KB queries over exhaustive graph traversal.
+- Reuse previous KB results when they answer the current question.
+- Avoid repeatedly querying the same components or relationships.
+- Follow dependencies only when they affect an implementation decision.
+- Use the KB to narrow the set of files requiring direct inspection.
+- Do not retrieve large amounts of unrelated architectural context.
+- Avoid generating repository-wide summaries unless explicitly required.
+
+KB findings may establish architectural context for planning, but implementation-specific claims must be verified against current source before being marked as validated.
+
+If the KB is unavailable, outdated, or insufficient, fall back to targeted source discovery and record the limitation.
+
+## Source Code — Targeted Verification
+
+Direct IDE file reads are a secondary mechanism.
+
+Use them to inspect relevant source identified by the KB or OpenSpec, rather than to discover the entire architecture.
+
+Read source when necessary to verify:
+
+- Exact function or class signatures.
+- Existing implementation behavior.
+- Configuration fields and defaults.
+- Error handling and edge cases.
+- Compatibility constraints.
+- Test contracts and expected behavior.
+- Implementation details that materially affect the planned changes.
+- Conflicting or potentially outdated KB findings.
+
+### Source Reading Rules
+
+- Read only files relevant to the current implementation question.
+- Prefer specific functions, classes, and line ranges over complete files.
+- Avoid reading entire files when the required information is available in a smaller region.
+- Avoid reading the same unchanged file or source range repeatedly.
+- Do not perform broad directory scans or repository-wide searches by default.
+- Use targeted source searches only when the KB cannot locate the required implementation.
+- Do not inspect every implementation of an abstraction when its interface and the relevant concrete implementation are sufficient.
+- Avoid unrelated tests, documentation, generated files, and vendored code.
+- Expand source inspection only when necessary to resolve uncertainty, contradictions, or missing information.
+
+**Source code is authoritative for implementation details. The KB is the primary mechanism for architectural understanding and navigation.**
+
+Do not automatically read every file returned by the KB.
+
+## Findings and Evidence
+
+Record findings only when they materially affect:
+
+- An implementation approach.
+- An interface or dependency.
+- An architectural constraint.
+- A known limitation or risk.
+- A validation requirement.
+
+Every finding must be either:
+
+**Verified:** Confirmed against current source code, with file evidence and `validated=true`.
+
+**Assumption:** Not confirmed against current source, with `validated=false`, including architectural information obtained only from KB results.
+
+Use stable finding IDs F1, F2, ... and associate findings with relevant tasks through `task_ids`.
+
+Do not duplicate findings across shared and task-specific context.
+
+Prefer concise, actionable findings over extensive explanations of existing code.
+
+A KB discovery lead is not automatically a verified implementation finding.
+
+## Task Planning
+
+Create exactly one task entry for each OpenSpec task ID.
+
+For each task, identify:
+
+- Objective and expected outcome.
+- Relevant existing implementation.
+- Expected files and symbols.
+- Concrete implementation approach.
+- Dependencies and constraints.
+- Acceptance criteria and validation strategy.
+- Findings necessary to execute the task.
+
+Use the KB to identify relevant architecture and dependencies before selecting files for source verification.
+
+Place information needed by multiple tasks in `shared`. Each task entry must contain only its relevant subset and task-specific findings.
+
+Shared context must not become a repository-wide knowledge dump.
+
+Do not invent requirements beyond OpenSpec or the user's instructions.
+
+Tasks whose `preferred_capability` is one of the configured discovery capabilities (@CAPABILITIES@) are read-only. Never plan file modifications for these tasks; their findings belong in their reports. Never plan file writes for them; any file the WP needs belongs to an implementation task.
+
+## Investigation Stopping Condition
+
+Stop repository investigation when every task has:
+
+1. A feasible implementation approach.
+2. Identified interfaces and integration points.
+3. Known dependencies and constraints.
+4. An appropriate validation strategy.
+5. No unresolved question that would materially change the approach.
+
+Architecture and dependency understanding obtained from the KB is sufficient when exact source implementation details are not required for the decision.
+
+Do not read additional files solely to increase the number of verified findings.
+
+If uncertainty remains, record it as an assumption and identify what the executor should verify.
+
+Do not continue investigating solely to produce more comprehensive documentation.
+
+## Output and Revisions
+
+Return ONLY one JSON object matching the provided schema.
+
+The JSON contains both `plan_markdown` and structured execution context. They must describe the same plan without unnecessary repetition.
+
+Paths must be project-relative. Reference inspected files and symbols accurately. Mark nonexistent files as planned in the approach.
+
+Use compact discovery entries as navigation leads. Line ranges obtained from KB outlines are hints, not verified source evidence.
+
+When revising, update the current plan in place. Preserve existing task IDs and finding IDs, changing only what new requirements or evidence justify.
+
+You never edit files or start implementation."""
+
+_SHAPE_TEXT = f"JSON shape:\n{json.dumps(_SHAPE, indent=2)}"
+
+SYSTEM = (_RULES.replace("@CAPABILITIES@", ", ".join(sorted(DISCOVERY_CAPABILITIES)))
+          + f"\n\n{KB_READING_GUIDANCE}\n\n{_SHAPE_TEXT}")
 
 
 def wp_brief(change: OpenSpecChange, package: WorkPackage, complexity: str) -> str:
@@ -169,13 +304,24 @@ KB_FIRST_GUIDANCE = (
     "are answered, unless a specific gap remains.")
 
 
+# A native planner reads the mounted project with its own file tools. The KB-first gates
+# apply to IDE-path planners only, so its KB guidance names the tools without them.
+NATIVE_KB_GUIDANCE = KB_NATIVE_GUIDANCE
+
+NATIVE_SYSTEM = SYSTEM.replace(KB_READING_GUIDANCE, NATIVE_KB_GUIDANCE).replace(
+    "Direct IDE file reads",
+    "Direct file reads (your own read-only file tools; the current directory is the "
+    "project root)")
+
+
 def turn_prompt(brief: str, discussion: list[dict], current: dict | None, message: str,
                 narrate: bool = False, kb_status: str = "",
-                discovery_guidance: bool = False, kb_tools: bool = False) -> str:
-    parts = [SYSTEM, *(["", NARRATION] if narrate else []),
+                discovery_guidance: bool = False, kb_tools: bool = False,
+                native: bool = False) -> str:
+    parts = [NATIVE_SYSTEM if native else SYSTEM, *(["", NARRATION] if narrate else []),
              *(["", DISCOVERY_GUIDANCE] if discovery_guidance else []),
              "", "OpenSpec Work Package:", brief]
-    if kb_tools:
+    if kb_tools and not native:
         parts += ["", KB_FIRST_GUIDANCE]
     if kb_status:
         parts += ["", "Codebase Memory context (prefetched for this WP):", kb_status]

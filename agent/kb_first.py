@@ -15,6 +15,7 @@ from agent.planning.knowledge_base import _identifiers
 from mcp_bridge.adapters import mutation_targets
 from mcp_bridge.read_metrics import dispatched, failed_read, read_region
 from mcp_bridge.registry import is_mutating_tool
+from providers.kb_gate import classify_search
 
 STRENGTHS = ("strong", "moderate", "weak", "none")
 _RANK = {name: rank for rank, name in enumerate(STRENGTHS)}
@@ -252,6 +253,11 @@ _CODE_EXTENSIONS = frozenset((
     "py", "pyi", "js", "jsx", "mjs", "ts", "tsx", "java", "kt", "kts", "go", "rs", "rb", "c",
     "h", "cc", "cpp", "hpp", "cs", "swift", "scala", "sh", "sql"))
 _OUTLINE_ROWS = 60
+
+
+def _is_code(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return "." in name and name.rsplit(".", 1)[-1].lower() in _CODE_EXTENSIONS
 GATE_NOTE = ("Read not performed. Outline from the last index: line ranges are hints "
              "and may have shifted; read current source via the IDE with ranges, "
              "or repeat this read for the whole file.")
@@ -304,8 +310,7 @@ class OutlineGate:
         path = _target(arguments)
         if not path or not self._broad(arguments):
             return None
-        name = path.rsplit("/", 1)[-1]
-        if "." not in name or name.rsplit(".", 1)[-1].lower() not in _CODE_EXTENSIONS:
+        if not _is_code(path):
             self._pass("non_code")
             return None
         if any(_same(path, known) for known in self.gated):
@@ -350,7 +355,6 @@ class OutlineGate:
 _GENERATED = contextvars.ContextVar("kb_first_generated", default=False)
 _SEARCHES = {"search_text", "search_regex", "search_in_files_by_text", "find_text"}
 _READS = {"read_file", "get_file_text_by_path", "codepartner_read_file"}
-_IDENTIFIER = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
 
 
 def _payload(raw):
@@ -379,7 +383,8 @@ def _source_body(result):
         lines = lines[3:]
         if lines and lines[0].startswith("Remaining: "):
             lines = lines[1:]
-    return "\n".join(re.sub(r"^L\d+: ?", "", line) for line in lines)
+    return "\n".join(re.sub(r"^(?:L\d+: ?|\s*\d+ \| ?)", "", line)
+                     for line in lines)
 
 
 @dataclass
@@ -400,14 +405,27 @@ class KbFirstPolicy:
                  snippet_max_lines: int = 300, recent_mutations=None,
                  mode: str = "advise", tier: str = "",
                  advisory_thresholds: dict[str, int] | None = None,
-                 small_file_bytes: int = 6000):
+                 small_file_bytes: int = 6000, gates: bool = True,
+                 enforce_reads: bool = False, direct_paths=()):
         self.role = role
+        # False: KB tools stay on demand and telemetry is kept, but bridged searches,
+        # reads and edits are never intercepted (discovery.policy: selective).
+        self.gates = gates
+        self.enforce_reads = enforce_reads
+        self.read_lookups: dict[str, str] = {}
+        self.fallback_searched: set[str] = set()
+        self.read_enforcement = Counter()
         self.tool_names = set(tool_names)
         self.tracker = tracker
         self.seed = seed or EvidenceSeed()
         self.outline = OutlineGate(None, outline_gate_lines)
         self.search_gate_max = search_gate_max
         self.verify_paths = set(verify_paths)
+        # Files the approved plan names for this task: the coder edits them, so their
+        # current source matters more than a KB outline.
+        self.direct_paths = set(direct_paths)
+        self.direct_read: set[str] = set()
+        self.read_notes: dict[str, str] = {}
         self.excluded_files = set(excluded_files)
         self.root_path = root_path
         self.indexed_at = indexed_at
@@ -464,7 +482,8 @@ class KbFirstPolicy:
             indexed_at=self.indexed_at, snippet_max_lines=self.snippet_max_lines,
             recent_mutations=self.recent_mutations, mode=self.mode, tier=self.tier,
             advisory_thresholds=self.advisory_thresholds,
-            small_file_bytes=self.small_file_bytes)
+            small_file_bytes=self.small_file_bytes, gates=self.gates,
+            enforce_reads=self.enforce_reads, direct_paths=self.direct_paths)
 
     def _location(self, payload):
         if not isinstance(payload, dict):
@@ -666,7 +685,7 @@ class KbFirstPolicy:
         return f"Symbol not found at KB location; KB hint stale. Candidate lines: {candidates}"
 
     async def _snippet(self, arguments, dispatch, run):
-        raw = await dispatch("kb_get_code_snippet", arguments)
+        raw = await self._dispatch("kb_get_code_snippet", arguments, dispatch)
         if _error(raw):
             return raw
         payload = _payload(raw)
@@ -773,26 +792,7 @@ class KbFirstPolicy:
         return json.dumps(clean(payload), ensure_ascii=False)
 
     def _search_query(self, arguments):
-        query = next((arguments.get(key) for key in ("q", "query", "text", "searchText", "regex", "pattern")
-                      if isinstance(arguments.get(key), str)), None)
-        if not query:
-            return None, "literal"
-        raw = re.sub(r"^(?:\\b|\^)+", "", query.strip())
-        raw = re.sub(r"(?:\\b)+$", "", raw)
-        names = [part.strip() for part in raw.split("|")]
-        if not names or not all(_IDENTIFIER.fullmatch(part) for part in names):
-            if re.search(r"\b(?:import|from)\b", query):
-                return None, "intent_import"
-            if re.search(r"(?:\w\s*\(|\.\w|=\s*\w)", query):
-                return None, "intent_usage"
-            return None, "literal"
-        for key in ("paths", "path", "file_path", "fileMask", "file_mask", "directory"):
-            value = str(arguments.get(key) or "").lower()
-            if value and re.search(r"(?:test|docs?|\.md|config|\.ya?ml|\.json)", value):
-                return None, "intent_tests_docs"
-            if value and key in {"paths", "path", "file_path", "directory"}:
-                return None, "intent_tests_docs"
-        return names, None
+        return classify_search(arguments)
 
     def _match_paths(self, result):
         for path in paths_in(result):
@@ -944,6 +944,20 @@ class KbFirstPolicy:
         if _GENERATED.get():
             return await dispatch(name, arguments)
         bare, actual, read = dispatched(name, arguments, name.rsplit("__", 1)[-1] in _READS)
+        if self.enforce_reads:
+            if bare == "read_notebook":
+                self.read_enforcement["notebook_blocked"] += 1
+                return ("Notebook-wide reads are unavailable under KB-enforced reading. "
+                        "Search the notebook, then read its relevant numbered JSON lines "
+                        "with the controlled file reader.")
+            if bare == "get_file_text_by_path":
+                self.read_enforcement["unbounded_transport_blocked"] += 1
+                return ("This reader cannot guarantee a bounded response. Use "
+                        "codepartner_read_file or read_file with an explicit line range.")
+            if read:
+                guarded = await self._guard_read(actual, dispatch, run)
+                if guarded is not None:
+                    return guarded
         if bare == "kb_get_code_snippet":
             return await self._snippet(arguments, dispatch, run)
         if bare == "kb_search_graph" and isinstance(actual.get("name_pattern"), str):
@@ -958,7 +972,7 @@ class KbFirstPolicy:
             for target in paths:
                 if bare in {"create_new_file", "create_new_file_with_text"}:
                     continue
-                if any(_same(target, hint) for hint in self.hinted_paths):
+                if self.gates and any(_same(target, hint) for hint in self.hinted_paths):
                     covered, location = self._edit_covered(actual, target)
                     if not covered:
                         self.edit_verification_blocks += 1
@@ -977,6 +991,12 @@ class KbFirstPolicy:
                 self.mutated_paths.update(paths)
                 for target in paths:
                     self.verified.pop(target, None)
+                    if self.enforce_reads:
+                        # The index cannot know the edited version; read it directly.
+                        for known in tuple(self.read_lookups):
+                            if _same(known, _norm(target)):
+                                self.read_lookups.pop(known, None)
+                        self.read_lookups[_norm(target)] = "direct"
                 old = next((actual.get(key) for key in
                             ("old_text", "oldText", "old_string", "oldString",
                              "textToReplace", "oldContent", "searchText")
@@ -1002,7 +1022,7 @@ class KbFirstPolicy:
                                 self.verified[path].append(VerifiedRegion(
                                     region.start, region.end, updated, region.whole))
             return result
-        graph_tool = self._name(run, "kb_search_graph")
+        graph_tool = self._name(run, "kb_search_graph") if self.gates else None
         if bare in _SEARCHES and graph_tool:
             names, reason = self._search_query(actual)
             signature = json.dumps([name, arguments], sort_keys=True, default=str)
@@ -1039,14 +1059,17 @@ class KbFirstPolicy:
                 self.search_outcomes[reason] += 1
                 if reason in {"kb_error", "no_graph_match"}:
                     self.fallback_reasons[reason] += 1
-        outline_tool = self._name(run, "kb_get_file_outline")
+        outline_tool = self._name(run, "kb_get_file_outline") if self.gates else None
         if read and outline_tool:
             path = _target(actual)
             await self._ensure_index(dispatch, run)
             if path and any(_same(path, item) for item in self.recent_paths):
                 self.fallback_reasons["stale_signal"] += 1
-            if path and not self._excluded(path) and not any(_same(path, item) for item in
-                    self.verify_paths | self.mutated_paths | self.recent_paths):
+            direct = self.direct_paths if self.role != "planner" else set()
+            if (path and not self._excluded(path)
+                    and self.read_lookups.get(_norm(path)) != "direct"
+                    and not any(_same(path, item) for item in self.verify_paths
+                                | self.mutated_paths | self.recent_paths | direct)):
                 async def outline(args):
                     return await self._dispatch(outline_tool, args, dispatch)
                 self.outline.outline = outline
@@ -1061,14 +1084,112 @@ class KbFirstPolicy:
                     self.outline_outcomes["served"] += 1
                     return gated[1]
         result = await dispatch(name, arguments)
+        if self.enforce_reads and bare == "execute_terminal_command" and not _error(result):
+            # A test/check can regenerate project files the index cannot know either;
+            # later reads of files already located go straight to current source.
+            for known in self.read_lookups:
+                self.read_lookups[known] = "direct"
+            self.read_enforcement["verification_invalidations"] += 1
+        if (self.enforce_reads and isinstance(result, str)
+                and not result.startswith(("Error:", "SEARCH ERROR", "SEARCH UNAVAILABLE",
+                                           "ACCESS DENIED", "TOOL ERROR"))):
+            targets = ([actual.get("path")] if bare == "codepartner_search_in_file"
+                       else actual.get("paths") if bare in {
+                           "search_in_files_by_text", "search_text", "search_regex",
+                           "find_text", "exact_search"} else None)
+            if isinstance(targets, list) and len(targets) == 1:
+                target = targets[0]
+                if isinstance(target, str) and self.read_lookups.get(_norm(target)) == "fallback":
+                    self.fallback_searched.add(_norm(target))
+                    self.read_enforcement["fallback_searches"] += 1
         if read:
             self._record_read(actual, result)
             self.outline.note(name, arguments, True)
+            note = self.read_notes.pop(_norm(_target(actual) or ""), None)
+            if note and isinstance(result, str) and not _error(result):
+                result = note + "\n" + result
         elif bare.startswith("kb_"):
             result = self._filter_kb(result)
             self._match_paths(result)
             self.outline.note(name, arguments, False)
         return result
+
+    async def _guard_read(self, arguments: dict, dispatch, run) -> str | None:
+        path, start, end, ranged = read_region(arguments)
+        if not path:
+            self.read_enforcement["missing_path"] += 1
+            return "A project-relative file path is required for a controlled read."
+        path = _norm(path)
+        if self._excluded(path):
+            return None
+        if path not in self.read_lookups:
+            reason = await self._direct_reason(path, dispatch, run)
+            if reason:
+                self.read_lookups[path] = "direct"
+                self.read_enforcement[reason] += 1
+        if path not in self.read_lookups:
+            outline_tool = self._name(run, "kb_get_file_outline")
+            if outline_tool:
+                raw = await self._dispatch(outline_tool, {
+                    "file_path": path, "limit": 60, "format": "json"}, dispatch)
+                payload = _payload(raw)
+                if isinstance(payload, dict) and _rows(payload):
+                    self.read_lookups[path] = "kb"
+                    self.hinted_paths.add(path)
+                    self.read_enforcement["kb_outlines"] += 1
+                    return (f"READ NOT PERFORMED. KB outline for {path} (navigation "
+                            "hint; verify current source). Choose a relevant line range "
+                            f"of at most {self.outline.lines} lines before reading.\n"
+                            f"{self._filter_kb(raw)}")
+                reason = "kb_error" if _error(raw) or payload is None else "not_indexed"
+            else:
+                reason = "kb_unavailable"
+            if reason == "not_indexed" and self.role != "planner" and _is_code(path):
+                # An empty outline of a code file usually means the index is behind,
+                # not that the file is empty; a forced search would only add a detour.
+                self.read_lookups[path] = "direct"
+                self.fallback_reasons[reason] += 1
+                self.read_enforcement["direct_stale_index"] += 1
+                self.read_notes[path] = (f"KB has no symbols for {path}; the index may be "
+                                         "stale. Showing current source.")
+                return await self._guard_read(arguments, dispatch, run)
+            self.read_lookups[path] = "fallback"
+            self.fallback_reasons[reason] += 1
+            self.read_enforcement["fallbacks"] += 1
+            return (f"READ NOT PERFORMED. KB {reason.replace('_', ' ')} for {path}. "
+                    "Search within this file using an advertised file-search tool, "
+                    "then request only the relevant numbered line range.")
+        if self.read_lookups[path] == "direct" and path not in self.direct_read:
+            self.direct_read.add(path)
+            self.read_enforcement["direct_reads"] += 1
+            return None
+        if self.read_lookups[path] == "fallback" and path not in self.fallback_searched:
+            self.read_enforcement["search_required"] += 1
+            return (f"READ NOT PERFORMED. Search within {path} first; the KB "
+                    "had no usable outline for this file.")
+        if not ranged or not isinstance(start, int) or not isinstance(end, int):
+            self.read_enforcement["unbounded_blocked"] += 1
+            return (f"READ NOT PERFORMED. Specify an explicit start and end line "
+                    f"for {path}, at most {self.outline.lines} lines.")
+        if start < 1 or end < start or end - start + 1 > self.outline.lines:
+            self.read_enforcement["oversized_blocked"] += 1
+            return (f"READ NOT PERFORMED. A range must contain 1–{self.outline.lines} "
+                    "lines; select a smaller relevant range.")
+        self.read_enforcement["ranged_reads"] += 1
+        return None
+
+    async def _direct_reason(self, path, dispatch, run) -> str | None:
+        """Why a coder/reviewer reads this file without a KB outline, or None."""
+        if self.role == "planner":
+            return None
+        if any(_same(path, known) for known in self.direct_paths):
+            return "direct_plan"
+        if any(_same(path, known) for known in self.verify_paths | self.mutated_paths):
+            return "direct_changed"
+        await self._ensure_index(dispatch, run)
+        if any(_same(path, known) for known in self.recent_paths):
+            return "direct_changed"
+        return None
 
     def summary(self):
         self.search_outcomes["kb_sufficient"] = max(
@@ -1104,4 +1225,20 @@ class KbFirstPolicy:
                                   if self.tracker else self.unexplained_reads),
             "threshold_crossings": (self.tracker.summary().get("threshold_crossings")
                                     if self.tracker else list(self.threshold_crossings)),
+            "read_enforcement": dict(self.read_enforcement),
         }
+
+
+def native_gate_metadata(discovery, always: bool = False) -> dict:
+    """Ask a native Claude run for the KB-first search nudge (providers/kb_gate.py)."""
+    if discovery is None or not getattr(discovery, "enabled", True):
+        return {}
+    if not always and getattr(discovery, "policy", "selective") != "kb_first":
+        return {}
+    return {"kb_gate": True, "kb_gate_max": getattr(discovery, "search_gate_max", 5)}
+
+
+def enforced_reads(discovery) -> bool:
+    """Whether agent-visible project reads must use the controlled tool path."""
+    return bool(discovery is not None and getattr(discovery, "enabled", True)
+                and getattr(discovery, "policy", None) == "kb_first")

@@ -25,6 +25,16 @@ from agent.task_contracts.contractor import TaskContractor
 from mcp_bridge.models import DoneEvent, ErrorEvent, TextEvent
 from model.chat import ChatMessage
 from tests.test_turn_routing import _Artifacts, _Execution, _WorldTest, _specs
+from tests import ide_mode
+
+
+def setUpModule():
+    ide_mode.pin()
+
+
+def tearDownModule():
+    ide_mode.unpin()
+
 
 TASKS = ("WP4-T1", "WP4-T2")
 
@@ -566,6 +576,21 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn("inspection", SYSTEM)
         self.assertIn("Never plan file writes for them", SYSTEM)
 
+    def test_planner_prompt_is_kb_first_in_both_modes(self):
+        from agent.planning.knowledge_base import KB_READING_GUIDANCE, KB_SELECTIVE_GUIDANCE
+        from agent.planning.prompts import NATIVE_KB_GUIDANCE, NATIVE_SYSTEM, SYSTEM
+        from agent.task_contracts.policy import DISCOVERY_CAPABILITIES
+        for prompt in (SYSTEM, NATIVE_SYSTEM):
+            self.assertTrue(prompt.startswith("You are the Work Package planner."))
+            self.assertIn("**KB-first, source-second**", prompt)
+            self.assertIn("## Investigation Stopping Condition", prompt)
+            self.assertTrue(all(name in prompt for name in DISCOVERY_CAPABILITIES))
+            self.assertIn('JSON shape:\n{\n  "summary"', prompt)
+            self.assertNotIn(KB_SELECTIVE_GUIDANCE, prompt)
+        self.assertIn(KB_READING_GUIDANCE, SYSTEM)
+        self.assertIn(NATIVE_KB_GUIDANCE, NATIVE_SYSTEM)
+        self.assertNotIn("approved plan context", NATIVE_SYSTEM)
+
     def test_validation_reports_dangling_ids_and_unknown_tasks(self):
         payload = plan_payload()
         payload["tasks"]["WP4-T1"]["finding_ids"] = ["F9"]
@@ -586,14 +611,18 @@ class ArtifactTests(unittest.TestCase):
         plan = project(self.draft(), plan_id="p", session_id="s", change_id="CHG1",
                        wp_fingerprint="f", wp_complexity="high", planner_model="claude-opus")
         context = coder_context(plan, "WP4-T1")
-        self.assertIn("TASK CONTEXT (WP4-T1)", context)
+        self.assertIn("RELEVANT CONTEXT (WP4-T1;", context)
+        self.assertIn("REQUIRED CHANGES", context)
+        self.assertIn("Expected approach: Extend the registry", context)
+        self.assertIn("src/legacy/", context)
         self.assertIn("src/wp4-t1.py", context)
         self.assertNotIn("src/wp4-t2.py", context)
         messages = TaskExecutionService._execution_messages(
             _task("WP4-T1"), [{"role": "user", "content": "x"}], plan_context=context)
         prompt = messages[-1]["content"]
         self.assertIn("A planner already investigated this work package", prompt)
-        self.assertIn("WP SHARED CONTEXT", prompt)
+        self.assertIn("RELEVANT CONTEXT (WP4-T1;", prompt)
+        self.assertNotIn("WP SHARED CONTEXT", prompt)
         contract = TaskContractor().initial_contract(
             _task("WP4-T1"), _specs(), task_context=plan.tasks["WP4-T1"])
         self.assertIn("src/wp4-t1.py", contract.primary_files)
@@ -679,7 +708,8 @@ class PlanModeConversationTests(_WorldTest):
         self.assertIn("approved and frozen", started)
         self.assertEqual([task_id for task_id, _ in self.world.execution.started],
                          list(TASKS))
-        self.assertIn("TASK CONTEXT (WP4-T1)", self.world.execution.kwargs[0]["plan_context"])
+        self.assertIn("RELEVANT CONTEXT (WP4-T1;",
+                      self.world.execution.kwargs[0]["plan_context"])
         plan_id = self.world.rows("SELECT plan_id FROM implementation_jobs")[0][0]
         self.assertTrue(plan_id.endswith("_r2"))
 

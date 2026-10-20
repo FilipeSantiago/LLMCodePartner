@@ -33,28 +33,25 @@ routing:
         - claude-opus
         - codex-sol-high
 
-# Per-role capability floors. Each role (coder, reviewer, planner) routes from
-# its own table; a model's `capability` is a role-independent strength rank.
+# Per-role capability floors. Coder and reviewer retain floors; planner tiers
+# may use any configured model. A model's `capability` is a strength rank.
 roles:
   coder:
     min_capability: 1
   reviewer:
     min_capability: 1
-  planner:
-    min_capability: 3
 
-# Work Package planner (codepartner-plan mode). Routed by WP complexity, which
-# is role-relative: a `low` planner still outranks every `simple` coder.
+# Work Package planner (codepartner-plan mode). Routed by WP complexity.
 planner:
   tiers:
     low:
-      - claude-sonnet
+      - claude-haiku
       - codex-sol-medium
     medium:
-      - claude-opus
-      - codex-sol-high
+      - claude-sonnet
+      - codex-sol-medium
     high:
-      - claude-opus
+      - claude-sonnet
       - codex-sol-high
     complex:
       - claude-opus
@@ -72,6 +69,14 @@ planner:
 # never replace the hard planner caps above.
 discovery:
   enabled: true
+  # kb_first: every role answers architecture and dependency questions through Codebase
+  # Memory first. Every role uses controlled IDE reads: the first read of a file
+  # obtains its KB outline, then only bounded source ranges are allowed. Missing
+  # KB entries require a file-scoped search before a bounded read. Coders and
+  # reviewers read plan files, changed files and code files the index lacks directly
+  # (KB to locate, files as truth). Native file access is unavailable in this mode. selective preserves native execution and
+  # makes KB use optional for coders and reviewers.
+  policy: kb_first
   mode: advise
   search_gate_max: 5
   small_file_bytes: 6000

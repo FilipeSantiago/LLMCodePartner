@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from agent.planning.knowledge_base import (CodebaseMemoryClient, KnowledgeBaseError,
                                            configured_execution_tools, planning_context,
-                                           refresh_accepted_wp)
+                                           catch_up_index, refresh_accepted_wp)
 from agent.routing.tool_metrics import read_only_handlers
 from agent.spec.command import SpecResult
 from agent.task_contracts.contractor import TaskContractor
@@ -138,7 +138,7 @@ class KnowledgeBaseTest(unittest.IsolatedAsyncioTestCase):
                                               "project_id": "target"},
                                              "openspec", "Build a scheduler", report)
         self.assertEqual(context, "")
-        self.assertEqual(progress, ["Codebase Memory unavailable; continuing with IntelliJ MCP"])
+        self.assertEqual(progress, ["Codebase Memory unavailable; continuing without it"])
 
     async def test_no_kb_configuration_emits_no_progress(self):
         progress = []
@@ -211,7 +211,7 @@ class KnowledgeBaseTest(unittest.IsolatedAsyncioTestCase):
             "Checking Codebase Memory project and index status",
             "Reading indexed architecture",
             "Searching indexed components and dependencies (1/1)",
-            "KB context ready; checking current code through IntelliJ MCP",
+            "KB context ready; checking the current code",
         ])
         self.assertIn("OpenSpec scope", high)
         self.assertIn("WP files", wp)
@@ -334,3 +334,70 @@ class KnowledgeBaseTest(unittest.IsolatedAsyncioTestCase):
                 IDE(), "/repo")
         self.assertIn("accepted review remains valid", message)
         self.assertEqual(store.result[2], "failed")
+
+    async def _catch_up(self, mutations, exit_text="CBM_EXIT_CODE=0"):
+        class Store:
+            since = None
+
+            async def recent_mutations(self, project_id, since):
+                self.project_id, self.since = project_id, since
+                return mutations
+
+        class IDE:
+            calls = []
+
+            async def list_tools(self):
+                return [SimpleNamespace(name="execute_terminal_command")]
+
+            async def call_tool(self, name, args):
+                self.calls.append((name, args))
+                return exit_text
+
+        async def metadata(_self, _project):
+            return ({"name": "target", "root_path": "/repo"},
+                    {"indexed_at": "2026-10-19T13:58:43Z"})
+
+        store, ide, progress = Store(), IDE(), []
+
+        async def note(line):
+            progress.append(line)
+
+        with patch.object(CodebaseMemoryClient, "project_metadata", metadata), \
+                patch.dict("os.environ", {"KB_ENABLED": "true", "KB_BINARY_PATH": "/bin/cbm",
+                                          "KB_DATA_PATH": "/cache"}):
+            message = await catch_up_index(store, "proj_1", {
+                "enabled": True, "provider": "codebase-memory", "project_id": "target"},
+                ide, "/repo", progress=note)
+        return message, store, ide, progress
+
+    async def test_catch_up_reindexes_when_edits_are_newer_than_index(self):
+        message, store, ide, progress = await self._catch_up(
+            [{"targets": ["trainer/contracts.py", "models/rnn/model.py"]},
+             {"targets": ["trainer/contracts.py"]}])
+        self.assertEqual(store.since, 1792418323.0)
+        self.assertEqual(len(ide.calls), 1)
+        self.assertIn("2 files changed", message)
+        self.assertEqual(progress, ["KB index is behind 2 changed files; refreshing"])
+
+    async def test_catch_up_is_a_noop_when_index_is_current(self):
+        message, _, ide, progress = await self._catch_up([])
+        self.assertIsNone(message)
+        self.assertEqual(ide.calls, [])
+        self.assertEqual(progress, [])
+
+    async def test_catch_up_failure_never_raises(self):
+        message, _, ide, _ = await self._catch_up(
+            [{"targets": ["trainer/contracts.py"]}], exit_text="CBM_EXIT_CODE=1")
+        self.assertIsNone(message)
+        self.assertEqual(len(ide.calls), 1)
+
+    def test_resumed_review_without_service_still_refreshes_kb(self):
+        session = SimpleNamespace(client=object(), project_path="/repo", knowledge_base={
+            "enabled": True, "provider": "codebase-memory", "project_id": "target"})
+        run = SimpleNamespace(metadata={"implementation_job_id": "job"})
+        with patch.object(dialog_controller, "_artifact_store", return_value=object()):
+            service = dialog_controller._resume_service(run, session, [])
+        self.assertIsNotNone(service.kb_refresh)
+        attached = object()
+        run.metadata["implementation_service"] = attached
+        self.assertIs(dialog_controller._resume_service(run, session, []), attached)

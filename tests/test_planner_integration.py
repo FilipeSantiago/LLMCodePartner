@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from agent.planning.knowledge_base import KB_READING_GUIDANCE
+from agent.planning.knowledge_base import KB_READING_GUIDANCE, KB_SELECTIVE_GUIDANCE
 from agent.planning.models import ApprovedWPPlan, WPPlanDraft
 from agent.planning.projection import project, validate_draft
 from agent.planning.prompts import SYSTEM
@@ -25,6 +25,16 @@ from mcp_bridge.models import DoneEvent, TextEvent
 from mcp_bridge.registry import ToolSpec
 from tests.test_routing import _Artifacts, task
 from tests.test_wp_planner import plan_payload
+from tests import ide_mode
+
+
+def setUpModule():
+    ide_mode.pin()
+
+
+def tearDownModule():
+    ide_mode.unpin()
+
 
 WP1_TASKS = ("WP1-T1", "WP1-T2")
 
@@ -114,6 +124,58 @@ class DiscoveryHandoffTests(unittest.TestCase):
         self.assertNotIn("EARLIER TASK RESULTS", coder_context(plan, "WP1-T1", events))
         self.assertNotIn("EARLIER TASK RESULTS", coder_context(plan, "WP1-T2"))
 
+    def test_coder_context_is_scoped_to_the_task(self):
+        payload = plan_payload(task_ids=WP1_TASKS)
+        payload["shared"].update({
+            "requirements": ["WP-wide requirement only the reviewer needs"],
+            "architecture": ["Loaders register through the registry"],
+            "constraints": ["Keep the trainer API stable"]})
+        payload["tasks"]["WP1-T2"].update({"depends_on": ["WP1-T1"],
+                                           "expected_tests": ["tests/test_t2.py"]})
+        draft = WPPlanDraft.from_dict(payload, "WP1", 1)
+        plan = project(draft, plan_id="plan_x_r1", session_id="x", change_id="CHG1",
+                       wp_fingerprint="f", wp_complexity="medium",
+                       planner_model="claude-sonnet")
+        events = [{"position": 0, "task_id": "WP1-T1", "kind": "changed_files",
+                   "summary": "src/registry.py"}]
+        context = coder_context(plan, "WP1-T2", events, "Do WP1-T2")
+        # Other tasks' findings, files and WP-wide requirements stay out.
+        self.assertNotIn("A registry already exists", context)
+        self.assertNotIn("src/wp1-t1.py", context)
+        self.assertNotIn("WP-wide requirement", context)
+        self.assertNotIn("WP SHARED CONTEXT", context)
+        # Findings for every task, architecture, constraints and dependencies stay in.
+        self.assertIn("The trainer API is public", context)
+        self.assertIn("Config loading is global", context)
+        self.assertIn("Loaders register through the registry", context)
+        self.assertIn("Keep the trainer API stable", context)
+        self.assertIn("src/legacy/", context)
+        self.assertIn("src/wp1-t2.py", context)
+        self.assertIn("WP1-T1 (dependency):", context)
+        self.assertIn("VALIDATION", context)
+        self.assertIn("tests/test_t2.py", context)
+        # The objective equal to the OpenSpec description is not repeated.
+        self.assertNotIn("Objective: Do WP1-T2", context)
+        self.assertIn("Objective: Do WP1-T2", coder_context(plan, "WP1-T2", events))
+
+    def test_execution_prompts_share_rules_and_handoff(self):
+        from agent.routing.task_execution import EXPLORATION_RULES
+        for native in (False, True):
+            prompt = TaskExecutionService._execution_messages(
+                task(), [], "", native=native)[0]["content"]
+            self.assertIn(EXPLORATION_RULES, prompt)
+            self.assertIn('"execution_dispute":null', prompt)
+            self.assertIn("Never read the whole repository", prompt)
+            self.assertIn("never limit necessary work", prompt)
+        contract = SimpleNamespace(revision=2, goal=task().description,
+                                   primary_files=("src/a.py",))
+        prompt = TaskExecutionService._execution_messages(
+            task(), [], "", contract)[0]["content"]
+        self.assertEqual(prompt.count(task().description),
+                         TaskExecutionService._execution_messages(
+                             task(), [], "")[0]["content"].count(task().description))
+        self.assertIn("TaskContract revision 2. Expected files: src/a.py", prompt)
+
     def test_missing_or_stale_discovery_remains_optional(self):
         legacy = WPPlanDraft.from_dict(plan_payload(task_ids=WP1_TASKS), "WP1", 1)
         self.assertEqual(legacy.discovery, [])
@@ -130,7 +192,13 @@ class DiscoveryHandoffTests(unittest.TestCase):
     def test_shared_guidance_reaches_planner_and_coder(self):
         self.assertIn(KB_READING_GUIDANCE, SYSTEM)
         self.assertIn("Before edits or review verdicts, inspect exact current IDE source", KB_READING_GUIDANCE)
+        # The default selective policy keeps KB-first guidance for planners only.
         prompt = TaskExecutionService._execution_messages(task(), [], "")[0]["content"]
+        self.assertIn(KB_SELECTIVE_GUIDANCE, prompt)
+        self.assertNotIn(KB_READING_GUIDANCE, prompt)
+        self.assertNotIn("KB search and outline seeds", prompt)
+        prompt = TaskExecutionService._execution_messages(
+            task(), [], "", kb_policy="kb_first")[0]["content"]
         self.assertIn(KB_READING_GUIDANCE, prompt)
         self.assertIn("KB search and outline seeds", prompt)
 
@@ -222,7 +290,9 @@ class ReviewerPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.verdict, "done")
         self.assertIn("Approved WP plan context", provider.prompt)
         self.assertIn("Objective: one factory", provider.prompt)
+        # The configured kb_first policy gives IDE-path reviewers the KB-first guidance.
         self.assertIn(KB_READING_GUIDANCE, provider.prompt)
+        self.assertNotIn(KB_SELECTIVE_GUIDANCE, provider.prompt)
         self.assertIn("not correctness evidence", provider.prompt)
 
     async def test_planner_only_file_is_not_eagerly_read_when_change_is_known(self):

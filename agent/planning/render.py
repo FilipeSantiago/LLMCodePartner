@@ -85,7 +85,8 @@ _PRIOR_LABELS = {"decisions": "Result", "changed_files": "Changed files",
                  "deviations": "Deviations from plan", "unresolved": "Unresolved"}
 
 
-def _prior_results(events: list[dict], task_id: str) -> list[str]:
+def _prior_results(events: list[dict], task_id: str,
+                   depends_on: list[str] | tuple[str, ...] = ()) -> list[str]:
     """Latest handoff facts per earlier task, so later coders build on them."""
     latest: dict[tuple[str, str], dict] = {}
     order: list[str] = []
@@ -98,7 +99,7 @@ def _prior_results(events: list[dict], task_id: str) -> list[str]:
         latest[(prior, event["kind"])] = event
     lines = []
     for prior in order:
-        lines.append(f"{prior}:")
+        lines.append(f"{prior}" + (" (dependency)" if prior in depends_on else "") + ":")
         lines += [f"- {_PRIOR_LABELS[kind]}: {latest[(prior, kind)]['summary']}"
                   for kind in _PRIOR_KINDS if (prior, kind) in latest]
     if not lines:
@@ -107,40 +108,59 @@ def _prior_results(events: list[dict], task_id: str) -> list[str]:
             "re-deriving them)", *lines]
 
 
+def _unique(*groups: list[str]) -> list[str]:
+    return list(dict.fromkeys(item for group in groups for item in group))
+
+
+def _task_findings(plan: ApprovedWPPlan, task: TaskContext | None,
+                   task_id: str) -> list[PlannerFinding]:
+    """Shared and task findings that concern this task (unscoped ones apply to all)."""
+    seen: dict[str, PlannerFinding] = {}
+    for finding in [*plan.shared.findings, *(task.findings if task else [])]:
+        if finding.id not in seen and (not finding.task_ids or task_id in finding.task_ids):
+            seen[finding.id] = finding
+    return list(seen.values())
+
+
 def coder_context(plan: ApprovedWPPlan, task_id: str,
-                  prior_events: list[dict] | tuple[dict, ...] = ()) -> str:
-    """Approved WP context, earlier tasks' results, and this task's context."""
+                  prior_events: list[dict] | tuple[dict, ...] = (),
+                  description: str = "") -> str:
+    """Task-scoped execution context: only the parts of the approved WP plan that bear
+    on `task_id`, plus earlier tasks' results. Other tasks' requirements, files and
+    findings stay out of the prompt; the coder can still search for more."""
     shared = plan.shared
     task: TaskContext | None = plan.tasks.get(task_id)
+    files = (task.relevant_files if task and task.relevant_files else shared.relevant_files)
+    symbols = (task.symbols if task and task.symbols else shared.symbols)
     lines = ["BEGIN APPROVED WP PLAN CONTEXT",
-             f"WP SHARED CONTEXT ({plan.wp_id}, plan {plan.plan_id})",
-             f"Objective: {shared.objective}",
-             *_list("Requirements", shared.requirements),
+             f"RELEVANT CONTEXT ({task_id}; {plan.wp_id}, plan {plan.plan_id})",
+             f"Work package objective: {shared.objective}",
              *_list("Architecture", shared.architecture),
-             *_list("Relevant files", shared.relevant_files),
-             *_list("Symbols", shared.symbols),
-             *_list("Constraints", shared.constraints),
              *_list("Planning decisions", shared.decisions),
-             *_list("Validated assumptions", shared.validated_assumptions),
-             *_list("Do not modify", shared.do_not_modify),
-             *_list("WP test strategy", shared.test_strategy),
-             *_findings(shared.findings),
+             *_list("Existing implementation", task.existing_implementation if task else []),
+             *_list("Relevant files", files),
+             *_list("Symbols", symbols),
+             *_list("Depends on", task.depends_on if task else []),
+             *_findings(_task_findings(plan, task, task_id)),
              *_discovery([entry for entry in plan.discovery
                           if not entry.task_ids or task_id in entry.task_ids]),
-             *_prior_results(list(prior_events), task_id)]
+             *_prior_results(list(prior_events), task_id, task.depends_on if task else ())]
     if task is not None:
-        lines += ["", f"TASK CONTEXT ({task.task_id})",
-                  f"Objective: {task.objective}",
-                  f"Expected approach: {task.approach}",
-                  *_list("Requirements", task.requirements),
-                  *_list("Relevant files", task.relevant_files),
-                  *_list("Symbols", task.symbols),
-                  *_list("Existing implementation", task.existing_implementation),
-                  *_list("Depends on", task.depends_on),
-                  *_list("Constraints", task.constraints),
-                  *_list("Do not modify", task.do_not_modify),
-                  *_list("Expected tests / validation", task.expected_tests),
-                  *_findings(task.findings)]
+        objective = (task.objective if task.objective.strip() != description.strip() else "")
+        changes = [*([f"Objective: {objective}"] if objective else []),
+                   *([f"Expected approach: {task.approach}"] if task.approach else []),
+                   *_list("Requirements", task.requirements)]
+        if changes:
+            lines += ["", "REQUIRED CHANGES", *changes]
+    constraints = _unique(shared.constraints, task.constraints if task else [])
+    protected = _unique(shared.do_not_modify, task.do_not_modify if task else [])
+    if constraints or protected:
+        lines += ["", "CONSTRAINTS", *_list("Constraints", constraints),
+                  *_list("Do not modify", protected)]
+    validation = (task.expected_tests if task and task.expected_tests
+                  else shared.test_strategy)
+    if validation:
+        lines += ["", "VALIDATION", *_list("Expected tests / validation", validation)]
     lines.append("END APPROVED WP PLAN CONTEXT")
     return "\n".join(lines)
 

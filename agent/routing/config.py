@@ -18,6 +18,7 @@ class RoutingConfigError(ValueError):
 
 
 ROLES = ("coder", "reviewer", "planner")
+KB_POLICIES = ("selective", "kb_first")
 PLANNER_TIERS = ("low", "medium", "high", "complex")
 _EFFORTS = {"low", "medium", "high", "xhigh"}
 
@@ -49,6 +50,9 @@ class DiscoveryConfig:
     """Shared KB-first discovery settings; thresholds are advisory only."""
     # off: no advisories; observe: record only; advise: soft-threshold advisories.
     mode: str = "advise"
+    # selective: KB-first gates and advisories apply to planners only; coders and
+    # reviewers use KB tools on demand. kb_first: gates for every role (previous default).
+    policy: str = "selective"
     enabled: bool = True
     search_gate_max: int = 5
     # A whole read whose returned response is smaller than this counts as targeted (L2).
@@ -62,7 +66,14 @@ class DiscoveryConfig:
     role_modes: dict[str, str] = field(default_factory=dict)
     role_thresholds: dict[str, dict[str, dict[str, int]]] = field(default_factory=dict)
 
+    def gated(self, role: str) -> bool:
+        """Whether KB-first gates (search interception, outline gate, edit checks)
+        apply to this role."""
+        return self.policy == "kb_first" or role == "planner"
+
     def mode_for(self, role: str) -> str:
+        if not self.gated(role):
+            return "observe"
         return self.role_modes.get(role, self.mode)
 
     def thresholds_for(self, role: str, tier: str) -> dict[str, int]:
@@ -194,7 +205,7 @@ def load_routing_config(path: Path | str | None = None) -> RoutingConfig:
     role_floors = _role_floors(raw.get("roles"))
     _check_floor(models, "coder", role_floors, {name for names in tiers.values() for name in names})
     _check_floor(models, "reviewer", role_floors, set(reviewers.values()))
-    planner = _planner_config(raw.get("planner"), models, tiers, role_floors)
+    planner = _planner_config(raw.get("planner"), models, role_floors)
     discovery = _discovery_config(raw.get("discovery",
         (raw.get("planner") or {}).get("discovery")))
     if planner is not None and "discovery" in raw:
@@ -243,7 +254,7 @@ def _check_floor(models: dict[str, ModelRef], role: str, floors: dict[str, int],
                 f"{role} model {name!r} (capability {capability}) is below the {role} floor {floor}")
 
 
-def _planner_config(raw: object, models: dict[str, ModelRef], coder_tiers: dict[str, tuple[str, ...]],
+def _planner_config(raw: object, models: dict[str, ModelRef],
                     floors: dict[str, int]) -> PlannerConfig | None:
     if raw is None:
         return None
@@ -263,14 +274,6 @@ def _planner_config(raw: object, models: dict[str, ModelRef], coder_tiers: dict[
         tiers[complexity] = tuple(candidates)
     planner_models = {name for names in tiers.values() for name in names}
     _check_floor(models, "planner", floors, planner_models)
-    # Complexity is role-relative: even a low planner must out-rank every simple coder.
-    simple_coders = [models[name].capability for name in coder_tiers["simple"]]
-    low_planners = [models[name].capability for name in tiers["low"]]
-    if None in simple_coders or None in low_planners:
-        raise RoutingConfigError("planner low tier and coder simple tier models need capabilities")
-    if min(low_planners) <= max(simple_coders):
-        raise RoutingConfigError(
-            "planner low tier must be strictly more capable than every simple coder")
     efforts = raw.get("reasoning_effort") or {}
     if not isinstance(efforts, dict):
         raise RoutingConfigError("planner reasoning_effort must be a mapping")
@@ -350,5 +353,8 @@ def _discovery_config(raw: object) -> DiscoveryConfig:
             if not all(_positive(value) for value in limits.values()):
                 raise RoutingConfigError(f"discovery thresholds for {role}/{tier} must be positive")
         role_thresholds[role] = tiers
-    return DiscoveryConfig(mode, enabled, search_gate_max, small, gate_lines,
+    policy = raw.get("policy", default.policy)
+    if policy not in KB_POLICIES:
+        raise RoutingConfigError(f"discovery policy must be one of {KB_POLICIES}")
+    return DiscoveryConfig(mode, policy, enabled, search_gate_max, small, gate_lines,
                            thresholds, role_modes, role_thresholds)
