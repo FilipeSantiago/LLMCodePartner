@@ -1,0 +1,18 @@
+# Per-project bind mounts for native execution. Copy to compose.projects.yaml
+# (gitignored) or use scripts/register_project.py, and chain it in .env:
+#   COMPOSE_FILE=compose.yaml:compose.projects.yaml
+# Adding a mount requires recreating the container: docker compose up -d codepartner
+# Mount only project directories, never / or a home directory.
+services:
+  codepartner:
+    volumes:
+      - type: bind
+        source: /home/you/Documents/research/MusicGeneration
+        target: /workspace/music-generation
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /home/you/Documents/research/VolleyVision
+        target: /workspace/volley-vision
+        bind:
+          create_host_path: false

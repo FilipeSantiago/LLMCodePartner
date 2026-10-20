@@ -16,6 +16,11 @@ RUN npm install --global --prefix /opt/node-tools \
 
 FROM python:3.13-slim-bookworm
 
+# Match the host user that owns mounted projects (HOST_UID/HOST_GID in .env) so
+# native edits keep host ownership.
+ARG CODEPARTNER_UID=10001
+ARG CODEPARTNER_GID=10001
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_COMPILE_BYTECODE=1 \
@@ -40,9 +45,13 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 COPY . .
 
-RUN groupadd --gid 10001 codepartner \
-    && useradd --uid 10001 --gid codepartner --create-home codepartner \
-    && chown -R codepartner:codepartner /app /home/codepartner
+# Registered projects are bind-mounted under /workspace. git 2.39 accepts only exact
+# paths or "*" as safe.directory, and every repository in the container is such a mount.
+RUN groupadd --gid "${CODEPARTNER_GID}" codepartner \
+    && useradd --uid "${CODEPARTNER_UID}" --gid codepartner --create-home codepartner \
+    && mkdir -p /workspace \
+    && chown -R codepartner:codepartner /app /home/codepartner \
+    && git config --system --add safe.directory '*'
 
 USER codepartner
 

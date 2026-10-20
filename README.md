@@ -34,6 +34,23 @@ docker compose exec codepartner codex --version
 docker compose exec codepartner claude --version
 ```
 
+### Native filesystem execution (multiple projects)
+
+Registered projects are bind-mounted into the container under `/workspace`, and the
+filesystem is the main execution path: the WP planner, coders, reviewers and chat
+turns use Claude Code's and Codex's own file and shell tools in the project
+directory, and OpenSpec artifacts are read and written on disk. IDE MCP stays
+available for IDE-specific extras only (inspections, symbols, refactorings, run
+configurations). Unregistered projects fail by default; set
+`CODEPARTNER_EXECUTION_MODE=auto` or `ide` to keep the IDE path for them. Codex runs
+without its own sandbox, so the container is the only boundary and every mounted
+project is reachable. Register projects with
+`scripts/register_project.py`, chain `compose.projects.yaml` through `COMPOSE_FILE`,
+and check the binding with `/project`. Native edits are detected from a git
+baseline and journaled for review; there is no undo. See
+[docs/native-execution.md](docs/native-execution.md) for setup, modes, container
+limitations and the smoke test.
+
 ### Task model routing
 
 Start implementation with `/implement WP1` so its Work Package is planned and
@@ -191,7 +208,7 @@ with `/` keeps its normal one-shot meaning.
 | `codepartner-review` | Runs `/review` read-only. A message without a scope reuses the last scope named in the conversation. | `WP1: are tests missing?` |
 | `codepartner-implement` | Plans a named Work Package before implementation. | `WP1: add tests` |
 
-Replies to a pending implementation job (`yes`, `accept`, `undo`, …) are always
+Replies to a pending implementation job (`yes`, `accept`, `retry review`, …) are always
 handled first, whatever mode is selected. Spec-mode drafts use provisional IDs
 (`WP1`, `WP1-T1`); final IDs are assigned when `/apply` saves the change.
 
@@ -232,8 +249,8 @@ active task's description and task-level acceptance criteria, not on an MCP writ
 call. Work-package criteria are cumulative context for the package and cannot be
 used to require implementation or tests assigned to later sibling tasks. Legacy
 tasks without explicit task criteria use their description as the review criterion.
-The review service reads claimed project artifacts through the request-scoped
-IDE MCP and supplies a balanced, bounded source snapshot to the reviewer so
+The review service reads claimed project artifacts from the mounted project (through
+the request-scoped IDE MCP on the `ide` path) and supplies a balanced, bounded source snapshot to the reviewer so
 interfaces, factories, concrete implementations, and tests receive coverage.
 Task mutation-journal paths are authoritative review evidence. A basename in a
 coder report is reconciled to a unique journal path first; legacy or supplemental
@@ -245,11 +262,12 @@ Unreadable required deliverables keep the review pending; unreadable scratch,
 temporary, debug, or ad-hoc artifacts are disclosed as optional limitations
 unless the task objective or acceptance criteria explicitly require them.
 The reviewer
-may make further IDE MCP reads, but cannot use a shell or container filesystem
-to inspect the project. Its decision must identify the artifacts it assessed;
+may read further files with read-only tools (natively, or IDE MCP reads on the `ide`
+path). Its decision must identify the artifacts it assessed;
 an unverified review stays pending and cannot become a confirmation question.
-Codex reviewer runs disable the built-in shell and pre-approve only the private
-run's optimizer-approved IDE read/search tools.
+On the `ide` path, Codex reviewer runs disable the built-in shell and pre-approve
+only the private run's optimizer-approved IDE read/search tools; natively they are
+read-only sessions (see docs/native-execution.md).
 If Claude coded the task, Codex reviews it; if Codex coded it, Claude reviews
 it. When only one provider is usable, a fresh read-only review uses that
 provider. `/review` remains a separate manual read-only command, while `/spec`,
@@ -280,15 +298,12 @@ Every implementation receives an independent review. If the reviewer finds a
 blocking implementation issue, the coder revises and the reviewer checks the
 result again, for up to three automatic revision rounds. Review approval or an
 exhausted revision budget then uses one interaction: reply `accept` to keep the
-implementation, `undo` to restore task-owned changes and stop the job, or
-`submit to coder again: <additional prompt>` to keep the work and begin a fresh
-three-revision coder/reviewer cycle. Accepting unresolved findings is recorded as
-an audited user override. The older `try coder again`, `accept anyway`, and
-`undo code` forms remain aliases for in-flight chats. Coder mutations made
-through direct IDE tools are journaled with before-images and post-write hashes;
-undo refuses to overwrite files changed independently afterward. Older in-flight
-jobs without a journal use a conservative coder-assisted undo that is recorded as
-such and instructed to preserve unrelated changes.
+implementation, or `submit to coder again: <additional prompt>` to keep the work
+and begin a fresh three-revision coder/reviewer cycle. Accepting unresolved
+findings is recorded as an audited user override. The older `try coder again` and
+`accept anyway` forms remain aliases for in-flight chats. There is no undo: task
+changes stay in the project (use git to revert them). Every change is journaled
+with its path and post-write hash so the reviewer knows exactly what changed.
 
 Coder narration is labeled as an untrusted claim and cannot set workflow status.
 New summary, completion, evidence, verification, test-result, or ad-hoc runner
@@ -296,16 +311,10 @@ artifacts are blocked before creation unless the task explicitly declares them;
 existing required documentation remains editable. An incomplete review caused by
 unchanged CodePartner-owned evidence cannot be retried until that evidence changes.
 
-The journal is fail-closed: if a mutation target cannot be identified or its
-before-image cannot be captured, the IDE mutation is not executed. If a write is
-applied but its post-image cannot be verified, the task enters `recovery_required`
-and `retry review` is unavailable. Reply `inspect recovery` to see canonical
-targets and each mutation's lifecycle (`planned`, `snapshotted`, `applied`, or
-`postimage_verified`), `establish new baseline: <recovery prompt>` to audit
-acceptance of the current project state as a new undo baseline and start a fresh
-three-revision coder/reviewer cycle, or `stop and repair manually` to end the job
-without attempting an unsafe undo. Changes made before a new baseline cannot be
-undone automatically.
+If an IDE mutation's target cannot be identified, it is not executed. If a write
+is applied but its post-image cannot be verified (or a native run moved `HEAD`),
+the job continues and the reviewer is told which changes the journal could not
+verify.
 
 Review implemented work without granting write tools:
 

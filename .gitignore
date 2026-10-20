@@ -22,5 +22,9 @@ __pycache__/
 # Runtime data (local, in-memory workflow — not source)
 /data/*.json
 
+# Machine-specific native project registry and mounts (see the *.example files)
+/config/projects.yaml
+/compose.projects.yaml
+
 # Local compress-bridge install (npm ci in infra/compress-bridge)
 node_modules/

@@ -46,6 +46,8 @@ services:
         OPENSPEC_VERSION: "1.14.0"
         CODEX_VERSION: "0.160.0"
         CLAUDE_CODE_VERSION: "2.1.287"
+        CODEPARTNER_UID: ${HOST_UID:-10001}
+        CODEPARTNER_GID: ${HOST_GID:-10001}
     init: true
     env_file:
       - .env
@@ -64,6 +66,9 @@ services:
       - agentgateway:127.0.0.1
     volumes:
       - agent-home:/home/codepartner
+      # Live, read-only config: projects.yaml edits apply without a rebuild.
+      # Project bind mounts are added by compose.projects.yaml (docs/native-execution.md).
+      - ./config:/app/config:ro
     restart: unless-stopped
     depends_on:
       semantic-router:
