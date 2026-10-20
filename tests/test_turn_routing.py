@@ -34,6 +34,16 @@ from mcp_bridge.models import DoneEvent, Run, TextEvent
 from mcp_bridge.registry import ToolSpec
 from model.chat import ChatCompletionRequest, ChatMessage
 from providers.codex import CodexProvider
+from tests import temp_db
+
+
+def setUpModule():
+    temp_db.start()
+
+
+def tearDownModule():
+    temp_db.stop()
+
 
 PROJECT = "proj_a"
 

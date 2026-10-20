@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 
 from agent.routing.models import ExecutionContext, ModelRef
 from agent.spec.models import Task
+from agent.workspace import READ_ONLY_CAPABILITIES
 from mcp_bridge.models import Event
 from mcp_bridge.registry import ROLE_CODER
 from providers.codex import CodexProvider
@@ -29,8 +30,7 @@ class CodexCLIExecutor:
                 "gateway_used": context.use_gateway,
                 "attempt_started_at": context.started_at,
                 "required_operations": task.required_operations,
-                "read_only": task.preferred_capability.lower() in {
-                    "read", "research", "inspect", "inspection", "analysis", "review", "verification"},
+                "read_only": task.preferred_capability.lower() in READ_ONLY_CAPABILITIES,
                 "excluded_files": tuple(getattr(task, "excluded_files", ())),
                 **context.owner_metadata,
             },
@@ -39,6 +39,7 @@ class CodexCLIExecutor:
              reasoning_effort=model.reasoning_effort,
              direct_tool_handlers=context.direct_tool_handlers,
              kb_first=context.kb_first,
+             native=context.native,
              preapprove_ide_tools=bool(context.owner_metadata.get("implementation_job_id")),
         ):
             yield event

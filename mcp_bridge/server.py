@@ -12,7 +12,7 @@ import os
 from collections.abc import Awaitable, Callable
 
 from mcp_bridge import bridge
-from mcp_bridge.models import DoneEvent, ErrorEvent, Run
+from mcp_bridge.models import DoneEvent, ErrorEvent, MutationEvent, ProgressEvent, Run
 from mcp_bridge.registry import ToolRegistry, ToolSpec
 from logger.diagnostic import debug
 
@@ -35,6 +35,38 @@ def live_runs_for_job(job_id: str) -> list[Run]:
             and run.task is not None and not run.task.done()]
 
 
+async def _finish_native(run: Run) -> bool:
+    """Journal (or, for read-only runs, check) a native run's changes
+    once, after its CLI has exited. False when the run must be reported as failed."""
+    native, finish = run.native, getattr(run.native, "finish", None)
+    if finish is None:
+        return True
+    native.finish = None
+    try:
+        # Shielded: a second cancellation must not interrupt journaling or checking.
+        paths = await asyncio.shield(finish())
+    except asyncio.CancelledError:
+        log.error("native finish interrupted run_id=%s; its changes may be unjournaled",
+                  run.run_id)
+        raise
+    except Exception as exc:
+        from agent.workspace import NativeSessionError
+        if isinstance(exc, NativeSessionError):
+            log.error("native run failed run_id=%s: %s", run.run_id, exc)
+            await run.put(ErrorEvent(str(exc)))
+        else:
+            log.exception("native change journal failed run_id=%s", run.run_id)
+            await run.put(ErrorEvent(f"Native changes could not be journaled: {exc}"))
+        return False
+    for warning in native.warnings:
+        log.warning("native run warning run_id=%s: %s", run.run_id, warning)
+        await run.put(ProgressEvent(f"- ⚠️ {warning}\n"))
+    for path in paths:
+        run.mutating_tool_succeeded = True
+        await run.put(MutationEvent("native_cli", {"path": path}))
+    return True
+
+
 async def _run(run: Run, prompt: str, system: str | None,
                specs: list[ToolSpec], strategy: Strategy) -> None:
     terminal = "endTurn"
@@ -50,16 +82,33 @@ async def _run(run: Run, prompt: str, system: str | None,
             debug(log, "run.strategy_started", trace_id=run.metadata.get("trace_id"),
                   run_id=run.run_id, prompt=prompt, system=system,
                   registered_tools=[vars(spec) for spec in specs])
+        if run.native is not None and run.native.start is not None:
+            # No baseline, no native run: a failure here precedes any write.
+            await run.native.start()
         terminal = await strategy(run, prompt, system, specs)
     except asyncio.CancelledError:
+        await _finish_native(run)
         bridge.discard(run)
         raise
     except Exception as exc:  # surface provider/model failures into the stream
         log.exception("run strategy failed run_id=%s", run.run_id)
         await run.put(ErrorEvent(str(exc)))
     finally:
+        if not await _finish_native(run):
+            terminal = "failed"
         debug(log, "run.strategy_finished", trace_id=run.metadata.get("trace_id"),
               run_id=run.run_id, terminal=terminal)
+        if run.native is not None and run.metadata.get("implementation_job_id"):
+            try:
+                from telemetry.storage import TelemetryStorage
+                TelemetryStorage().record_aci_attempt(
+                    run.run_id, run.metadata,
+                    {"execution_mode": "native",
+                     **run.metadata.get("native_tool_metrics", {"tool_calls": 0}),
+                     **({"kb_first": run.kb_first.summary()} if run.kb_first else {})},
+                    run.usage)
+            except Exception:
+                log.exception("could not record native metrics run_id=%s", run.run_id)
         if run.tool_interface is not None:
             try:
                 from telemetry.storage import TelemetryStorage

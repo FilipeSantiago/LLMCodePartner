@@ -24,6 +24,8 @@ _REVIEW_COMMAND = re.compile(r"^\s*/review(?:\s+|$)", re.IGNORECASE)
 _REWORK_COMMAND = re.compile(r"^\s*/rework(?:\s+|$)", re.IGNORECASE)
 _RESET_COMMAND = re.compile(r"^\s*/reset(?:\s+|$)", re.IGNORECASE)
 _HELP_COMMAND = re.compile(r"^\s*/(?:help|man)(?:\s+|$)", re.IGNORECASE)
+_PROJECT_COMMAND = re.compile(
+    r"^\s*/project(?:\s+(list|use)(?:\s+([A-Za-z0-9_.-]+))?)?\s*$", re.IGNORECASE)
 _TASK_TARGET = re.compile(
     r"\b(?:WP|US)\s*(\d+)\s*-\s*T(?:ASK)?\s*(\d+)\b",
     re.IGNORECASE,
@@ -64,6 +66,11 @@ COMMANDS = (
                 "Clears its OpenSpec completion and review records, keeping cancelled tasks and project files."),
     CommandInfo("implement", "/implement WP1|WP1-T1 [more selectors][: <execution instruction>]", "Route and implement tasks sequentially.",
                 "Expands work packages into incomplete tasks, routes each task at start time, executes sequentially, and stops on failure. Put optional execution guidance after ':'."),
+    CommandInfo("project", "/project [list | use <id>]", "Show or bind the mounted project.",
+                "Shows which registered project (config/projects.yaml) this conversation "
+                "executes in natively, lists registered projects, or binds the conversation "
+                "to one. Unregistered or unmounted projects are rejected; they run through "
+                "the IDE."),
     CommandInfo("help", "/help", "List available commands.", "Use /man <command> for detailed syntax and behavior."),
     CommandInfo("man", "/man <command>", "Show command documentation.", "For example: /man implement or /man rework."),
 )
@@ -148,6 +155,22 @@ def extract_reset_wp_id(content: str) -> str:
     if match is None:
         raise SpecCommandError("/reset requires exactly one work package ID such as WP1")
     return f"WP{match.group(1)}"
+
+
+def is_project_command(content: str | None) -> bool:
+    return bool(content and re.match(r"^\s*/project(?:\s|$)", content, re.IGNORECASE))
+
+
+def extract_project_command(content: str) -> tuple[str, str | None]:
+    """`/project` -> ("show", None); `/project list`; `/project use <id>`."""
+    match = _PROJECT_COMMAND.match(content or "")
+    if not match:
+        raise SpecCommandError("usage: /project [list | use <id>]")
+    action = (match.group(1) or "show").lower()
+    project_id = match.group(2)
+    if (action == "use") != (project_id is not None):
+        raise SpecCommandError("usage: /project [list | use <id>]")
+    return action, project_id
 
 
 def is_help_command(content: str | None) -> bool:

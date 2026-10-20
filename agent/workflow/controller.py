@@ -73,7 +73,7 @@ PASSTHROUGH_ACTIONS = frozenset({A.CODING, A.EXECUTE_COMMAND,
 # project; proposing one while another job is active asks to switch instead.
 MUTATING_ACTIONS = frozenset({
     A.START_IMPLEMENTATION, A.APPROVE_WP_PLAN, A.CODING, A.RETRY_CONTRACT, A.EXPAND_CONTRACT_SCOPE,
-    A.RETRY_CODER_AFTER_REVIEW, A.ACCEPT_REVIEW, A.UNDO_IMPLEMENTATION,
+    A.RETRY_CODER_AFTER_REVIEW, A.ACCEPT_REVIEW,
     A.RESOLVE_CODER_RECOVERY, A.ANSWER_REVIEWER_QUESTION,
 })
 
@@ -282,7 +282,7 @@ class ConversationWorkflow:
                 conversation_id=conversation_id,
                 message_fingerprint=fingerprint(message), action=A.CODING,
                 expected_effects=(f"Ask the coding agent to: {_preview(message)}",
-                                  "Project files may be changed through the guarded IDE tools"),
+                                  "Project files may be changed"),
                 parameters={"command": "/__workflow_coding__ " + message.strip()},
                 confidence=classification["confidence"],
                 interpretation_source="model"))
@@ -811,8 +811,6 @@ class ConversationWorkflow:
         elif action == A.ACCEPT_REVIEW:
             events = service.accept_anyway(
                 job_id, position, messages, specs, instruction, handlers, guidance)
-        elif action == A.UNDO_IMPLEMENTATION:
-            events = service.undo_code(job_id, position, messages, specs, handlers)
         elif action == A.RETRY_REVIEW:
             events = service.retry_review(
                 job_id, position, messages, specs, instruction, handlers)
@@ -822,12 +820,7 @@ class ConversationWorkflow:
                 messages, specs, handlers, instruction)
         elif action == A.RESOLVE_CODER_RECOVERY:
             mode = intent.parameters.get("recovery_mode")
-            if mode == "inspect":
-                events = service.inspect_recovery(job_id, position)
-            elif mode == "establish_baseline":
-                events = service.establish_new_baseline(
-                    job_id, position, messages, specs, instruction, handlers, guidance)
-            elif mode == "review_handoff":
+            if mode == "review_handoff":
                 events = service.review_blocked_handoff(
                     job_id, position, messages, specs, instruction, handlers, guidance)
             else:

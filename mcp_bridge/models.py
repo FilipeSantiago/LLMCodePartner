@@ -97,6 +97,9 @@ class Run:
     tool_interface: Any | None = None
     # Optional per-run KB-first discovery policy. None preserves the original route.
     kb_first: Any | None = None
+    # Optional native filesystem execution (`agent.workspace.NativeRun`). None keeps
+    # every source operation on the IDE bridge.
+    native: Any | None = None
 
     async def put(self, event: Any) -> None:
         await self.queue.put(event)

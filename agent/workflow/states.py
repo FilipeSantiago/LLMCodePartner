@@ -12,6 +12,7 @@ class WorkflowState(StrEnum):
     CONTRACT_RESOLUTION = "awaiting_contract_resolution"
     REVIEW_RESOLUTION = "awaiting_review_resolution"
     CODER_RECOVERY = "awaiting_coder_recovery"
+    # Legacy rows only: journal recovery protected undo, which was removed.
     JOURNAL_RECOVERY = "recovery_required"
     HUMAN_CONFIRMATION = "awaiting_human_confirmation"
     EVIDENCE_RESOLUTION = "awaiting_evidence_resolution"
@@ -26,7 +27,6 @@ class WorkflowAction(StrEnum):
     RETRY_CODER_AFTER_REVIEW = "RETRY_CODER_AFTER_REVIEW"
     RETRY_REVIEW = "RETRY_REVIEW"
     ACCEPT_REVIEW = "ACCEPT_REVIEW"
-    UNDO_IMPLEMENTATION = "UNDO_IMPLEMENTATION"
     RESOLVE_CODER_RECOVERY = "RESOLVE_CODER_RECOVERY"
     ANSWER_REVIEWER_QUESTION = "ANSWER_REVIEWER_QUESTION"
     APPLY_SPEC = "APPLY_SPEC"
@@ -44,20 +44,18 @@ S = WorkflowState
 
 ACTIONS_BY_STATE: dict[WorkflowState, tuple[WorkflowAction, ...]] = {
     S.CONTRACT_RESOLUTION: (A.RETRY_CONTRACT, A.EXPAND_CONTRACT_SCOPE, A.STOP_JOB),
-    S.REVIEW_RESOLUTION: (A.RETRY_CODER_AFTER_REVIEW, A.ACCEPT_REVIEW,
-                          A.UNDO_IMPLEMENTATION, A.STOP_JOB),
-    S.CODER_RECOVERY: (A.RESOLVE_CODER_RECOVERY, A.UNDO_IMPLEMENTATION, A.STOP_JOB),
-    S.JOURNAL_RECOVERY: (A.RESOLVE_CODER_RECOVERY, A.STOP_JOB),
+    S.REVIEW_RESOLUTION: (A.RETRY_CODER_AFTER_REVIEW, A.ACCEPT_REVIEW, A.STOP_JOB),
+    S.CODER_RECOVERY: (A.RESOLVE_CODER_RECOVERY, A.STOP_JOB),
+    S.JOURNAL_RECOVERY: (A.STOP_JOB,),
     S.HUMAN_CONFIRMATION: (A.ANSWER_REVIEWER_QUESTION, A.RETRY_REVIEW, A.STOP_JOB),
     S.EVIDENCE_RESOLUTION: (A.RETRY_REVIEW, A.STOP_JOB),
     S.MANUAL_RESOLUTION: (A.STOP_JOB,),
 }
 
-# RESOLVE_CODER_RECOVERY covers two different recovery states. `review_handoff`
-# sends a blocked (complete but gap-reporting) coder handoff to the Reviewer.
+# RESOLVE_CODER_RECOVERY modes. `review_handoff` sends a blocked (complete but
+# gap-reporting) coder handoff to the Reviewer.
 RECOVERY_MODES: dict[WorkflowState, tuple[str, ...]] = {
     S.CODER_RECOVERY: ("retry_coder", "review_handoff"),
-    S.JOURNAL_RECOVERY: ("inspect", "establish_baseline"),
 }
 
 PAUSED_STATES = frozenset(state.value for state in ACTIONS_BY_STATE)
@@ -73,7 +71,6 @@ ACTION_DESCRIPTIONS: dict[WorkflowAction, str] = {
     A.RETRY_CODER_AFTER_REVIEW: "send the reviewed task back to the Coder with guidance",
     A.RETRY_REVIEW: "run the Reviewer again",
     A.ACCEPT_REVIEW: "accept the implementation (overriding a failed review if needed)",
-    A.UNDO_IMPLEMENTATION: "restore this task's changes and stop the job",
     A.RESOLVE_CODER_RECOVERY: "recover an interrupted or blocked Coder run",
     A.ANSWER_REVIEWER_QUESTION: "answer the Reviewer's question (yes completes the task)",
     A.APPLY_SPEC: "apply the active OpenSpec draft",
@@ -88,7 +85,7 @@ STATE_DESCRIPTIONS: dict[WorkflowState, str] = {
     S.CONTRACT_RESOLUTION: "stopped before review: the TaskContract was violated or exhausted",
     S.REVIEW_RESOLUTION: "the Reviewer finished and a decision is needed",
     S.CODER_RECOVERY: "the Coder was interrupted before finishing",
-    S.JOURNAL_RECOVERY: "the mutation journal is incomplete and needs recovery",
+    S.JOURNAL_RECOVERY: "stopped by a journal check that no longer exists; stop the job",
     S.HUMAN_CONFIRMATION: "the Reviewer asked a question",
     S.EVIDENCE_RESOLUTION: "the Reviewer could not obtain enough evidence",
     S.MANUAL_RESOLUTION: "paused for an unknown reason; manual resolution needed",

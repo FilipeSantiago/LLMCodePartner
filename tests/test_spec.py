@@ -773,8 +773,6 @@ class HandlerAndController(unittest.IsolatedAsyncioTestCase):
         cases = {
             "accept": ("accept", ""),
             "accept anyway: prototype": ("accept", "prototype"),
-            "undo": ("undo", ""),
-            "undo code": ("undo", ""),
             "submit to coder again: add coverage": ("submit_again", "add coverage"),
             "try coder again: preserve API": ("submit_again", "preserve API"),
         }
@@ -783,26 +781,8 @@ class HandlerAndController(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     dialog_controller._implementation_resolution(command), expected)
         self.assertIsNone(dialog_controller._implementation_resolution("accept this plan"))
-
-    def test_recovery_command_requires_an_explicit_nonempty_prompt(self):
-        self.assertEqual(
-            dialog_controller._implementation_recovery(
-                "establish new baseline: repair named originals and run tests"),
-            "repair named originals and run tests")
-        self.assertIsNone(
-            dialog_controller._implementation_recovery("establish new baseline:"))
-        self.assertIsNone(dialog_controller._implementation_recovery("retry review"))
-        self.assertEqual(
-            dialog_controller._implementation_recovery_action("inspect recovery"),
-            ("inspect_recovery", ""))
-        self.assertEqual(
-            dialog_controller._implementation_recovery_action(
-                "stop and repair manually"),
-            ("stop_recovery", ""))
-        self.assertEqual(
-            dialog_controller._implementation_recovery_action(
-                "establish new baseline: repair originals"),
-            ("establish_baseline", "repair originals"))
+        # Undo was removed: the old command is no longer an implementation action.
+        self.assertIsNone(dialog_controller._implementation_resolution("undo"))
 
     async def test_default_artifact_store_refuses_unbridged_target_project_access(self):
         store = OpenSpecArtifactStore()

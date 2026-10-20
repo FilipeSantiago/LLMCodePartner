@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from agent.routing.persistence import RoutingPersistence
+from agent.routing.rollback import journal_handlers
 from mcp_bridge import bridge
 from mcp_bridge.agent_tools import AgentToolInterface, _check_command, _command_result, _read_result
 from mcp_bridge.edit_validation import validate_postimages
@@ -277,6 +279,68 @@ class AgentToolInterfaceTests(unittest.IsolatedAsyncioTestCase):
             {"path": "src/app.py", "start_line": 1, "end_line": 10})
         self.assertIn("lines 1–10 of 437", result)
         self.assertEqual(self.interface.metrics["backend_calls"], 1)
+
+    async def test_large_existing_file_rewrite_requires_identical_repeat(self):
+        self.run.registry.register([_spec("create_new_file", {
+            "pathInProject": {}, "text": {}, "overwrite": {}})])
+        args = {"pathInProject": "src/large.py", "text": "replacement", "overwrite": True}
+        async def backend(name, arguments):
+            self.calls.append((name, arguments))
+            if name == "read_file":
+                return "\n".join(f"L{i}: line {i}" for i in range(1, 62))
+            return "Done!"
+        first = await self.interface.execute("create_new_file", args, backend)
+        self.assertIn("EDIT NOT APPLIED", first)
+        self.assertIn("61 lines", first)
+        self.assertNotIn("create_new_file", [name for name, _ in self.calls])
+        second = await self.interface.execute("create_new_file", args, backend)
+        self.assertIn("EDIT APPLIED", second)
+        self.assertIn("create_new_file", [name for name, _ in self.calls])
+        self.assertEqual(self.interface.metrics["rewrite_blocked"], 1)
+        self.assertEqual(self.interface.metrics["rewrite_overridden"], 1)
+
+    async def test_small_and_new_files_can_be_created(self):
+        self.run.registry.register([_spec("create_new_file_with_text", {
+            "pathInProject": {}, "text": {}, "overwrite": {}})])
+        async def backend(name, arguments):
+            self.calls.append((name, arguments))
+            if name == "read_file":
+                if arguments["file_path"] == "src/new.py":
+                    return "File src/new.py doesn't exist or can't be opened"
+                return "\n".join(f"L{i}: line {i}" for i in range(1, 61))
+            return "Done!"
+        for path in ("src/small.py", "src/new.py"):
+            result = await self.interface.execute("create_new_file_with_text", {
+                "pathInProject": path, "text": "replacement", "overwrite": True}, backend)
+            self.assertIn("EDIT APPLIED", result)
+        self.assertEqual(self.interface.metrics["rewrite_blocked"], 0)
+
+    async def test_override_still_records_journaled_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
+            specs = [
+                _spec("read_file", {"file_path": {}, "offset": {}, "limit": {}}),
+                _spec("create_new_file", {"pathInProject": {}, "text": {}, "overwrite": {}}),
+            ]
+            run = Run()
+            run.registry.register(specs)
+            content = "\n".join(f"L{i}: # line {i}" for i in range(1, 62))
+            async def read(_arguments):
+                return content
+            async def create(_arguments):
+                return "Done!"
+            run.direct_tool_handlers = journal_handlers(
+                persistence, "job", 0, specs,
+                {"read_file": read, "create_new_file": create})
+            run.tool_interface = AgentToolInterface(run)
+            args = {"pathInProject": "src/large.py", "text": "x = 1", "overwrite": True}
+            self.assertIn("EDIT NOT APPLIED", await bridge.call_tool(
+                run, "create_new_file", args))
+            self.assertIn("EDIT APPLIED", await bridge.call_tool(
+                run, "create_new_file", args))
+            mutations = await persistence.mutations("job", 0)
+            self.assertEqual(len(mutations), 1)
+            self.assertEqual(mutations[0]["operation"], "create")
 
     async def test_fallback_edit_validates_complete_postimage(self):
         async def backend(name, _arguments):

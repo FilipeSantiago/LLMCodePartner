@@ -28,7 +28,8 @@ from collections.abc import AsyncIterator
 from mcp_bridge import mcp_http
 from mcp_bridge import server as engine
 from mcp_bridge.models import ErrorEvent, Event, Run, TextEvent
-from mcp_bridge.registry import ROLE_CODER, ToolSpec, allowed_for
+from mcp_bridge.registry import ROLE_CODER, ToolSpec, allowed_for, native_bridged_specs
+from providers import compaction
 from providers.base import Provider
 
 log = logging.getLogger("codepartner.providers.codex")
@@ -43,6 +44,10 @@ _TIER_ENV = {
     "sonnet": "CODEX_MODEL_MEDIUM",
     "opus": "CODEX_MODEL_COMPLEX",
 }
+
+
+# `codex exec --json` item types that mark a native context compaction.
+COMPACTION_ITEMS = frozenset({"context_compaction", "contextCompaction"})
 
 
 def parse_event(obj: dict) -> Event | None:
@@ -72,6 +77,27 @@ def usage_of(obj: dict) -> dict | None:
         usage = obj.get("usage")
         return usage if isinstance(usage, dict) else None
     return None
+
+
+def record_native_item(run: Run, item: dict) -> None:
+    """Count a completed native codex item (shell command, file change, MCP call)."""
+    kind = item.get("type")
+    names = {"command_execution": "shell", "file_change": "file_change",
+             "mcp_tool_call": str(item.get("tool") or "mcp")}
+    if kind not in names:
+        return
+    metrics = run.metadata.setdefault("native_tool_metrics", run.native.metrics if run.native
+                                      else {"tool_calls": 0, "tools": {}, "files": []})
+    metrics["tool_calls"] += 1
+    metrics["tools"][names[kind]] = metrics["tools"].get(names[kind], 0) + 1
+    if kind == "mcp_tool_call" and names[kind].startswith("kb_"):
+        metrics["kb_calls"] = metrics.get("kb_calls", 0) + 1
+    for change in item.get("changes") or ():
+        path = change.get("path") if isinstance(change, dict) else None
+        if isinstance(path, str) and path not in metrics["files"]:
+            metrics["files"].append(path)
+        if run.native is not None:
+            run.native.record_write(path)
 
 
 def model_for(model: str | None) -> str | None:
@@ -110,7 +136,7 @@ class CodexProvider(Provider):
                      direct_tool_handlers: dict | None = None,
                      reviewer_mode: bool = False,
                      preapprove_ide_tools: bool = False,
-                     kb_first=None,
+                     kb_first=None, native=None,
                     **kwargs) -> AsyncIterator[Event]:
         """Stateful like Claude's, and for the same reason: the `codex` process stays
         alive across HTTP requests, blocked inside its MCP tool call, while JetBrains
@@ -134,12 +160,15 @@ class CodexProvider(Provider):
                                                 concrete_model, reasoning_effort, reviewer_mode,
                                                 preapprove_ide_tools)
 
+            if native is not None:
+                specs = native_bridged_specs(specs)
             run = engine.start_run(prompt, system, specs, strategy=strategy,
                                    allowed=allowed_for(role),
                                    direct_tool_handlers=direct_tool_handlers,
-                                   agent_tool_interface=role == ROLE_CODER)
+                                   agent_tool_interface=role == ROLE_CODER and native is None)
             run.metadata.update(run_metadata or {})
             run.kb_first = kb_first
+            run.native = native
 
         async for event in self._drain_queue(run):
             yield event
@@ -156,14 +185,29 @@ class CodexProvider(Provider):
         against them, and push its output onto the Run as neutral events. Returns the
         terminal reason. The MCP endpoint is opened and closed with the process, so a
         finished (or cancelled) run leaves nothing callable behind."""
+        native = run.native
+        if native is not None:
+            native.agent_can_write = True  # its shell can write even in a read-only run
         async with mcp_http.serve_run(run) as url:
             args = self._base_args(model, gateway_url, concrete_model, reasoning_effort,
-                                   reviewer_mode) + self._mcp_args(
+                                   reviewer_mode, native) + self._mcp_args(
                                        url, run.registry.names(), reviewer_mode,
                                        preapprove_ide_tools)
+            run.metadata["context_compaction"] = compaction.requested(
+                "codex model_auto_compact_token_limit")
             item_types: Counter[str] = Counter()
             reviewer_tool_activity: list[dict[str, str | bool]] = []
-            async for obj in self._exec(args, self._join(prompt, system)):
+            async for obj in self._exec(args, self._join(prompt, system),
+                                        env=native.env if native is not None else None,
+                                        report_exit=native is not None):
+                if native is not None and obj.get("type") == "item.completed":
+                    item = obj.get("item") or {}
+                    record_native_item(run, item)
+                    if item.get("type") == "command_execution":
+                        code = item.get("exit_code")
+                        await native.command_finished(
+                            item.get("command"), item.get("aggregated_output"),
+                            code if isinstance(code, int) else None)
                 if reviewer_mode and obj.get("type") in {"item.started", "item.completed"}:
                     item = obj.get("item") or {}
                     if isinstance(item, dict):
@@ -176,6 +220,11 @@ class CodexProvider(Provider):
                                 "status": str(item.get("status") or "unknown"),
                                 "has_error": bool(item.get("error")),
                             })
+                if (obj.get("type") == "item.completed"
+                        and (obj.get("item") or {}).get("type") in COMPACTION_ITEMS):
+                    run.metadata.setdefault("compactions", []).append(
+                        {"trigger": "auto", "item": (obj.get("item") or {}).get("type")})
+                    log.info("codex native compaction recorded")
                 event = parse_event(obj)
                 if event is not None:
                     await run.put(event)
@@ -209,12 +258,14 @@ class CodexProvider(Provider):
     def _base_args(self, model: str | None = None, gateway_url: str | None = None,
                     concrete_model: bool = False,
                     reasoning_effort: str | None = None,
-                    reviewer_mode: bool = False) -> list[str]:
-        """`codex exec` flags shared by both surfaces. `read-only` is the locked tool
-        surface: codex may reason, but every write has to go through the IDE tools."""
+                    reviewer_mode: bool = False, native=None) -> list[str]:
+        """`codex exec` flags shared by both surfaces. Without `native`, `read-only`
+        with no shell is the locked tool surface: codex may reason, but every read and
+        write goes through the IDE tools. With `native`, codex works in the registered
+        workspace with its shell and without its own sandbox."""
         args = [BIN, "exec", "--json", "--skip-git-repo-check", "--ephemeral",
                 "-c", "tools.web_search=false"]
-        cwd = os.getenv("CODEX_CWD")
+        cwd = native.workspace if native is not None else os.getenv("CODEX_CWD")
         if cwd:
             args += ["--cd", cwd]
         resolved = model if concrete_model else model_for(model)
@@ -233,11 +284,20 @@ class CodexProvider(Provider):
                 # persistent config mutation is required for this attempt.
                 "-c", "model_providers.agentgateway.requires_openai_auth=true",
             ]
+        # Native auto-compaction threshold; `CODEX_ARGS` below can still override it.
+        args += compaction.codex_args()
         # Escape hatch for CLI-level choices we don't model (`--oss`, `--profile`,
         # extra `-c` overrides).
         args += shlex.split(os.getenv("CODEX_ARGS", ""))
         # The sandbox goes LAST on purpose: a repeated flag wins on the right, so no
         # escape-hatch value can loosen it.
+        if native is not None:
+            # Codex's bubblewrap sandbox cannot start in this container, so native runs
+            # skip it. The container and its mounts are the only boundary, and every
+            # mounted project is reachable; read-only runs are restored afterwards,
+            # not prevented from writing (docs/native-execution.md).
+            return args + ["--ignore-user-config",
+                           "--dangerously-bypass-approvals-and-sandbox"]
         # Every agent read must pass through the request-scoped MCP boundary.
         # A read-only Codex shell could still open .env or an out-of-project file.
         args += ["--ignore-user-config", "-c", "features.shell_tool=false"]
@@ -247,7 +307,8 @@ class CodexProvider(Provider):
         """`codex exec` takes no system prompt — prepend it to the instructions."""
         return f"{system}\n\n{prompt}" if system else prompt
 
-    async def _exec(self, args: list[str], prompt: str) -> AsyncIterator[dict]:
+    async def _exec(self, args: list[str], prompt: str, env: dict[str, str] | None = None,
+                    report_exit: bool = False) -> AsyncIterator[dict]:
         """Run `codex exec`, feed the prompt on stdin, yield one dict per JSONL line.
 
         Unparseable lines are skipped rather than fatal: the CLI mixes the odd
@@ -259,6 +320,7 @@ class CodexProvider(Provider):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=8 * 1024 * 1024,  # agent messages can be far larger than the 64KiB default
+            env={**os.environ, **env} if env else None,
         )
         log.info("codex exec: %s", " ".join(args[1:]))
         # Drain stderr concurrently — an undrained pipe fills up and stalls the child.
@@ -287,6 +349,10 @@ class CodexProvider(Provider):
             if proc.returncode:
                 log.warning("codex exited rc=%s stderr=%s",
                             proc.returncode, " | ".join(errors[-10:]))
+                if report_exit:
+                    yield {"type": "error", "message": (
+                        f"codex exited with status {proc.returncode}: "
+                        + (" | ".join(errors[-3:]) or "no diagnostics"))}
         finally:
             if proc.returncode is None:
                 proc.kill()

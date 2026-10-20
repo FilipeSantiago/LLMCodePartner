@@ -157,7 +157,6 @@ ACTION_TITLES: dict[WorkflowAction, str] = {
     WorkflowAction.RETRY_CODER_AFTER_REVIEW: "Send {task} back to the Coder after review",
     WorkflowAction.RETRY_REVIEW: "Run the Reviewer again for {task}",
     WorkflowAction.ACCEPT_REVIEW: "Accept {task}",
-    WorkflowAction.UNDO_IMPLEMENTATION: "Undo {task}'s changes and stop the job",
     WorkflowAction.RESOLVE_CODER_RECOVERY: "Recover the interrupted Coder run for {task}",
     WorkflowAction.ANSWER_REVIEWER_QUESTION: "Answer the Reviewer's question for {task}",
     WorkflowAction.APPLY_SPEC: "Apply the active OpenSpec draft",

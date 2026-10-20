@@ -64,9 +64,9 @@ The code lives in `agent/workflow/`:
 | State | Meaning | Valid actions |
 |---|---|---|
 | `awaiting_contract_resolution` | Stopped before review: TaskContract violated or exhausted | `RETRY_CONTRACT`, `EXPAND_CONTRACT_SCOPE`, `STOP_JOB` |
-| `awaiting_review_resolution` | Reviewer finished; a decision is needed | `RETRY_CODER_AFTER_REVIEW`, `ACCEPT_REVIEW`, `UNDO_IMPLEMENTATION`, `STOP_JOB` |
-| `awaiting_coder_recovery` | Coder interrupted, or its handoff reported unresolved gaps | `RESOLVE_CODER_RECOVERY` (retry Coder; `review anyway` sends a blocked handoff to the Reviewer), `UNDO_IMPLEMENTATION`, `STOP_JOB` |
-| `recovery_required` | Mutation journal incomplete | `RESOLVE_CODER_RECOVERY` (inspect, establish baseline), `STOP_JOB` |
+| `awaiting_review_resolution` | Reviewer finished; a decision is needed | `RETRY_CODER_AFTER_REVIEW`, `ACCEPT_REVIEW`, `STOP_JOB` |
+| `awaiting_coder_recovery` | Coder interrupted, or its handoff reported unresolved gaps | `RESOLVE_CODER_RECOVERY` (retry Coder; `review anyway` sends a blocked handoff to the Reviewer), `STOP_JOB` |
+| `recovery_required` | Legacy only (journal recovery was removed with undo) | `STOP_JOB` |
 | `awaiting_human_confirmation` | Reviewer asked a question | `ANSWER_REVIEWER_QUESTION`, `RETRY_REVIEW`, `STOP_JOB` |
 | `awaiting_evidence_resolution` | Reviewer could not obtain enough evidence | `RETRY_REVIEW`, `STOP_JOB` |
 | `awaiting_manual_resolution` | Legacy pause that could not be classified | `STOP_JOB` |
@@ -136,8 +136,7 @@ unless the session is still active at the same revision. See `docs/wp-planner.md
 1. Recognized phrases are mapped deterministically, relative to the task's state.
    For example, `submit to coder again: <guidance>` means `RETRY_CONTRACT` in a
    contract pause and `RETRY_CODER_AFTER_REVIEW` after a review. Existing phrases
-   (`accept`, `undo`, `retry review`, `inspect recovery`,
-   `establish new baseline: …`, `stop job`, `yes`, `no: …`) keep working.
+   (`accept`, `retry review`, `stop job`, `yes`, `no: …`) keep working.
 2. Otherwise the cheap model (`IMPLEMENT_INTENT_MODEL`) receives only the current
    message, a bounded context block for the target task, the valid actions, and a
    strict JSON schema whose `action` enum contains only those actions. It does not
@@ -223,7 +222,7 @@ token reports that it was already confirmed and runs nothing.
 Only one mutating flow may be active per IDE project. The project id is a hash
 of the IDE project path from `ide_mcp.json`; jobs store it, so jobs started from
 other chats in the same project are visible. Read-only actions (reviews, spec
-explanations, `inspect recovery`) never displace anything.
+explanations) never displace anything.
 
 When a mutating proposal is created, the project's other unfinished jobs are
 attached to it:

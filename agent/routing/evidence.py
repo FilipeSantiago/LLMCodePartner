@@ -90,6 +90,31 @@ def is_reproducible_verification_call(arguments: dict) -> bool:
             and bool(_REPRODUCIBLE_CHECK.search(command)))
 
 
+def safe_agent_verification(command: object) -> bool:
+    """Only fixed test/check entrypoints may be run by a KB-controlled agent."""
+    if not isinstance(command, str) or not command.strip() or "\n" in command:
+        return False
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    if not words or any(word in {"|", "&", ";", "<", ">", "&&", "||"}
+                        or "$(" in word or "`" in word for word in words):
+        return False
+    if words[:2] == ["uv", "run"]:
+        words = words[2:]
+    if not words:
+        return False
+    executable = os.path.basename(words[0])
+    if executable.startswith("python") and len(words) >= 3 and words[1] == "-m":
+        return words[2] in {"pytest", "unittest", "compileall", "mypy"}
+    if executable in {"pytest", "py.test", "mypy"}:
+        return True
+    if executable == "ruff" and len(words) >= 2:
+        return words[1] == "check" and not any(word.startswith("--fix") for word in words)
+    return False
+
+
 def verification_succeeded(result: object) -> bool:
     if isinstance(result, dict):
         for key in ("exit_code", "exitCode", "returncode"):

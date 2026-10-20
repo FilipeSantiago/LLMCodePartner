@@ -57,7 +57,9 @@ async def call_tool(run: Run, name: str, arguments: dict) -> str:
     `asyncio.TimeoutError` if the client doesn't answer within `TOOL_TIMEOUT`.
     """
     async def dispatch(tool_name: str, tool_args: dict) -> str:
-        if run.tool_interface is None:
+        from agent.kb_first import _GENERATED
+        if (run.tool_interface is None or
+                _GENERATED.get() and tool_name.rsplit("__", 1)[-1].startswith("kb_")):
             return await _call_backend(run, tool_name, tool_args)
         result = await run.tool_interface.execute(
             tool_name, tool_args,
@@ -76,6 +78,10 @@ async def _call_backend(run: Run, name: str, arguments: dict) -> str:
         return "Error: this job is being stopped; no further tool calls are allowed."
     if run.tool_interface is not None:
         run.tool_interface.metrics["backend_calls"] += 1
+    if getattr(run.kb_first, "enforce_reads", False):
+        blocked = _controlled_tool_refusal(name, arguments)
+        if blocked:
+            return blocked
     # Every route, including direct standalone tools, goes through the per-run
     # catalog adapter.  A provider cannot bypass dispatcher/schema restrictions.
     try:
@@ -101,6 +107,32 @@ async def _call_backend(run: Run, name: str, arguments: dict) -> str:
     if run.tool_interface is not None:
         run.tool_interface.metrics["backend_output_bytes"] += len(result.encode())
     return result
+
+
+def _controlled_tool_refusal(name: str, arguments: dict) -> str | None:
+    """Keep source-bearing and shell transports behind the controlled read policy."""
+    from agent.routing.evidence import safe_agent_verification
+    bare = name.rsplit("__", 1)[-1]
+    inner = arguments
+    if bare == "execute_tool":
+        command = arguments.get("command")
+        try:
+            tokens = shlex.split(command) if isinstance(command, str) else []
+        except ValueError:
+            tokens = []
+        if not tokens:
+            return "Error: invalid controlled tool command"
+        bare = tokens[0]
+        inner = {key[2:]: value for key, value in zip(tokens[1::2], tokens[2::2])
+                 if key.startswith("--")}
+    if bare in {"get_git_diff_all", "open_commit", "read_notebook"}:
+        return ("Error: this tool can return unrestricted file content; use KB and "
+                "the bounded project file reader instead")
+    if bare == "execute_terminal_command":
+        if not safe_agent_verification(inner.get("command")):
+            return ("Error: arbitrary terminal commands are unavailable under "
+                    "KB-enforced reading; only bounded test/check commands are allowed")
+    return None
 
 
 async def _call_direct(run: Run, handler, name: str, arguments: dict,

@@ -716,7 +716,7 @@ class ScopeDriftTests(unittest.IsolatedAsyncioTestCase):
             await service.contract_persistence.save(job.job_id, 0, contract)
             for path in ("agent/router.py", "agent/helpers.py"):
                 await persistence.record_rollback_file(
-                    job.job_id, 0, path, True, "old", expected_hash="hash")
+                    job.job_id, 0, path, True, expected_hash="hash")
             rows = await persistence.implementation_job_tasks(job.job_id)
 
             drift = await service._scope_drift(job.job_id, rows, _specs(), {})

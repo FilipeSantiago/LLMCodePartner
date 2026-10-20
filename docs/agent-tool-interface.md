@@ -76,6 +76,6 @@ shape for a measured baseline while retaining the guard. Use identical tasks,
 models, IDE projects, and starting revisions for baseline and compact runs.
 Check completion and Reviewer verdicts alongside tokens and cost. The current
 Claude SDK and Codex CLI own their internal conversational histories; the bridge
-can limit new observations but cannot replace older model messages. There is no
-claim of active-history compaction until the provider runtimes expose a supported
-history hook and measurements show a reduction in actual model context.
+can limit new observations but cannot replace older model messages. Older history is
+compacted only by the CLIs' own automatic compaction, which CodePartner configures but
+does not implement (docs/native-execution.md, "Context compaction").

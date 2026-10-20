@@ -61,11 +61,7 @@ _PHRASES: tuple[tuple[re.Pattern, Callable[[re.Match], _Phrase]], ...] = tuple(
          lambda m: _Phrase("review_handoff", _group(m, "g"))),
         (r"accept(?: anyway)?(?:\s*:\s*(?P<g>.+))?",
          lambda m: _Phrase("accept", _group(m, "g"))),
-        (r"undo(?: code)?", lambda m: _Phrase("undo")),
         (r"/?retry[- ]review", lambda m: _Phrase("retry_review")),
-        (r"inspect recovery", lambda m: _Phrase("inspect")),
-        (r"establish new baseline\s*:\s*(?P<g>.+)",
-         lambda m: _Phrase("baseline", _group(m, "g"))),
         (r"stop(?: the)?(?: job)?|stop and repair manually|cancel (?:the )?job",
          lambda m: _Phrase("stop")),
         (r"yes|y|approve", lambda m: _Phrase("yes")),
@@ -97,10 +93,7 @@ def _phrase_action(phrase: _Phrase, state: str) -> tuple[A, dict] | None:
         "retry_contract": (A.RETRY_CONTRACT, {}),
         "expand": (A.EXPAND_CONTRACT_SCOPE, {"scope_paths": list(phrase.paths)}),
         "accept": (A.ACCEPT_REVIEW, {}),
-        "undo": (A.UNDO_IMPLEMENTATION, {}),
         "retry_review": (A.RETRY_REVIEW, {}),
-        "inspect": (A.RESOLVE_CODER_RECOVERY, {"recovery_mode": "inspect"}),
-        "baseline": (A.RESOLVE_CODER_RECOVERY, {"recovery_mode": "establish_baseline"}),
         "review_handoff": (A.RESOLVE_CODER_RECOVERY, {"recovery_mode": "review_handoff"}),
         "stop": (A.STOP_JOB, {}),
         "yes": (A.ANSWER_REVIEWER_QUESTION, {"approved": True}),
@@ -117,7 +110,6 @@ _HINTS = {
     A.EXPAND_CONTRACT_SCOPE: "`expand scope: <paths>`",
     A.RETRY_CODER_AFTER_REVIEW: "`submit to coder again: <guidance>`",
     A.ACCEPT_REVIEW: "`accept` or `accept anyway: <reason>`",
-    A.UNDO_IMPLEMENTATION: "`undo`",
     A.RETRY_REVIEW: "`retry review`",
     A.ANSWER_REVIEWER_QUESTION: "`yes` or `no: <feedback>`",
     A.STOP_JOB: "`stop job`",
@@ -127,9 +119,7 @@ _HINTS = {
 def _hint(action: A, state: str) -> str:
     if action == A.RESOLVE_CODER_RECOVERY:
         return {S.CODER_RECOVERY.value:
-                    "`try coder again[: <guidance>]` or `review anyway`",
-                S.JOURNAL_RECOVERY.value:
-                    "`inspect recovery` or `establish new baseline: <guidance>`"}.get(state, "")
+                    "`try coder again[: <guidance>]` or `review anyway`"}.get(state, "")
     return _HINTS.get(action, "")
 
 
@@ -181,16 +171,8 @@ def expected_effects(intent: WorkflowIntent, task: PausedTask | None) -> tuple[s
         return (f"Mark {name} complete" + (" as a user override" if override else ""),
                 *((f"Reason: {intent.guidance}",) if intent.guidance else ()),
                 "Continue with the job's next task")
-    if action == A.UNDO_IMPLEMENTATION:
-        return (f"Restore the files {name} changed", "Stop the job")
     if action == A.RESOLVE_CODER_RECOVERY:
         mode = intent.parameters.get("recovery_mode")
-        if mode == "inspect":
-            return ("Show the mutation journal and integrity issues", "Nothing is changed")
-        if mode == "establish_baseline":
-            return ("Accept the current files as the new undo baseline",
-                    "Prior uncertain mutations can no longer be undone automatically",
-                    *guidance, *resume)
         if mode == "review_handoff":
             return (f"Send {name}'s coder report to the Reviewer despite its reported gaps",
                     "The Reviewer judges the acceptance criteria",
@@ -207,7 +189,7 @@ def expected_effects(intent: WorkflowIntent, task: PausedTask | None) -> tuple[s
                 "Do not discard a path claim solely because the user asked to ignore it",
                 "No Coder run or file change is proposed")
     if action == A.STOP_JOB:
-        return (f"Stop the job at {name}", "Nothing is undone; files stay for inspection")
+        return (f"Stop the job at {name}", "Files stay as they are for inspection")
     return ()
 
 
@@ -398,8 +380,6 @@ class WorkflowInterpreter:
         elif intent.action in GUIDANCE_REQUIRED and not intent.guidance:
             problem = (f"Say what should change, for example "
                        f"{_hint(intent.action, task.state)}.")
-        elif mode == "establish_baseline" and not intent.guidance:
-            problem = "Establishing a new baseline needs recovery guidance."
         elif (intent.action == A.EXPAND_CONTRACT_SCOPE
               and not intent.parameters.get("scope_paths")):
             problem = "Name the files to add, for example `expand scope: <paths>`."

@@ -109,7 +109,7 @@ call is measured in telemetry. A violation records an escalation and retains
 journaled changes for inspection.
 
 Writing outside the expected files is allowed and audited. Every write is already
-journaled with a before-image, so it can be undone. Before review, CodePartner
+journaled (path and post-write hash). Before review, CodePartner
 compares each task's journaled changes with its latest contract and adds a
 CodePartner scope audit to the Reviewer's context. The Reviewer judges whether each
 file was needed for the active acceptance criteria; unrelated or unjustified

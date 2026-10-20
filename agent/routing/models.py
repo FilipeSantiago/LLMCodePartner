@@ -59,6 +59,8 @@ class ExecutionContext:
     # Owner identity (implementation job/position) stamped on the run at creation.
     owner_metadata: dict[str, Any] = field(default_factory=dict)
     kb_first: Any | None = None
+    # `agent.workspace.NativeRun` when this attempt runs natively in a registered project.
+    native: Any | None = None
 
 
 @dataclass(frozen=True)

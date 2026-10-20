@@ -255,6 +255,11 @@ class RoutingPersistence:
                   queued_wp_ids_json TEXT NOT NULL DEFAULT '[]'""")
             if "request" not in planning_columns:
                 db.execute("ALTER TABLE wp_planning_sessions ADD COLUMN request TEXT")
+            rollback_columns = {row[1] for row in db.execute(
+                "PRAGMA table_info(implementation_rollback_files)")}
+            if "native_json" not in rollback_columns:
+                # Git-baseline preimages of native (non-IDE) execution.
+                db.execute("ALTER TABLE implementation_rollback_files ADD COLUMN native_json TEXT")
             task_columns = {row[1] for row in db.execute("PRAGMA table_info(implementation_job_tasks)")}
             if "coder_report" not in task_columns:
                 db.execute("ALTER TABLE implementation_job_tasks ADD COLUMN coder_report TEXT")
@@ -674,8 +679,7 @@ class RoutingPersistence:
         return await asyncio.to_thread(self._claim_resolution, job_id, position, action)
 
     def _claim_resolution(self, job_id, position, action):
-        target = ("accepting_override" if action == "accept_override" else
-                  "accepting" if action == "accept" else "undoing")
+        target = {"accept_override": "accepting_override", "accept": "accepting"}[action]
         with self._database() as db:
             result = db.execute("""UPDATE implementation_job_tasks SET status=?, error=NULL
               WHERE job_id=? AND position=?
@@ -846,28 +850,26 @@ class RoutingPersistence:
 
     def _rollback_file(self, job_id, position, path):
         with self._database() as db:
-            row = db.execute("""SELECT before_exists, before_content, expected_hash
+            row = db.execute("""SELECT before_exists, expected_hash
               FROM implementation_rollback_files
               WHERE job_id=? AND position=? AND path=?""",
                              (job_id, position, path)).fetchone()
-        return ({"path": path, "before_exists": bool(row[0]),
-                 "before_content": row[1], "expected_hash": row[2]}
+        return ({"path": path, "before_exists": bool(row[0]), "expected_hash": row[1]}
                 if row else None)
 
     async def record_rollback_file(self, job_id: str, position: int, path: str,
-                                   before_exists: bool, before_content: str | None,
+                                   before_exists: bool,
                                    expected_hash: str | None = None) -> None:
+        """Journal that a task touched `path` (no preimage is stored)."""
         await asyncio.to_thread(self._record_rollback_file, job_id, position, path,
-                                before_exists, before_content, expected_hash)
+                                before_exists, expected_hash)
 
-    def _record_rollback_file(self, job_id, position, path, before_exists,
-                              before_content, expected_hash):
+    def _record_rollback_file(self, job_id, position, path, before_exists, expected_hash):
         with self._database() as db:
             db.execute("""INSERT OR IGNORE INTO implementation_rollback_files
-              (job_id, position, path, before_exists, before_content, expected_hash)
-              VALUES (?, ?, ?, ?, ?, ?)""", (
-                job_id, position, path, int(before_exists), before_content, expected_hash,
-            ))
+              (job_id, position, path, before_exists, expected_hash)
+              VALUES (?, ?, ?, ?, ?)""", (
+                job_id, position, path, int(before_exists), expected_hash))
 
     async def update_rollback_hash(self, job_id: str, position: int, path: str,
                                    expected_hash: str | None) -> None:
@@ -885,11 +887,10 @@ class RoutingPersistence:
 
     def _rollback_files(self, job_id, position):
         with self._database() as db:
-            rows = db.execute("""SELECT path, before_exists, before_content, expected_hash
+            rows = db.execute("""SELECT path, before_exists, expected_hash
               FROM implementation_rollback_files WHERE job_id=? AND position=?
               ORDER BY rowid DESC""", (job_id, position)).fetchall()
-        return [{"path": row[0], "before_exists": bool(row[1]),
-                 "before_content": row[2], "expected_hash": row[3]}
+        return [{"path": row[0], "before_exists": bool(row[1]), "expected_hash": row[2]}
                 for row in rows]
 
     async def rollback_integrity_issues(self, job_id: str, position: int) -> list[dict]:
@@ -904,71 +905,10 @@ class RoutingPersistence:
             rows = db.execute(f"""SELECT action, details_json
               FROM implementation_resolution_actions
               WHERE job_id=? AND position=? AND action IN ({placeholders})
-                AND id > COALESCE((SELECT MAX(id) FROM implementation_resolution_actions
-                  WHERE job_id=? AND position=?
-                    AND action='recovery_baseline_established'), 0)
-              ORDER BY id""", (job_id, position, *actions, job_id, position)).fetchall()
+              ORDER BY id""", (job_id, position, *actions)).fetchall()
         return [{"action": action,
                  **(json.loads(details) if details else {})}
                 for action, details in rows]
-
-    async def establish_recovery_baseline(self, job_id: str, position: int,
-                                          budget: int, guidance: str) -> bool:
-        return await asyncio.to_thread(
-            self._establish_recovery_baseline, job_id, position, budget, guidance)
-
-    def _establish_recovery_baseline(self, job_id, position, budget, guidance):
-        now = time.time()
-        with self._database() as db:
-            row = db.execute("""SELECT task_id FROM implementation_job_tasks
-              WHERE job_id=? AND position=? AND status='recovery_required'""",
-                             (job_id, position)).fetchone()
-            if row is None:
-                return False
-            db.execute("""INSERT INTO implementation_resolution_actions
-              (job_id, position, action, details_json, created_at)
-              VALUES (?, ?, 'recovery_baseline_established', ?, ?)""", (
-                job_id, position, json.dumps({
-                    "guidance": guidance,
-                    "warning": "The prior uncertain mutations were accepted as the new undo baseline.",
-                }), now,
-            ))
-            db.execute("""DELETE FROM implementation_rollback_files
-              WHERE job_id=? AND position=?""", (job_id, position))
-            db.execute("""DELETE FROM implementation_evidence
-              WHERE job_id=? AND position=?""", (job_id, position))
-            db.execute("""UPDATE implementation_job_tasks
-              SET status='running', error=NULL, review_started_at=NULL,
-                  revision_attempts=0, revision_budget=?
-              WHERE job_id=? AND position=?""", (budget, job_id, position))
-            db.execute("""UPDATE implementation_jobs
-              SET status='running', error=NULL, updated_at=? WHERE job_id=?""",
-                       (now, job_id))
-            return True
-
-    async def stop_recovery(self, job_id: str, position: int) -> bool:
-        return await asyncio.to_thread(self._stop_recovery, job_id, position)
-
-    def _stop_recovery(self, job_id, position):
-        now = time.time()
-        with self._database() as db:
-            result = db.execute("""UPDATE implementation_job_tasks
-              SET status='recovery_stopped', error='manual recovery requested'
-              WHERE job_id=? AND position=? AND status='recovery_required'""",
-                                (job_id, position))
-            if not result.rowcount:
-                return False
-            db.execute("""UPDATE implementation_jobs
-              SET status='stopped', error='manual recovery requested', updated_at=?
-              WHERE job_id=?""", (now, job_id))
-            db.execute("""INSERT INTO implementation_resolution_actions
-              (job_id, position, action, details_json, created_at)
-              VALUES (?, ?, 'recovery_stopped', ?, ?)""", (
-                job_id, position, json.dumps({
-                    "warning": "No automatic undo was attempted; manual repair is required.",
-                }), now,
-            ))
-            return True
 
     async def record_review(self, job_id: str, position: int, coder_model: str,
                             reviewer_model: str, verdict: str, rationale: str,
@@ -1077,30 +1017,6 @@ class RoutingPersistence:
                 (t.status='reviewing' AND t.review_started_at<?))
               ORDER BY t.position LIMIT 1""",
               (job_id, time.time() - 15 * 60)).fetchone()
-
-    async def pending_recovery(self, conversation_id: str | None):
-        if not conversation_id:
-            return None
-        return await asyncio.to_thread(self._pending_recovery, conversation_id)
-
-    def _pending_recovery(self, conversation_id):
-        with self._database() as db:
-            return db.execute("""SELECT t.job_id, t.position, t.task_id, j.instruction
-              FROM implementation_job_tasks t JOIN implementation_jobs j
-              ON j.job_id=t.job_id WHERE j.conversation_id=?
-                AND t.status='recovery_required'
-              ORDER BY j.updated_at DESC LIMIT 1""", (conversation_id,)).fetchone()
-
-    async def pending_recovery_for_job(self, job_id: str):
-        return await asyncio.to_thread(self._pending_recovery_for_job, job_id)
-
-    def _pending_recovery_for_job(self, job_id):
-        with self._database() as db:
-            return db.execute("""SELECT t.job_id, t.position, t.task_id, j.instruction
-              FROM implementation_job_tasks t JOIN implementation_jobs j
-              ON j.job_id=t.job_id WHERE t.job_id=?
-                AND t.status='recovery_required'
-              ORDER BY t.position LIMIT 1""", (job_id,)).fetchone()
 
     async def pending_resolution(self, conversation_id: str | None):
         if not conversation_id:

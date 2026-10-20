@@ -160,3 +160,16 @@ def is_mutating_tool(name):
 def operations_for(name):
     d = _definition(name)
     return d.operations if d else frozenset()
+
+# Bridged tools that duplicate native CLI file access (read, search, list, write).
+# In native execution these stay unregistered; IDE-specific inspections, refactorings,
+# notebooks, the dispatcher and KB tools remain bridged.
+NATIVE_OVERLAP = (frozenset(a for d in DEFINITIONS if d.domain == DOMAIN_SOURCE
+                            and d.capabilities & {CAP_READ, CAP_SEARCH, CAP_WRITE}
+                            for a in d.aliases)
+                  | frozenset({"list_files_in_folder", "list_directory_tree"}))
+def native_bridged_specs(specs: list[ToolSpec]) -> list[ToolSpec]:
+    """Drop bridged tools that native filesystem tools already cover."""
+    return [spec for spec in specs
+            if (next((spec.name[len(p):] for p in PREFIXES if spec.name.startswith(p)), spec.name)
+                not in NATIVE_OVERLAP)]

@@ -1,8 +1,19 @@
-"""Task-scoped IDE mutation journal and conflict-safe rollback."""
+"""Task-scoped mutation journal for review and execution evidence.
 
+IDE mutations are journaled per tool call. Native (CLI filesystem) execution is
+journaled from a git baseline taken before the run and compared after it. The
+journal records which files changed and how; it keeps no preimages and restores
+nothing.
+"""
+
+import asyncio
 import hashlib
+import os
 import re
 import shlex
+import stat
+import subprocess
+from pathlib import Path
 
 from agent.routing.persistence import RoutingPersistence
 from agent.routing.evidence import (is_verification_call, normalize_dispatcher_call,
@@ -12,8 +23,6 @@ from agent.spec.bridge_client import BridgeMcpFileClient
 from mcp_bridge.adapters import mutation_targets
 from mcp_bridge.registry import (
     DOMAIN_SOURCE,
-    OP_FILE_CREATE,
-    OP_FILE_DELETE,
     OP_FILE_READ,
     ToolRegistry,
     ToolSpec,
@@ -110,18 +119,125 @@ def _nested_mutation(name: str, arguments: dict) -> tuple[str | None, dict]:
     return _DISPATCHER_MUTATIONS[tokens[0]], parsed
 
 
-def _arguments_for_path(spec: ToolSpec, path: str, content: str | None = None) -> dict:
-    properties = spec.schema.get("properties", {}) if isinstance(spec.schema, dict) else {}
-    key = next((name for name in ("file_path", "filePath", "pathInProject", "path")
-                if not properties or name in properties), "file_path")
-    arguments = {key: path}
-    if content is not None:
-        text_key = next((name for name in ("text", "content", "newText")
-                         if not properties or name in properties), "text")
-        arguments[text_key] = content
-        if not properties or "overwrite" in properties:
-            arguments["overwrite"] = True
-    return arguments
+# --- native git baseline -------------------------------------------------------
+#
+# Captures the pre-task state for change detection without writing anything to the
+# repository: file oids come from `hash-object --no-filters` (no `-w`), file modes
+# from `lstat`, and staged entries from `ls-files -s`. Only paths the run changed are
+# journaled; nothing is restored.
+
+_GIT_TIMEOUT = 300
+
+
+def _git(root: str, *args: str, data: bytes | None = None) -> bytes:
+    result = subprocess.run(["git", "-C", root, *args], input=data,
+                            capture_output=True, timeout=_GIT_TIMEOUT)
+    if result.returncode:
+        raise RuntimeError(f"git {args[0]} failed: "
+                           f"{result.stderr.decode(errors='replace').strip()[:300]}")
+    return result.stdout
+
+
+def _nul_paths(output: bytes) -> list[str]:
+    return [os.fsdecode(item) for item in output.split(b"\0") if item]
+
+
+def _index_entries(root: str) -> dict[str, list[list[str]]]:
+    """path -> [[mode, oid, stage], ...] (several stages while a merge conflict is open)."""
+    entries: dict[str, list[list[str]]] = {}
+    for record in _git(root, "ls-files", "-s", "-z").split(b"\0"):
+        if not record:
+            continue
+        meta, path = record.split(b"\t", 1)
+        entries.setdefault(os.fsdecode(path), []).append(meta.decode().split())
+    return entries
+
+
+def _candidates(root: str) -> set[str]:
+    """Tracked and untracked, non-ignored paths (ignored files are not journaled)."""
+    return set(_nul_paths(_git(root, "ls-files", "-z", "-c", "-o", "--exclude-standard")))
+
+
+def _lstat(root: str, path: str):
+    try:
+        info = os.lstat(os.path.join(root, path))
+    except FileNotFoundError:
+        return None
+    if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+        return None  # directories (submodules) and special files are not journaled
+    return info
+
+
+def _signature(info) -> list[int] | None:
+    return None if info is None else [info.st_mode, info.st_size, info.st_mtime_ns,
+                                      info.st_ctime_ns, info.st_ino]
+
+
+def _file_bytes(root: str, path: str, info) -> bytes:
+    full = os.path.join(root, path)
+    if stat.S_ISLNK(info.st_mode):
+        return os.fsencode(os.readlink(full))
+    with open(full, "rb") as handle:
+        return handle.read()
+
+
+def _oid(root: str, data: bytes) -> str:
+    return _git(root, "hash-object", "--no-filters", "--stdin", data=data).decode().strip()
+
+
+def _capture_baseline(root: str) -> dict:
+    head = subprocess.run(["git", "-C", root, "rev-parse", "--verify", "-q", "HEAD"],
+                          capture_output=True, text=True, timeout=_GIT_TIMEOUT).stdout.strip()
+    index = _index_entries(root)
+    files: dict[str, dict] = {}
+    regular: list[str] = []
+    for path in sorted(_candidates(root) | set(index)):
+        info = _lstat(root, path)
+        if info is None:
+            continue
+        files[path] = {"stat": _signature(info), "perm": stat.S_IMODE(info.st_mode),
+                       "link": stat.S_ISLNK(info.st_mode)}
+        if files[path]["link"]:
+            files[path]["oid"] = _oid(root, _file_bytes(root, path, info))
+        else:
+            regular.append(path)
+    if regular:
+        oids = _git(root, "hash-object", "--no-filters", "--stdin-paths",
+                    data=os.fsencode("\n".join(regular) + "\n")).decode().split()
+        for path, oid in zip(regular, oids):
+            files[path]["oid"] = oid
+    return {"root": root, "head": head or None, "index": index, "files": files}
+
+
+def _detect_changes(baseline: dict) -> tuple[list[dict], str | None]:
+    """Paths whose content, mode, existence or index entry differ from the baseline."""
+    root = baseline["root"]
+    index = _index_entries(root)
+    before_files = baseline["files"]
+    changes = []
+    for path in sorted(_candidates(root) | set(index) | set(before_files)
+                       | set(baseline["index"])):
+        before = before_files.get(path)
+        info = _lstat(root, path)
+        content_changed = False
+        if (before is None) != (info is None):
+            content_changed = True
+        elif info is not None and _signature(info) != before["stat"]:
+            content_changed = (_oid(root, _file_bytes(root, path, info)) != before["oid"]
+                               or stat.S_IMODE(info.st_mode) != before["perm"]
+                               or stat.S_ISLNK(info.st_mode) != before["link"])
+        index_changed = index.get(path) != baseline["index"].get(path)
+        if not (content_changed or index_changed):
+            continue
+        current_hash = (_MISSING_HASH if info is None
+                        else hashlib.sha256(_file_bytes(root, path, info)).hexdigest())
+        changes.append({"path": path, "before_exists": before is not None,
+                        "expected_hash": current_hash})
+    head = subprocess.run(["git", "-C", root, "rev-parse", "--verify", "-q", "HEAD"],
+                          capture_output=True, text=True, timeout=_GIT_TIMEOUT).stdout.strip()
+    moved = None if (head or None) == baseline["head"] else (
+        f"HEAD moved from {baseline['head'] or 'none'} to {head or 'none'} during the task")
+    return changes, moved
 
 
 class RollbackJournal:
@@ -196,12 +312,11 @@ class RollbackJournal:
                     continue
                 tracked.append(path)
                 continue
-            exists, content, error = await self._read(path)
+            # Only existence matters (review needs before/after); no preimage is kept.
+            # An unreadable file is assumed to exist rather than blocking the write.
+            exists, _, error = await self._read(path)
             if error:
-                issues.append(("rollback_snapshot_failed", {
-                    "tool": name, "path": path, "error": error,
-                }))
-                continue
+                exists = True
             if (not exists and _communication_artifact(path, mutation_text)
                     and path not in self.allowed_artifacts):
                 issues.append(("project_artifact_policy", {
@@ -212,16 +327,16 @@ class RollbackJournal:
                               "repository; run the check through the execution capability"),
                 }))
                 continue
-            pending.append((path, exists, content))
+            pending.append((path, exists))
         if issues:
             await self.persistence.advance_mutation(
                 mutation_id, "planned", "snapshot",
                 "; ".join(str(payload.get("error") or payload.get("path") or action)
                           for action, payload in issues))
             return mutation_id, [], issues
-        for path, exists, content in pending:
+        for path, exists in pending:
             await self.persistence.record_rollback_file(
-                self.job_id, self.position, path, exists, content)
+                self.job_id, self.position, path, exists)
             tracked.append(path)
         await self.persistence.advance_mutation(mutation_id, "snapshotted")
         return mutation_id, tracked, issues
@@ -269,8 +384,8 @@ class RollbackJournal:
         if any(action == "project_artifact_policy" for action, _ in issues):
             return ("Error: mutation blocked before execution by the project artifact policy "
                     f"({reasons}). No files were changed.")
-        return ("Error: mutation blocked before execution because a complete rollback "
-                f"snapshot could not be established ({reasons}). No files were changed.")
+        return ("Error: mutation blocked before execution because its target files could "
+                f"not be identified for review ({reasons}). No files were changed.")
 
     async def record_verification(self, name: str, arguments: dict,
                                   result: object, success: bool,
@@ -366,55 +481,50 @@ class RollbackJournal:
             wrapped[name] = call
         return wrapped
 
-    async def restore(self) -> tuple[list[str], list[str]] | None:
-        issues = await self.persistence.rollback_integrity_issues(
-            self.job_id, self.position)
-        if issues:
-            labels = [str(issue.get("path") or issue.get("tool") or issue["action"])
-                      for issue in issues]
-            return [], labels
-        entries = await self.persistence.rollback_files(self.job_id, self.position)
-        if not entries:
-            return None
-        create = next((spec for spec in self.registry.candidates(
-            OP_FILE_CREATE, DOMAIN_SOURCE) if spec.name in self.handlers), None)
-        delete = next((spec for spec in self.registry.candidates(
-            OP_FILE_DELETE, DOMAIN_SOURCE) if spec.name in self.handlers), None)
-        ready: list[tuple[dict, ToolSpec]] = []
-        conflicts: list[str] = []
-        for entry in entries:
-            path = entry["path"]
-            exists, content, error = await self._read(path)
-            current_hash = (_hash(content) if exists and content is not None
-                            else _MISSING_HASH)
-            if error or not entry["expected_hash"] or current_hash != entry["expected_hash"]:
-                conflicts.append(path)
-                continue
-            spec = create if entry["before_exists"] else delete
-            if spec is None:
-                conflicts.append(path)
-                continue
-            ready.append((entry, spec))
-        # Validate the complete set before changing any file. This prevents a
-        # known conflict from producing a partial rollback.
-        if conflicts:
-            return [], conflicts
-        restored: list[str] = []
-        for entry, spec in ready:
-            path = entry["path"]
-            supplied = _arguments_for_path(
-                spec, path, entry["before_content"] if entry["before_exists"] else None)
-            try:
-                arguments = self.registry.prepare_advertised_call(spec.name, supplied)[1]
-                result = await self.handlers[spec.name](arguments)
-            except Exception:
-                conflicts.append(path)
-                continue
-            if _failed(result):
-                conflicts.append(path)
-                continue
-            restored.append(path)
-        return restored, conflicts
+    async def record_git_baseline(self, root: str) -> None:
+        """Snapshot a native run's work tree, index and HEAD before it starts."""
+        self._native_baseline = await asyncio.to_thread(_capture_baseline, root)
+
+    async def record_native_changes(self, excluded_files: tuple[str, ...] = ()) -> list[str]:
+        """Journal every path the native run changed since `record_git_baseline`.
+
+        Native tools cannot be stopped from touching the contract's excluded files:
+        such changes are journaled like any other, and the run then fails
+        (`NativeSessionError`) naming them. Nothing is restored.
+        """
+        baseline = getattr(self, "_native_baseline", None)
+        if baseline is None:
+            return []
+        self._native_baseline = None
+        changes, moved = await asyncio.to_thread(_detect_changes, baseline)
+        for change in changes:
+            path = change["path"]
+            operation = ("file_create" if not change["before_exists"] else
+                         "file_delete" if change["expected_hash"] == _MISSING_HASH else
+                         "file_replace")
+            mutation_id = await self.persistence.plan_mutation(
+                self.job_id, self.position, "native_cli", operation, [path])
+            await self.persistence.record_rollback_file(
+                self.job_id, self.position, path, change["before_exists"],
+                change["expected_hash"])
+            await self.persistence.update_rollback_hash(
+                self.job_id, self.position, path, change["expected_hash"])
+            await self.persistence.advance_mutation(mutation_id, "postimage_verified")
+        if moved:
+            await self.persistence.record_resolution_action(
+                self.job_id, self.position, "rollback_untracked_mutation",
+                {"tool": "native_cli", "error": moved})
+        paths = [change["path"] for change in changes]
+        if excluded_files:
+            from agent.task_contracts.policy import path_excluded
+            excluded = [path for path in paths if path_excluded(path, excluded_files)]
+            if excluded:
+                from agent.workspace import NativeSessionError
+                raise NativeSessionError(
+                    "The attempt changed files the task contract excludes: "
+                    + ", ".join(excluded) + ". They were left as changed; review them "
+                    "before continuing.")
+        return paths
 
     async def changed_paths(self) -> list[str]:
         entries = await self.persistence.rollback_files(self.job_id, self.position)

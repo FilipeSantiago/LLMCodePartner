@@ -29,8 +29,8 @@ then rejects any selected alias outside the local tier.
 ### Roles and capability floors
 
 Coder, reviewer, and WP planner route from separate tables. Each model carries a
-role-independent `capability` rank, and `roles.<role>.min_capability` sets a floor
-per role:
+role-independent `capability` rank. The configured `roles.<role>.min_capability`
+sets a floor for coders and reviewers; the planner has no floor by default:
 
 - **Coder:** `routing.tiers`, keyed by task complexity (`simple|medium|complex`).
 - **Reviewer:** the `reviewers` pairing table; fallbacks below the reviewer floor
@@ -40,8 +40,8 @@ per role:
   (`low|medium|high|complex`), with optional `reasoning_effort` overrides and a
   `max_tool_calls` investigation budget.
 
-Complexity is role-relative. The loader rejects a config whose `low` planner
-candidates are not strictly more capable than every `simple` coder. A config
+Planner tiers may use lower-capability models, including Haiku in the low tier.
+An optional explicit `roles.planner.min_capability` is still honored. A config
 without `roles` or `planner` still loads; only `codepartner-plan` needs the planner
 section. See `docs/wp-planner.md`.
 

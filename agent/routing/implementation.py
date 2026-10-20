@@ -7,6 +7,7 @@ import re
 import shlex
 from collections.abc import AsyncIterator
 from dataclasses import asdict, replace
+from pathlib import Path
 
 from agent.planning.models import ApprovedWPPlan
 from agent.kb_first import KbFirstPolicy, evidence_seed
@@ -29,6 +30,8 @@ from agent.spec.models import (CompletionReview, Task, ValidationContract,
                                WorkPackage, WorkPackageReview)
 from agent.task_contracts.contractor import TaskContractor, requested_paths, USER_RESOLUTION_REASON
 from agent.task_contracts.persistence import TaskContractPersistence
+from agent.workspace import (NATIVE_SHELL_TOOL, command_result, native_project,
+                             run_native_command)
 from mcp_bridge import bridge
 from mcp_bridge.activity import describe_call
 from mcp_bridge.models import (DoneEvent, ErrorEvent, Event, ProgressEvent, Run,
@@ -87,7 +90,7 @@ class ImplementationService:
                  persistence: RoutingPersistence | None = None,
                  reviewer: ReviewService | None = None,
                  contract_persistence: TaskContractPersistence | None = None,
-                 kb_refresh=None):
+                 kb_refresh=None, kb_catch_up=None):
         self.artifacts = artifacts
         self.task_execution = task_execution or TaskExecutionService()
         self.persistence = persistence or self.task_execution.persistence
@@ -99,6 +102,8 @@ class ImplementationService:
                        or getattr(self.task_execution, "config", None)
                        or load_routing_config())
         self.kb_refresh = kb_refresh
+        # Reindexes first when accepted edits are newer than the KB index.
+        self.kb_catch_up = kb_catch_up
 
     def _coder_line(self, model: str | None, fallbacks: tuple[str, ...] = ()) -> str:
         """Which model routing picked for the coder."""
@@ -176,8 +181,7 @@ class ImplementationService:
                   if verdict == "needs_work" else "The review is ready.")
         return ui.block(f"{task_id}{suffix}: {status}") + ui.menu((
             "1. Reply `accept` to keep the implementation and continue.",
-            "2. Reply `undo` to restore only this task's changes and stop the job.",
-            "3. Reply `submit to coder again: <additional prompt>` to keep the current "
+            "2. Reply `submit to coder again: <additional prompt>` to keep the current "
             "work and start a fresh coder/reviewer cycle.",
         ))
 
@@ -278,7 +282,9 @@ class ImplementationService:
         for number, step in enumerate(steps, 1):
             tool = step.get("tool") if isinstance(step, dict) else None
             arguments = step.get("arguments") if isinstance(step, dict) else None
-            if (not isinstance(tool, str) or tool not in direct_tool_handlers
+            project = native_project() if tool == NATIVE_SHELL_TOOL else None
+            if (not isinstance(tool, str)
+                    or (tool not in direct_tool_handlers and project is None)
                     or not isinstance(arguments, dict)
                     or not is_reproducible_verification_call(arguments)):
                 errors.append(
@@ -288,7 +294,11 @@ class ImplementationService:
             if signature in seen:
                 continue
             try:
-                result = await direct_tool_handlers[tool](arguments)
+                if project is not None:
+                    output, exit_code = await run_native_command(project, arguments["command"])
+                    result = command_result(output, exit_code)
+                else:
+                    result = await direct_tool_handlers[tool](arguments)
                 success = verification_succeeded(result)
             except Exception as exc:
                 result = f"{type(exc).__name__}: {exc}"
@@ -363,7 +373,6 @@ class ImplementationService:
                     "which judges the acceptance criteria; the job continues if it passes.",
                     "2. Reply `try coder again: <guidance>` to rerun the coder under the same "
                     "task contract.",
-                    "3. Reply `undo` to restore only this task's changes and stop the job.",
                 )),
             ))
         return "".join((
@@ -375,7 +384,6 @@ class ImplementationService:
             ui.menu((
                 "1. Reply `try coder again` (optionally `try coder again: <guidance>`) to "
                 "continue this task from the saved files.",
-                "2. Reply `undo` to restore only this task's changes and stop the job.",
             )),
         ))
 
@@ -383,7 +391,7 @@ class ImplementationService:
                          job_id: str) -> str:
         if item.status == CODER_RECOVERY_STATUS or latest is None:
             return (f"{item.task_id} for job {job_id}: reply `try coder again` to continue on a "
-                    "different model, or `undo` to restore this task's changes.")
+                    "different model.")
         return self._resolution_options(item.task_id, latest["verdict"], job_id)
 
     async def create_job(self, selectors: list[str], instruction: str = "",
@@ -408,6 +416,11 @@ class ImplementationService:
         yield TextEvent(ui.block(
             f"**Job {ui.short_job(job.job_id)}** queued {len(job.task_ids)} task(s): "
             f"{', '.join(job.task_ids)}"))
+        if self.kb_catch_up is not None:
+            caught_up = await self.kb_catch_up(
+                await self.persistence.implementation_job_project_id(job.job_id))
+            if caught_up:
+                yield TextEvent(ui.block(caught_up))
         async for event in self._advance(
                 job.job_id, messages, specs, job.instruction, direct_tool_handlers or {}):
             yield event
@@ -480,10 +493,6 @@ class ImplementationService:
                            specs: list[ToolSpec]) -> AsyncIterator[Event]:
         job_id = run.metadata["implementation_job_id"]
         position = run.metadata["implementation_position"]
-        if run.metadata.get("implementation_action") == "undo":
-            async for event in self._complete_undo(job_id, position):
-                yield event
-            return
         report = await self.persistence.coder_report_for(job_id, position)
         async for event in self._task_finished(
                 job_id, position, messages, specs,
@@ -562,15 +571,19 @@ class ImplementationService:
             search_gate_max=discovery.search_gate_max,
             excluded_files=contract.excluded_files,
             recent_mutations=recent_mutations,
+            direct_paths=(*plan.shared.relevant_files,
+                          *(plan.tasks[task.id].relevant_files
+                            if task.id in plan.tasks else ())) if plan else (),
             seed=evidence_seed("\n".join((task.title, task.description,
                                          task.context, task.acceptance_criteria
                                          if isinstance(task.acceptance_criteria, str)
                                          else " ".join(task.acceptance_criteria or ())))),
             mode=discovery.mode_for("coder"), tier=task.complexity,
             advisory_thresholds=discovery.thresholds_for("coder", task.complexity),
-            small_file_bytes=discovery.small_file_bytes)
-            if (discovery is not None and discovery.enabled and not contract.excluded_files
-                and any(spec.name == "kb_search_graph" for spec in specs)) else None)
+            small_file_bytes=discovery.small_file_bytes,
+            gates=discovery.gated("coder"),
+            enforce_reads=bool(discovery.policy == "kb_first"))
+            if (discovery is not None and discovery.enabled) else None)
         async for event in self.task_execution.execute(
                 task, change.id, messages, specs, on_decision=record_decision,
                 execution_instruction=instruction,
@@ -581,7 +594,8 @@ class ImplementationService:
                     "implementation_position": item.position,
                     "implementation_task_id": task.id,
                     **({"plan_id": plan.plan_id} if plan else {}),
-                }, **({"plan_context": coder_context(plan, task.id, prior_events)}
+                }, **({"plan_context": coder_context(
+                       plan, task.id, prior_events, task.description)}
                    if plan else {})):
             if routed is not None and not announced:
                 announced = True
@@ -670,15 +684,6 @@ class ImplementationService:
             return
         journal = RollbackJournal(self.persistence, item.job_id, item.position,
                                   specs, direct_tool_handlers)
-        issues = await journal.integrity_issues()
-        if issues:
-            await self.persistence.update_implementation_task(
-                item.job_id, item.position, "recovery_required",
-                error="mutation journal integrity could not be verified")
-            yield TextEvent(ui.block(
-                f"⛔ {item.task_id}: a prior edit cannot be verified in the mutation "
-                "journal. Reply `inspect recovery` before retrying."))
-            return
         manifest = await journal.review_manifest()
         paths = [entry["path"] for entry in manifest]
         if not await self.persistence.claim_auto_coder_fallback(
@@ -855,24 +860,17 @@ class ImplementationService:
                 self.persistence, job_id, position, specs, direct_tool_handlers)
             integrity_issues = await journal.integrity_issues()
             if integrity_issues:
-                await self.persistence.update_implementation_task(
-                    job_id, position, "recovery_required",
-                    error="mutation journal integrity could not be verified")
+                # Not blocking: the reviewer judges the project as it is, told which
+                # changes the journal could not verify.
                 details = "; ".join(
                     str(issue.get("path") or issue.get("tool") or issue["action"])
+                    + (f" ({issue['error']})" if issue.get("error") else "")
                     for issue in integrity_issues)
-                yield TextEvent("".join((
-                    ui.heading("⛔", f"{task.id} — Recovery required", "reviewer: not run"),
-                    ui.block("A mutation was applied without a complete verified journal, so "
-                             "safe undo and independent review cannot be guaranteed."),
-                    ui.quote(f"Journal evidence: {details}."),
-                    ui.block("Reply `inspect recovery` for the mutation audit, "
-                             "`establish new baseline: <prompt>` to explicitly accept the "
-                             "current project state as the new undo baseline and rerun the "
-                             "coder/reviewer cycle, or `stop and repair manually` to end this "
-                             "job. `retry review` is unavailable."),
-                )))
-                return
+                yield TextEvent(ui.block(
+                    f"⚠️ {task.id}: some changes are not fully recorded in the change "
+                    f"journal ({details}); the reviewer is told."))
+                report = (f"{report}\n\nCodePartner journal warning: these changes could "
+                          f"not be fully verified in the change journal: {details}.")
             journal_manifest = await journal.review_manifest()
             changed_paths = [entry["path"] for entry in journal_manifest]
             if wp_boundary and _requires_test_run(package):
@@ -1236,7 +1234,8 @@ class ImplementationService:
         handlers = journal.wrapped_handlers()
         dispatcher = next((name for name in handlers
                            if name.rsplit("__", 1)[-1] == "execute_tool"), None)
-        if dispatcher is None:
+        project = native_project()
+        if dispatcher is None and project is None:
             yield TextEvent(ui.block("The required tests have no passing run, and this IDE exposes no "
                             "`execute_tool` for CodePartner to run them."))
             return
@@ -1255,8 +1254,15 @@ class ImplementationService:
                                 "or changed test file was found to run."))
                 return
             command = "pytest " + " ".join(shlex.quote(path) for path in test_paths)
-        command = await self._project_test_command(journal, command)
+        command = await self._project_test_command(journal, command, project)
         yield TextEvent(ui.block(f"Running the required tests through CodePartner: `{command}`"))
+        if project is not None:
+            output, exit_code = await run_native_command(project, command)
+            result = command_result(output, exit_code)
+            await journal.record_verification(
+                NATIVE_SHELL_TOOL, {"command": command}, result,
+                exit_code == 0 if exit_code is not None else verification_succeeded(result))
+            return
         try:
             await handlers[dispatcher]({"command": command})
         except Exception as exc:
@@ -1284,10 +1290,17 @@ class ImplementationService:
                 "and the reviewer will judge their output."]
 
     @staticmethod
-    async def _project_test_command(journal: RollbackJournal, command: str) -> str:
+    async def _project_test_command(journal: RollbackJournal, command: str,
+                                    project=None) -> str:
         """Run a bare pytest through the project's environment rather than PATH."""
         if not re.match(r"(?:pytest|py\.test)(?:\s|$)", command):
             return command
+        if project is not None:
+            # A host .venv is unusable in the container; uv builds its own environment.
+            root = Path(project.workspace)
+            if (root / "uv.lock").exists() or (root / "pyproject.toml").exists():
+                return f"uv run {command}"
+            return f"python3 -m {command}"
         if (await journal._read("uv.lock"))[0]:
             return f"uv run {command}"
         if (await journal._read(".venv/pyvenv.cfg"))[0]:
@@ -1458,14 +1471,6 @@ class ImplementationService:
                          else frozenset())
         journal = RollbackJournal(self.persistence, item.job_id, item.position,
                                   specs, direct_tool_handlers)
-        if await journal.integrity_issues():
-            await self.persistence.update_implementation_task(
-                item.job_id, item.position, "recovery_required",
-                error="mutation journal integrity could not be verified")
-            yield TextEvent(ui.block(
-                "The saved edits could not be verified. Reply `inspect recovery` "
-                "before another coder changes the project."))
-            return
         manifest = await journal.review_manifest()
         if not await self.persistence.claim_coder_recovery(item.job_id, item.position):
             yield ErrorEvent("This task is no longer awaiting a coder recovery decision.")
@@ -1491,80 +1496,6 @@ class ImplementationService:
                 exclude_models=attempted):
             yield event
 
-    async def establish_new_baseline(self, job_id: str, position: int,
-                                     messages: list[dict], specs: list[ToolSpec],
-                                     instruction: str, direct_tool_handlers: dict,
-                                     guidance: str) -> AsyncIterator[Event]:
-        item = await self.persistence.implementation_task(job_id, position)
-        if item is None or item.status != "recovery_required":
-            yield ErrorEvent("This task does not require journal recovery.")
-            return
-        if not guidance.strip():
-            yield ErrorEvent(
-                "Establish new baseline requires a recovery prompt after the colon.")
-            return
-        if not await self.persistence.establish_recovery_baseline(
-                job_id, position, REVISION_BUDGET, guidance.strip()):
-            yield ErrorEvent("This task is no longer awaiting journal recovery.")
-            return
-        yield TextEvent(ui.block(
-            f"Established the current project state as the new undo baseline for "
-            f"{item.task_id}. Prior uncertain mutations cannot be undone automatically. "
-            f"Starting a fresh coder/reviewer cycle."))
-        recovery_instruction = "\n".join(filter(None, [
-            instruction,
-            guidance.strip(),
-            "Recovery run: inspect and directly repair the named original artifacts. "
-            "All new mutations must be journaled. Run every requested verification and "
-            "report only captured results.",
-        ]))
-        async for event in self._run_item(
-                item, messages, specs, recovery_instruction, direct_tool_handlers):
-            yield event
-
-    async def inspect_recovery(self, job_id: str, position: int) -> AsyncIterator[Event]:
-        item = await self.persistence.implementation_task(job_id, position)
-        if item is None or item.status != "recovery_required":
-            yield ErrorEvent("This task does not require journal recovery.")
-            return
-        mutations = await self.persistence.mutations(job_id, position)
-        issues = await self.persistence.rollback_integrity_issues(job_id, position)
-        lines = [
-            f"{item.task_id} — Recovery audit",
-            "Undo remains disabled until a new baseline is explicitly established.",
-        ]
-        if mutations:
-            lines.append("Mutation lifecycle:")
-            for mutation in mutations:
-                targets = ", ".join(mutation["targets"]) or "unresolved targets"
-                failure = (f"; failure={mutation['failure_stage']}: "
-                           f"{mutation['failure_detail']}"
-                           if mutation["failure_stage"] else "")
-                lines.append(
-                    f"- #{mutation['id']} {mutation['tool']} ({mutation['operation']}): "
-                    f"{mutation['stage']} — {targets}{failure}")
-        else:
-            lines.append("Mutation lifecycle: no structured lifecycle records are available.")
-        if issues:
-            lines.append("Integrity issues:")
-            lines.extend(
-                f"- {issue['action']}: "
-                f"{issue.get('path') or issue.get('tool') or issue.get('error') or 'unknown'}"
-                for issue in issues)
-        yield TextEvent(ui.block("\n".join(lines)))
-
-    async def stop_recovery(self, job_id: str, position: int) -> AsyncIterator[Event]:
-        item = await self.persistence.implementation_task(job_id, position)
-        if item is None or item.status != "recovery_required":
-            yield ErrorEvent("This task does not require journal recovery.")
-            return
-        if not await self.persistence.stop_recovery(job_id, position):
-            yield ErrorEvent("This task is no longer awaiting journal recovery.")
-            return
-        yield TextEvent(ui.block(
-            f"Stopped implementation job {job_id} at {item.task_id}. No automatic undo "
-            "was attempted; inspect and repair the current project state manually."))
-
     async def review_blocked_handoff(self, job_id: str, position: int,
                                      messages: list[dict], specs: list[ToolSpec],
                                      instruction: str, direct_tool_handlers: dict,
@@ -1577,7 +1508,7 @@ class ImplementationService:
                 or not (item.error or "").startswith("Coder handoff blocked")
                 or (blocker is not None and not blocker.startswith("Coder handoff blocked"))):
             yield ErrorEvent("This task has no blocked coder handoff to review; "
-                             "only `try coder again` or `undo` apply.")
+                             "only `try coder again` applies.")
             return
         if not await self.persistence.claim_coder_recovery(job_id, position):
             yield ErrorEvent("This task is no longer awaiting a coder recovery decision.")
@@ -1648,131 +1579,6 @@ class ImplementationService:
         async for event in self._advance(
                 job_id, messages, specs, instruction, direct_tool_handlers):
             yield event
-
-    async def undo_code(self, job_id: str, position: int,
-                        messages: list[dict], specs: list[ToolSpec],
-                        direct_tool_handlers: dict) -> AsyncIterator[Event]:
-        item = await self.persistence.implementation_task(job_id, position)
-        latest = await self.persistence.latest_review(job_id, position)
-        interrupted = item is not None and item.status == CODER_RECOVERY_STATUS
-        if item is None or not interrupted and (latest is None or latest["verdict"] not in {
-                "done", "needs_work", "ask_user"}):
-            yield ErrorEvent("This task has no reviewed implementation to undo.")
-            return
-        waiting_status = CODER_RECOVERY_STATUS if interrupted else "awaiting_review_resolution"
-        if not await self.persistence.claim_resolution(job_id, position, "undo"):
-            yield ErrorEvent("This task is no longer awaiting a review decision.")
-            return
-        journal = RollbackJournal(
-            self.persistence, job_id, position, specs, direct_tool_handlers)
-        restored = await journal.restore()
-        if restored is not None:
-            restored_paths, conflicts = restored
-            if conflicts:
-                await self.persistence.update_implementation_task(
-                    job_id, position, waiting_status,
-                    error="Undo conflicts: " + ", ".join(conflicts))
-                await self.persistence.record_resolution_action(
-                    job_id, position, "undo_conflict", {
-                        "restored_paths": restored_paths,
-                        "conflict_paths": conflicts,
-                    })
-                yield TextEvent(ui.block(
-                    "Undo stopped to protect files changed after the coder run. "
-                    f"Conflicts: {', '.join(conflicts)}. "
-                    "Already restored: " + (", ".join(restored_paths) or "none") + "."))
-                yield TextEvent(self._pending_options(item, latest, job_id))
-                return
-            await self.persistence.record_resolution_action(
-                job_id, position, "undo_completed", {
-                    "mode": "journal", "restored_paths": restored_paths,
-                })
-            await self.persistence.update_implementation_task(
-                job_id, position, "undone", error=None)
-            await self.persistence.finish_implementation_job(job_id, "undone")
-            yield TextEvent(ui.block(
-                f"{item.task_id} code undo completed for {len(restored_paths)} file(s). "
-                "The task remains incomplete and the job stopped."))
-            return
-        report = await self.persistence.coder_report_for(job_id, position)
-        findings = self._stored_findings(latest)
-        claimed_paths = sorted({path for finding in findings
-                                for path in finding.artifact_paths})
-        await self.persistence.record_resolution_action(
-            job_id, position, "undo_requested", {
-                "claimed_paths": claimed_paths,
-                "legacy_without_snapshot": True,
-            })
-        change, queued_task = await self.artifacts.task_by_id(item.task_id)
-        undo_instruction = "\n".join([
-            "Undo only the project-code changes introduced while implementing this task.",
-            "Use the saved coder report and reviewer artifact paths as claims to inspect, not as proof.",
-            "Preserve unrelated user changes. Do not modify OpenSpec or .codepartner tracking artifacts.",
-            "If a change cannot be safely attributed to this task, leave it untouched and report it.",
-            f"Task change: {change.id}",
-            f"Reviewer artifact paths: {json.dumps(claimed_paths)}",
-            f"Saved coder report:\n{report}",
-        ])
-        yield TextEvent(ui.block(f"Undoing code for {item.task_id} with a routed coder recovery run."))
-        failure: str | None = None
-        paused = False
-        decision_id: str | None = None
-
-        async def record_decision(decision) -> None:
-            nonlocal decision_id
-            decision_id = decision.decision_id
-            await self.persistence.update_implementation_task(
-                job_id, position, "undoing", decision_id=decision_id)
-
-        async for event in self.task_execution.execute(
-                queued_task, change.id, messages, specs, on_decision=record_decision,
-                execution_instruction=undo_instruction,
-                direct_tool_handlers=direct_tool_handlers, owner_metadata={
-                    "implementation_job_id": job_id,
-                    "implementation_position": position,
-                    "implementation_task_id": item.task_id,
-                    "implementation_action": "undo",
-                }):
-            if isinstance(event, ErrorEvent):
-                failure = event.message
-            if isinstance(event, ToolCallEvent):
-                paused = True
-                run = bridge.run_for(event.tool_call_id)
-                if run is not None:
-                    run.metadata.update({
-                        "implementation_job_id": job_id,
-                        "implementation_position": position,
-                        "implementation_task_id": item.task_id,
-                        "implementation_action": "undo",
-                        "implementation_service": self,
-                    })
-            if not isinstance(event, DoneEvent):
-                yield event
-        if paused:
-            return
-        if failure:
-            await self.persistence.update_implementation_task(
-                job_id, position, waiting_status, error=failure)
-            await self.persistence.record_resolution_action(
-                job_id, position, "undo_failed", {"error": failure})
-            yield TextEvent(ui.block(f"Undo failed for {item.task_id}: {failure}\n"
-                            + self._pending_options(item, latest, job_id)))
-            return
-        async for event in self._complete_undo(job_id, position):
-            yield event
-
-    async def _complete_undo(self, job_id: str, position: int) -> AsyncIterator[Event]:
-        item = await self.persistence.implementation_task(job_id, position)
-        if item is None:
-            yield ErrorEvent("The implementation task was not found after undo.")
-            return
-        await self.persistence.record_resolution_action(
-            job_id, position, "undo_completed", {"mode": "coder_assisted"})
-        await self.persistence.update_implementation_task(
-            job_id, position, "undone", error=None)
-        await self.persistence.finish_implementation_job(job_id, "undone")
-        yield TextEvent(ui.block(
-            f"{item.task_id} code undo completed. The task remains incomplete and the job stopped."))
 
     async def _complete(self, job_id: str, position: int, task_id: str,
                         review: CompletionReview) -> None:

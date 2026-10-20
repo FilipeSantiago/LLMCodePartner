@@ -12,6 +12,16 @@ from agent.workflow.interpreter import ConversationIntentInterpreter
 from api import dialog_controller
 from mcp_bridge.models import TextEvent
 from model.chat import ChatCompletionRequest, ChatMessage
+from tests import ide_mode
+
+
+def setUpModule():
+    ide_mode.pin()
+
+
+def tearDownModule():
+    ide_mode.unpin()
+
 
 
 class _Provider:

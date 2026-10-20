@@ -25,6 +25,7 @@ from mcp_bridge.read_metrics import SourceReadStats
 # The IDE's read_file tool rejects a single request above 5,000 lines. This is
 # a transport constraint, not a limit on what the coder may request.
 IDE_READ_PAGE = 5000
+REWRITE_GUARD_LINES = 60
 _NUMBERED = re.compile(r"^L(\d+): ?(.*)$")
 _TRUNCATED = re.compile(r"…\d+ lines truncated…")
 _PATH_KEYS = frozenset({
@@ -405,6 +406,7 @@ class AgentToolInterface:
         self.observations: dict[str, str] = {}
         self.prior: dict[tuple, tuple[str, str]] = {}
         self.complete_reads: dict[str, str] = {}
+        self.rewrite_pending: set[str] = set()
         self.prior_search: dict[tuple, str] = {}
         self.counter = 0
         self.metrics: Counter[str] = Counter()
@@ -697,6 +699,22 @@ class AgentToolInterface:
                 messages.append(f"{path}: IDE inspection unavailable")
         return "IDE inspection:\n" + "\n".join(messages)
 
+    async def _existing_lines(self, path: str, backend) -> int | None:
+        raw = self.complete_reads.get(path)
+        if raw is None:
+            candidate = next((spec for spec in self.run.registry.tools()
+                              if _bare(spec.name) == "read_file"), None)
+            if candidate is None:
+                return None
+            raw = await backend(candidate.name, {"file_path": path, "offset": 1,
+                                                 "limit": REWRITE_GUARD_LINES + 1})
+        if _read_result(raw, path, 1, REWRITE_GUARD_LINES + 1)[0].startswith("READ FAILED"):
+            return None
+        numbered, truncated = _numbered_lines(raw)
+        if truncated and len(numbered) <= REWRITE_GUARD_LINES:
+            return None
+        return max(numbered, default=0) if numbered else None
+
     async def _execute(self, name: str, arguments: dict,
                        backend: Callable[[str, dict], Awaitable[str]]) -> str:
         bare = _bare(name)
@@ -799,6 +817,21 @@ class AgentToolInterface:
                                   exclusions=tuple(self.run.metadata.get("excluded_files", ())))
             if reason:
                 return f"ACCESS DENIED\n{path}: {reason}. Do not retry this path."
+        if (mutating and effective in {"create_new_file", "create_new_file_with_text"}
+                and inner.get("overwrite") in (True, "true", "True")):
+            signature = json.dumps([effective, inner], sort_keys=True, default=str)
+            for path in targets:
+                lines = await self._existing_lines(path, backend)
+                if lines is not None and lines > REWRITE_GUARD_LINES:
+                    if signature in self.rewrite_pending:
+                        self.rewrite_pending.remove(signature)
+                        self.metrics["rewrite_overridden"] += 1
+                        break
+                    self.rewrite_pending.add(signature)
+                    self.metrics["rewrite_blocked"] += 1
+                    return (f"EDIT NOT APPLIED\n{path} already exists ({lines} lines). "
+                            "Change it with apply_patch; to replace the whole file anyway, "
+                            "repeat the identical call.")
         if effective == "get_git_diff_all":
             return "ACCESS DENIED\nFull project diffs may include protected files; inspect specific source files instead."
         if not self.compact and effective in _READ:

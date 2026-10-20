@@ -35,6 +35,16 @@ from agent.spec.command import (
 from agent.spec.models import Task, OpenSpecChange
 from mcp_bridge.models import DoneEvent, ErrorEvent, MutationEvent, Run, TextEvent
 from mcp_bridge.registry import ToolSpec
+from tests import ide_mode
+
+
+def setUpModule():
+    ide_mode.pin()
+
+
+def tearDownModule():
+    ide_mode.unpin()
+
 
 
 def task(complexity="medium"):
@@ -938,7 +948,7 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
                 "(ran, verification incomplete)" in event.text
                 for event in events if isinstance(event, TextEvent)))
 
-    async def test_incomplete_mutation_journal_blocks_review_approval(self):
+    async def test_incomplete_mutation_journal_warns_the_reviewer(self):
         with tempfile.TemporaryDirectory() as directory:
             artifacts = _Artifacts()
             execution = _TaskExecution()
@@ -958,68 +968,15 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
                     "error": "raw read unavailable",
                 })
             events = [event async for event in service.start(job, [], [])]
-            self.assertEqual(reviewer.reports, [])
-            self.assertEqual(
+            # Not blocking any more: the reviewer runs and is told about the gap.
+            self.assertEqual(len(reviewer.reports), 1)
+            self.assertIn("CodePartner journal warning", reviewer.reports[0])
+            self.assertIn("models/train.ipynb", reviewer.reports[0])
+            self.assertNotEqual(
                 (await persistence.implementation_task(job.job_id, 0)).status,
                 "recovery_required")
-            self.assertIsNone(await persistence.pending_review(None))
-            self.assertTrue(any("Recovery required" in event.text
-                                and "retry review` is unavailable" in event.text
+            self.assertTrue(any("not fully recorded in the change journal" in event.text
                                 for event in events if isinstance(event, TextEvent)))
-
-    async def test_establishing_recovery_baseline_clears_only_prior_journal_cycle(self):
-        with tempfile.TemporaryDirectory() as directory:
-            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
-            service = ImplementationService(_Artifacts(), _TaskExecution(), persistence,
-                                            _Reviewer(["done"]))
-            job = await service.create_job(["WP1-T1"], conversation_id="conv-test")
-            await persistence.update_implementation_task(
-                job.job_id, 0, "recovery_required", error="journal failure")
-            await persistence.record_resolution_action(
-                job.job_id, 0, "rollback_postimage_failed",
-                {"path": "src/uncertain.py", "error": "read failed"})
-            await persistence.record_rollback_file(
-                job.job_id, 0, "src/uncertain.py", True, "before", "hash")
-
-            self.assertIsNotNone(await persistence.pending_recovery("conv-test"))
-            self.assertTrue(await persistence.establish_recovery_baseline(
-                job.job_id, 0, 3, "repair the original report"))
-            self.assertEqual(await persistence.rollback_integrity_issues(job.job_id, 0), [])
-            self.assertEqual(await persistence.rollback_files(job.job_id, 0), [])
-            self.assertEqual(await persistence.revision_state(job.job_id, 0), (0, 3))
-            self.assertEqual(
-                (await persistence.implementation_task(job.job_id, 0)).status, "running")
-
-    async def test_recovery_can_be_inspected_then_stopped_for_manual_repair(self):
-        with tempfile.TemporaryDirectory() as directory:
-            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
-            service = ImplementationService(_Artifacts(), _TaskExecution(), persistence,
-                                            _Reviewer(["done"]))
-            job = await service.create_job(["WP1-T1"], conversation_id="conv-test")
-            await persistence.update_implementation_task(
-                job.job_id, 0, "recovery_required", error="journal failure")
-            mutation_id = await persistence.plan_mutation(
-                job.job_id, 0, "apply_patch", "patch", ["src/a.py"])
-            await persistence.advance_mutation(
-                mutation_id, "applied", "postimage", "IDE read failed")
-            await persistence.record_resolution_action(
-                job.job_id, 0, "rollback_postimage_failed",
-                {"path": "src/a.py", "error": "IDE read failed"})
-
-            events = [event async for event in service.inspect_recovery(job.job_id, 0)]
-            audit = "\n".join(event.text for event in events
-                              if isinstance(event, TextEvent))
-            self.assertIn("Mutation lifecycle", audit)
-            self.assertIn("src/a.py", audit)
-            self.assertIn("failure=postimage", audit)
-
-            events = [event async for event in service.stop_recovery(job.job_id, 0)]
-            self.assertTrue(any("No automatic undo" in event.text
-                                for event in events if isinstance(event, TextEvent)))
-            self.assertEqual(
-                (await persistence.implementation_task(job.job_id, 0)).status,
-                "recovery_stopped")
-            self.assertIsNone(await persistence.pending_recovery("conv-test"))
 
     async def test_failed_current_review_cannot_accept_stale_needs_work_verdict(self):
         finding = ReviewFinding(
@@ -1196,7 +1153,7 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await persistence.revision_state(job.job_id, 0), (3, 3))
             self.assertTrue(any("submit to coder again" in event.text
                                 and "`accept`" in event.text
-                                and "`undo`" in event.text
+                                and "`undo`" not in event.text
                                 for event in first_events if isinstance(event, TextEvent)))
             self.assertEqual((await persistence.pending_resolution("conv-test"))[0],
                              job.job_id)
@@ -1244,35 +1201,6 @@ class ImplementationServiceTests(unittest.IsolatedAsyncioTestCase):
                 job.job_id, 0, [], [], "", {}, "duplicate")]
             self.assertEqual(artifacts.completed, ["WP1-T1"])
             self.assertTrue(any(isinstance(event, ErrorEvent) for event in duplicate))
-
-    async def test_undo_code_stops_job_and_leaves_task_incomplete(self):
-        with tempfile.TemporaryDirectory() as directory:
-            artifacts = _Artifacts()
-            execution = _TaskExecution()
-            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
-
-            async def actual_model(_decision_id):
-                return "claude-haiku"
-
-            persistence.actual_model_for = actual_model
-            service = ImplementationService(
-                artifacts, execution, persistence, _Reviewer(["needs_work"] * 4))
-            job = await service.create_job(["WP1-T1"], conversation_id="conv-test")
-            [event async for event in service.start(job, [], [])]
-            events = [event async for event in service.undo_code(
-                job.job_id, 0, [], [], {})]
-            self.assertEqual(artifacts.completed, [])
-            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
-                             "undone")
-            self.assertTrue(any("task remains incomplete" in event.text
-                                for event in events if isinstance(event, TextEvent)))
-            db = sqlite3.connect(persistence.path)
-            try:
-                status = db.execute("SELECT status FROM implementation_jobs WHERE job_id=?",
-                                    (job.job_id,)).fetchone()
-            finally:
-                db.close()
-            self.assertEqual(status, ("undone",))
 
     def test_findings_render_as_parseable_json(self):
         finding = ReviewFinding(
@@ -1395,7 +1323,7 @@ class RollbackJournalTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
             await persistence.record_rollback_file(
-                "job", 0, "verify_feature.py", False, None, "old-hash")
+                "job", 0, "verify_feature.py", False, "old-hash")
             calls = []
 
             async def read_file(_arguments):
@@ -1513,103 +1441,7 @@ class RollbackJournalTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(Path(evidence[0]["payload_path"]).is_file())
             self.assertEqual(await persistence.mutations("job", 0), [])
 
-    async def test_journal_restores_edited_files_and_deletes_created_files(self):
-        with tempfile.TemporaryDirectory() as directory:
-            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
-            files = {"src/existing.py": "before"}
-
-            async def read_file(arguments):
-                path = arguments["file_path"]
-                return files.get(path, f"File {path} doesn't exist or can't be opened")
-
-            async def create_file(arguments):
-                files[arguments["pathInProject"]] = arguments["text"]
-                return "created"
-
-            async def replace_file(arguments):
-                files[arguments["file_path"]] = arguments["text"]
-                return "replaced"
-
-            async def delete_file(arguments):
-                files.pop(arguments["file_path"], None)
-                return "deleted"
-
-            specs = [
-                ToolSpec("read_file", "read", {"type": "object", "properties": {
-                    "file_path": {"type": "string"}, "limit": {"type": "integer"}}}),
-                ToolSpec("create_new_file", "create", {"type": "object", "properties": {
-                    "pathInProject": {"type": "string"}, "text": {"type": "string"},
-                    "overwrite": {"type": "boolean"}},
-                    "required": ["pathInProject", "text"]}),
-                ToolSpec("replace_file_text_by_path", "replace", {
-                    "type": "object", "properties": {
-                        "file_path": {"type": "string"}, "text": {"type": "string"}}}),
-                ToolSpec("delete_file", "delete", {"type": "object", "properties": {
-                    "file_path": {"type": "string"}}}),
-            ]
-            handlers = {"read_file": read_file, "create_new_file": create_file,
-                        "replace_file_text_by_path": replace_file,
-                        "delete_file": delete_file}
-            wrapped = journal_handlers(persistence, "job", 0, specs, handlers)
-            await wrapped["replace_file_text_by_path"](
-                {"file_path": "src/existing.py", "text": "after"})
-            await wrapped["create_new_file"](
-                {"pathInProject": "src/new.py", "text": "new", "overwrite": True})
-            self.assertEqual(files, {"src/existing.py": "after", "src/new.py": "new"})
-            mutations = await persistence.mutations("job", 0)
-            self.assertEqual(
-                [(item["operation"], item["stage"], item["targets"])
-                 for item in mutations],
-                [("replace", "postimage_verified", ["src/existing.py"]),
-                 ("create", "postimage_verified", ["src/new.py"])],
-            )
-
-            result = await RollbackJournal(
-                persistence, "job", 0, specs, handlers).restore()
-            self.assertEqual(result, (["src/new.py", "src/existing.py"], []))
-            self.assertEqual(files, {"src/existing.py": "before"})
-
-    async def test_journal_refuses_to_overwrite_later_user_change(self):
-        with tempfile.TemporaryDirectory() as directory:
-            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
-            files = {"src/existing.py": "before", "src/other.py": "other before"}
-
-            async def read_file(arguments):
-                return files[arguments["file_path"]]
-
-            async def create_file(arguments):
-                files[arguments["pathInProject"]] = arguments["text"]
-                return "created"
-
-            async def replace_file(arguments):
-                files[arguments["file_path"]] = arguments["text"]
-                return "replaced"
-
-            specs = [
-                ToolSpec("read_file", "read", {"type": "object", "properties": {
-                    "file_path": {"type": "string"}, "limit": {"type": "integer"}}}),
-                ToolSpec("create_new_file", "create", {"type": "object", "properties": {
-                    "pathInProject": {"type": "string"}, "text": {"type": "string"}},
-                    "required": ["pathInProject", "text"]}),
-                ToolSpec("replace_file_text_by_path", "replace", {
-                    "type": "object", "properties": {
-                        "file_path": {"type": "string"}, "text": {"type": "string"}}}),
-            ]
-            handlers = {"read_file": read_file, "create_new_file": create_file,
-                        "replace_file_text_by_path": replace_file}
-            wrapped = journal_handlers(persistence, "job", 0, specs, handlers)
-            await wrapped["replace_file_text_by_path"](
-                {"file_path": "src/existing.py", "text": "coder"})
-            await wrapped["replace_file_text_by_path"](
-                {"file_path": "src/other.py", "text": "other coder"})
-            files["src/existing.py"] = "later user edit"
-            result = await RollbackJournal(
-                persistence, "job", 0, specs, handlers).restore()
-            self.assertEqual(result, ([], ["src/existing.py"]))
-            self.assertEqual(files["src/existing.py"], "later user edit")
-            self.assertEqual(files["src/other.py"], "other coder")
-
-    async def test_notebook_mutation_is_journaled_and_restored(self):
+    async def test_notebook_mutation_is_journaled(self):
         with tempfile.TemporaryDirectory() as directory:
             persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
             files = {"models/train.ipynb": "before notebook"}
@@ -1642,10 +1474,10 @@ class RollbackJournalTests(unittest.IsolatedAsyncioTestCase):
             })
             journal = RollbackJournal(persistence, "job", 0, specs, handlers)
             self.assertEqual(await journal.changed_paths(), ["models/train.ipynb"])
-            self.assertEqual(await journal.restore(), (["models/train.ipynb"], []))
-            self.assertEqual(files["models/train.ipynb"], "before notebook")
+            self.assertEqual([entry["change"] for entry in await journal.review_manifest()],
+                             ["modified"])
 
-    async def test_snapshot_failure_blocks_mutation_before_handler_runs(self):
+    async def test_unreadable_preimage_does_not_block_the_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
             files = {"src/tracked.py": "before", "models/train.ipynb": "before notebook"}
@@ -1687,12 +1519,14 @@ class RollbackJournalTests(unittest.IsolatedAsyncioTestCase):
                 {"file_path": "src/tracked.py", "text": "after"})
             result = await wrapped["edit_notebook"](
                 {"file_path": "models/train.ipynb", "new_source": "changed"})
-            self.assertTrue(result.startswith("Error: mutation blocked before execution"))
+            # The write runs; its unreadable postimage is an integrity warning for review.
+            self.assertNotIn("blocked before execution", str(result))
             self.assertEqual(files["src/tracked.py"], "after")
-            self.assertEqual(files["models/train.ipynb"], "before notebook")
-            self.assertEqual(
-                await RollbackJournal(persistence, "job", 0, specs, handlers).restore(),
-                (["src/tracked.py"], []))
+            self.assertEqual(files["models/train.ipynb"], "after notebook")
+            journal = RollbackJournal(persistence, "job", 0, specs, handlers)
+            self.assertIn("src/tracked.py", await journal.changed_paths())
+            self.assertTrue(any(issue["action"] == "rollback_postimage_failed"
+                                for issue in await journal.integrity_issues()))
 
     async def test_apply_patch_input_tracks_multifile_move_and_unified_prefixes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1832,8 +1666,8 @@ class RollbackJournalTests(unittest.IsolatedAsyncioTestCase):
     async def test_review_manifest_describes_rename_and_deletion_without_preimages(self):
         with tempfile.TemporaryDirectory() as directory:
             persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
-            await persistence.record_rollback_file("job", 0, "old.py", True, "private old", "__missing__")
-            await persistence.record_rollback_file("job", 0, "new.py", False, None, "new-hash")
+            await persistence.record_rollback_file("job", 0, "old.py", True, "__missing__")
+            await persistence.record_rollback_file("job", 0, "new.py", False, "new-hash")
             mutation = await persistence.plan_mutation(
                 "job", 0, "rename_refactoring", "rename", ["old.py", "new.py"])
             await persistence.advance_mutation(mutation, "postimage_verified")
@@ -1904,6 +1738,47 @@ class _SelectingReviewer(ReviewService):
 
 
 class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # These assertions cover the legacy preloaded-snapshot review mode.
+        config = load_routing_config()
+        selective = replace(config, discovery=replace(config.discovery, policy="selective"))
+        patch = mock.patch("agent.routing.review.load_routing_config", return_value=selective)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    async def test_kb_first_review_defers_full_snapshot_and_uses_read_policy(self):
+        from agent.routing.config import load_routing_config as load_real_config
+
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                self.prompt = messages[0]["content"]
+                self.policy = kwargs["kb_first"]
+                self.native = kwargs["native"]
+                await kwargs["direct_tool_handlers"]["read_file"]({
+                    "file_path": "src/app.py", "offset": 1, "limit": 1})
+                yield TextEvent(json.dumps({
+                    "verdict": "done", "rationale": "Reviewed source",
+                    "evidence": ["Inspected src/app.py"],
+                    "inspected_paths": ["src/app.py"], "findings": [],
+                }))
+                yield DoneEvent("endTurn")
+
+        async def read_file(_arguments):
+            return "SECRET_FULL_FILE_CONTENT"
+
+        provider = FakeProvider()
+        with mock.patch("agent.routing.review.providers.get", return_value=provider):
+            await ReviewService(config=load_real_config()).review(
+                SimpleNamespace(title="Change", work_packages=[]), task(),
+                "Changed `src/app.py`.", "claude-haiku",
+                [ToolSpec("read_file", "Read", {"type": "object", "properties": {
+                    "file_path": {"type": "string"}, "offset": {"type": "integer"},
+                    "limit": {"type": "integer"}}})], {"read_file": read_file})
+        self.assertIsNone(provider.native)
+        self.assertTrue(provider.policy.enforce_reads)
+        self.assertNotIn("SECRET_FULL_FILE_CONTENT", provider.prompt)
+        self.assertIn('"status": "deferred"', provider.prompt)
+
     async def test_required_journaled_source_is_paginated_before_review(self):
         class FakeProvider:
             async def tools(self, messages, specs, **kwargs):
@@ -2145,7 +2020,7 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider.reasoning_effort, "medium")
         self.assertEqual(provider.run_metadata,
                          {"reviewer": True, "reviewer_model": "codex-luna-low",
-                     "gateway_used": False})
+                          "gateway_used": False})
         self.assertEqual(decision.verdict, "done")
         self.assertEqual(decision.reviewer_model, "codex-luna-low")
         self.assertEqual(decision.evidence, ("Inspected report.md",))
@@ -3253,15 +3128,6 @@ class CoderRecoveryTests(unittest.IsolatedAsyncioTestCase):
             duplicate = [event async for event in service.retry_coder(
                 job.job_id, 0, [], [], "", {}, "")]
             self.assertTrue(any(isinstance(event, ErrorEvent) for event in duplicate))
-
-    async def test_undo_is_available_without_a_review(self):
-        with tempfile.TemporaryDirectory() as directory:
-            service, persistence, artifacts, job, _ = await self._interrupted_job(
-                directory, _InterruptedTaskExecution())
-            [event async for event in service.undo_code(job.job_id, 0, [], [], {})]
-            self.assertEqual((await persistence.implementation_task(job.job_id, 0)).status,
-                             "undone")
-            self.assertEqual(artifacts.completed, [])
 
     async def test_exhausted_operational_failures_remain_retryable(self):
         with tempfile.TemporaryDirectory() as directory:
