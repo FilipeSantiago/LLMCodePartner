@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from agent.prompt.base import ParentPromptBuilder, PromptRole
+from agent.prompt.base import ParentPromptBuilder, PromptBuilder, PromptRole
 
 if TYPE_CHECKING:
     from agent.spec.models import Task
@@ -84,6 +84,101 @@ def _planned(plan_context: str, ide: bool) -> str:
             + ". Respect the do-not-modify areas. Where the OpenSpec description or context "
             "disagrees with the approved plan, follow the plan: it reflects the current "
             "repository.")
+
+
+_INLINE_SCHEMA = (
+    '{"edits":[{"file":"path","old_text":"<exact current text>","new_text":"<replacement>"}],'
+    '"new_files":[{"path":"path","content":"<whole file>"}],'
+    '"need_context":[],'
+    '"summary":"<work done>",'
+    '"criteria":[{"criterion":"<requirement>","status":"satisfied|blocked",'
+    '"paths":["path"]}],'
+    '"remaining_gaps":[],'
+    '"context_handoff":{"files":[],"symbols":[],"decisions":[]}}')
+
+
+@dataclass(frozen=True)
+class InlineCoderPromptContext:
+    task: "Task"
+    # Current source of the task's ranges (`agent.planning.snippets.materialize`).
+    source: str
+    edit_files: tuple[str, ...]
+    execution_instruction: str = ""
+    contract: object = None
+    plan_context: str = ""
+    checks: tuple[str, ...] = ()
+
+
+class InlineCoderPromptBuilder(PromptBuilder[InlineCoderPromptContext]):
+    """A coder without tools: the plan's source is in the prompt and the reply is one
+    JSON object of exact replacements, which CodePartner applies and checks."""
+    role = PromptRole.CODER
+
+    def sections(self, context: InlineCoderPromptContext) -> list[str]:
+        return [
+            *_task_contract(context.task, context.execution_instruction, context.contract),
+            context.plan_context,
+            _planned(context.plan_context, ide=False),
+            "## Current source\nThe current text of every file region this task needs, "
+            "read for you just now, with line numbers. It is complete and authoritative: "
+            "you have no tools and do not need any.",
+            context.source,
+            f"Files you may change: {', '.join(context.edit_files)}. Change only EDIT "
+            "regions and create only NEW files; REFERENCE regions are read-only context.",
+            _WORK_RULES.split(". Validate")[0] + ".",
+            ("CodePartner applies your edits and then runs: "
+             + "; ".join(f"`{command}`" for command in context.checks)
+             + ". Failures come back to you once with the updated source."
+             if context.checks else
+             "CodePartner applies your edits and returns any problem to you once."),
+            self.reply_rules(),
+        ]
+
+    @staticmethod
+    def reply_rules() -> str:
+        return (
+            "## Reply\nReply with exactly one JSON object and nothing else:\n"
+            + _INLINE_SCHEMA + "\n"
+            "- Put every change of this task in this one reply.\n"
+            "- `old_text` is copied verbatim from the current source, without the line "
+            "numbers and the `| ` after them, with enough surrounding lines to occur exactly "
+            "once in its file. `new_text` replaces it; keep the file's indentation.\n"
+            "- Several edits to one file apply in order, each to the result of the previous.\n"
+            "- `new_files` only for NEW FILE entries, with their whole content.\n"
+            "- `need_context` only when the source above cannot answer a concrete question "
+            "(a missing signature or file): list each as {\"file\" or \"symbol\": ..., "
+            "\"why\": ...} and leave `edits` and `new_files` empty. It costs a round trip.\n"
+            "- `criteria` maps each acceptance criterion to the paths that satisfy it; "
+            "`context_handoff` holds short path::symbol names and decisions the next task "
+            "needs, no source.\n"
+            "- Do not claim a test ran; CodePartner runs them.")
+
+    def repair(self, problem) -> str:
+        return (f"CodePartner could not use your reply: {problem}. Nothing was applied. "
+                "Reply again with the single JSON object only.")
+
+    @staticmethod
+    def apply_failed(errors: list[str], source: str) -> str:
+        return ("CodePartner rejected your reply and applied nothing:\n"
+                + "\n".join(f"- {error}" for error in errors)
+                + "\nThe current source of your edit files:\n" + source
+                + "\nReply with the complete corrected JSON object (all edits of the task, "
+                  "against this source).")
+
+    @staticmethod
+    def checks_failed(failures: list[tuple[str, str]], source: str) -> str:
+        return ("Your edits were applied. These checks failed:\n"
+                + "\n".join(f"### `{command}`\n{output}" for command, output in failures)
+                + "\nThe current source of your edit files, with your edits:\n" + source
+                + "\nReply with one JSON object holding only the further edits that fix "
+                  "these failures, against this source, plus the updated summary and "
+                  "criteria.")
+
+    @staticmethod
+    def context_given(source: str, unresolved: list[str]) -> str:
+        return ("The context you asked for:\n" + source
+                + ("\nNot found: " + ", ".join(unresolved) if unresolved else "")
+                + "\nNow reply with the edits. Another need_context ends inline execution.")
 
 
 @dataclass(frozen=True)

@@ -9,8 +9,9 @@ from collections.abc import AsyncIterator
 from dataclasses import asdict, replace
 from pathlib import Path, PurePosixPath
 
-from agent.planning.models import ApprovedWPPlan
+from agent.planning.models import ApprovedWPPlan, TaskContext
 from agent.planning.rebase import rebase_task, with_package_markers
+from agent.planning.snippets import earlier_task_references, materialize
 from agent.planning.render import (DEFAULT_MARGIN, coder_context, prior_task_context,
                                     reviewer_context, task_files, task_read_only_files)
 from agent.routing.config import load_routing_config
@@ -25,6 +26,7 @@ from agent.routing.rollback import (RollbackJournal, declared_artifacts,
                                     journal_handlers)
 from agent.routing.evidence import (has_passing_test_run, is_reproducible_verification_call,
                                     shell_test_command, verification_succeeded)
+from agent.routing.inline_execution import InlineRequest
 from agent.routing.task_execution import TaskExecutionService
 from agent.spec.artifact_store import ArtifactStore
 from agent.spec.models import (CompletionReview, Task, ValidationContract,
@@ -178,6 +180,87 @@ class ImplementationService:
                  for task_id, context in plan.tasks.items()}
         return replace(plan, tasks=tasks)
 
+    async def _inline_request(self, plan: ApprovedWPPlan, task: Task, job_id: str,
+                              prior_events: list[dict]) -> tuple[InlineRequest | None, str]:
+        """The inline execution of a planned task, or None and why it runs agentic.
+
+        The prompt carries the task's fitted edit and reference ranges and the code that
+        earlier tasks it depends on (or whose files it uses) changed in this job."""
+        settings = getattr(self.config, "inline", None)
+        if settings is None or settings.mode == "agentic":
+            return None, ""
+        project = native_project()
+        context = plan.tasks.get(task.id)
+        if project is None:
+            return None, "inline execution needs a native project"
+        if context is None or not context.edits:
+            return None, "the plan has no edit ranges for this task"
+        root = Path(project.workspace)
+        if settings.mode == "auto" and any(
+                edit.start_line is None and (root / edit.file).exists()
+                for edit in context.edits):
+            return None, "a planned edit of an existing file has no lines"
+        used = {*context.edit_files(), *context.reference_files()}
+        positions: dict[str, int] = {}
+        for event in prior_events:
+            if event["task_id"] == task.id:
+                continue
+            if (event["task_id"] in context.depends_on
+                    or (event["kind"] == "changed_files"
+                        and used.intersection(event.get("payload") or ()))):
+                positions[event["task_id"]] = event["position"]
+        preimages = getattr(self.persistence, "rollback_preimages", None)
+        changes = ({task_id: await preimages(job_id, [position])
+                    for task_id, position in positions.items()} if preimages else {})
+        source = materialize(context, root, margin=self._margin(),
+                             budget=settings.context_chars,
+                             extra=earlier_task_references(task.id, changes, root))
+        if not source.fits:
+            return None, (f"its source ({source.chars} chars) exceeds "
+                          f"inline_context_chars ({settings.context_chars})")
+        return InlineRequest(project, context, source,
+                             await self._inline_checks(context, project),
+                             settings.fix_rounds, self._margin(),
+                             settings.lint_command), ""
+
+    def _inline_review_references(self, plan: ApprovedWPPlan,
+                                  reviewed: list[str] | None) -> str | None:
+        """The reviewed tasks' reference source for an inline (tool-free) review, or None
+        when the review keeps its tools: agentic mode, no native project, or too much."""
+        settings = getattr(self.config, "inline", None)
+        project = native_project()
+        if settings is None or settings.mode == "agentic" or project is None:
+            return None
+        references = [ref for task_id, context in plan.tasks.items()
+                      if reviewed is None or task_id in reviewed
+                      for ref in context.references]
+        source = materialize(TaskContext("REVIEW", "", references=references),
+                             project.workspace, budget=settings.context_chars)
+        return source.text if source.fits else None
+
+    async def _inline_checks(self, context, project) -> tuple[str, ...]:
+        """Commands for the task's expected tests: explicit commands as written, test
+        paths (`tests/test_x.py` or `...::test_y`) as one pytest run."""
+        root = Path(project.workspace)
+        commands: list[str] = []
+        paths: list[str] = []
+        for entry in context.expected_tests:
+            text = entry.strip().strip("`")
+            first = text.split(maxsplit=1)[0].rstrip(":,;") if text else ""
+            if re.fullmatch(r"pytest|py\.test|uv|python3?|npm|pnpm|yarn|go|make|cargo|"
+                            r"ruff|mypy|\.venv/\S+", first):
+                commands.append(text)
+                continue
+            path = first.split("::", 1)[0]
+            if (path.endswith(".py") and ".." not in path.split("/")
+                    and ((root / path).is_file() or path in context.edit_files())
+                    and first not in paths):
+                paths.append(first)
+        if paths:
+            commands.append("pytest " + " ".join(shlex.quote(path) for path in paths))
+        return tuple([await self._project_test_command(None, command, project)
+                      for command in dict.fromkeys(commands)])
+
     async def _approved_plan(self, job_id: str) -> ApprovedWPPlan | None:
         """The approved WP plan this job executes, if it came from the planner."""
         lookup = getattr(self.persistence, "job_plan_id", None)
@@ -228,7 +311,8 @@ class ImplementationService:
             events.append(("changed_files", ", ".join(changed), changed))
             context = plan.tasks.get(task_id)
             planned = {*plan.shared.relevant_files,
-                       *(context.relevant_files if context else ())}
+                       *((*context.relevant_files, *context.edit_files())
+                         if context else ())}
             outside = [path for path in changed if path not in planned]
             if outside:
                 events.append(("deviations", "changed files not named in the plan: "
@@ -649,6 +733,16 @@ class ImplementationService:
                 item.job_id, item.position, "running", decision_id=decision_id
             )
 
+        inline, agentic_reason = ((await self._inline_request(plan, task, item.job_id,
+                                                              prior_events))
+                                  if plan is not None else (None, ""))
+        if inline is not None:
+            yield TextEvent(ui.block(
+                f"_inline: {len(inline.source.regions)} source region(s), "
+                f"{inline.source.chars} chars; checks: "
+                f"{', '.join(inline.checks) or 'none'}_"))
+        elif agentic_reason:
+            yield TextEvent(ui.block(f"_agentic: {agentic_reason}_"))
         tracked_handlers = journal_handlers(
             self.persistence, item.job_id, item.position, specs, direct_tool_handlers,
             declared_artifacts("\n".join((
@@ -673,7 +767,8 @@ class ImplementationService:
                   }, **({"plan_context": coder_context(
                          plan, task.id, prior_events, task.description, self._margin()),
                          "exploration_scope": tuple(task_files(plan, task.id)),
-                         "exploration_read_only": tuple(task_read_only_files(plan, task.id))}
+                         "exploration_read_only": tuple(task_read_only_files(plan, task.id)),
+                     **({"inline": inline} if inline is not None else {})}
                      if plan else {"handoff_context": unplanned_context})):
             if routed is not None and not announced:
                 announced = True
@@ -1018,6 +1113,10 @@ class ImplementationService:
                     if reviewed is None or task_id in reviewed for edit in context.edits))
                 object.__setattr__(review_task, "_planner_relevant_files",
                                    tuple(dict.fromkeys(planned_files)))
+                references = self._inline_review_references(plan, reviewed)
+                if references is not None:
+                    object.__setattr__(review_task, "_review_tool_free", True)
+                    object.__setattr__(review_task, "_review_reference_source", references)
             if isinstance(self.reviewer, ReviewService):
                 progress_queue: asyncio.Queue[str | None] = asyncio.Queue()
                 outcome: dict = {}

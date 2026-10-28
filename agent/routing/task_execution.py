@@ -9,10 +9,12 @@ from collections.abc import Awaitable, Callable
 
 import providers
 
-from agent.prompt import CoderPromptContext, PromptFactory, PromptRole
+from agent.prompt import (CoderPromptContext, InlineCoderPromptBuilder,
+                          InlineCoderPromptContext, PromptFactory, PromptRole)
 from agent.routing.config import RoutingConfig, load_routing_config
 from agent.routing.evidence import is_verification_call, verification_succeeded
 from agent.routing.gateway import brief_failure, gateway_attempts, same_credential_limit
+from agent.routing.inline_execution import InlineCoder, InlineOutcome, InlineRequest
 from agent.routing.executors.registry import ExecutorRegistry
 from agent.routing.models import ExecutionContext, ExecutionDecision
 from agent.routing.persistence import RoutingPersistence
@@ -55,6 +57,7 @@ class TaskExecutionService:
                       handoff_context: str = "",
                       exploration_scope: tuple[str, ...] = (),
                       exploration_read_only: tuple[str, ...] = (),
+                      inline: InlineRequest | None = None,
                       ) -> AsyncIterator[Event]:
         # The active project belongs to the IDE request that advertised `specs`.
         # Never route through a process-wide IDE/project setting.
@@ -69,6 +72,22 @@ class TaskExecutionService:
         await self.persistence.record_decision(decision)
         if on_decision is not None:
             await on_decision(decision)
+        excluded_files = tuple(getattr(contract, "excluded_files", ()) or ())
+        if inline is not None:
+            outcome = InlineOutcome()
+            prompt = InlineCoderPromptBuilder().with_context(InlineCoderPromptContext(
+                task, inline.source.text, inline.edit_files, execution_instruction, contract,
+                plan_context, inline.checks)).build().user_message()
+            prefix = [message for message in messages[:-1] if message.get("role") == "system"]
+            async for event in InlineCoder(self.config, self.persistence, self.executors,
+                                           self.router.health).run(
+                    task, decision, inline, [*prefix, prompt], owner_metadata or {},
+                    excluded_files, outcome):
+                yield event
+            if outcome.fallback is None:
+                return
+            yield ProgressEvent(f"- ↩️ inline: {outcome.fallback}; continuing as a "
+                                "tool-using session from the current files\n")
         discovery = getattr(self.config, "discovery", None)
         policy = getattr(discovery, "policy", "selective")
         # Native attempts delegate exploration (within the planner-assigned files) and long
@@ -95,7 +114,7 @@ class TaskExecutionService:
                     task, messages, execution_instruction, contract, plan_context,
                     handoff_context,
                     native=True, kb_policy=policy, subagent_request=subagent_request),
-                excluded_files=tuple(getattr(contract, "excluded_files", ()) or ()),
+                excluded_files=excluded_files,
                 subagent_request=subagent_request):
             yield event
 

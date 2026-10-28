@@ -4,7 +4,8 @@
 """
 
 from agent.prompt.base import Prompt, PromptBuilder, PromptRole
-from agent.prompt.coder import CoderPromptBuilder, CoderPromptContext
+from agent.prompt.coder import (CoderPromptBuilder, CoderPromptContext,
+                                InlineCoderPromptBuilder, InlineCoderPromptContext)
 from agent.prompt.factory import PromptFactory
 from agent.prompt.planner import PlannerPromptBuilder, PlannerPromptContext
 from agent.prompt.reviewer import ReviewerPromptBuilder, ReviewerPromptContext
@@ -13,6 +14,7 @@ from agent.prompt.subagents import (ChecksPromptBuilder, ChecksPromptContext,
 
 __all__ = [
     "ChecksPromptBuilder", "ChecksPromptContext", "CoderPromptBuilder", "CoderPromptContext",
+    "InlineCoderPromptBuilder", "InlineCoderPromptContext",
     "PlannerPromptBuilder", "PlannerPromptContext", "Prompt", "PromptBuilder",
     "PromptFactory", "PromptRole", "ReaderPromptBuilder", "ReaderPromptContext",
     "ReviewerPromptBuilder", "ReviewerPromptContext",

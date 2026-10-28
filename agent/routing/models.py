@@ -64,6 +64,8 @@ class ExecutionContext:
     subagents: Any | None = None
     # Claude prompt-cache TTL for this attempt: "5m" forces 5-minute cache writes.
     prompt_cache_ttl: str = ""
+    # An inline call: no tools of any kind (no IDE, KB, native or agent-interface tools).
+    tool_free: bool = False
 
 
 @dataclass(frozen=True)

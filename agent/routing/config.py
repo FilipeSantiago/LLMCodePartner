@@ -119,6 +119,24 @@ class SubagentConfig:
     enforce_scope: bool = True
 
 
+CODER_MODES = ("agentic", "inline", "auto")
+
+
+@dataclass(frozen=True)
+class InlineConfig:
+    """Inline execution (`execution.coder_mode`): the coder and reviewer get the plan's
+    current source in the prompt and no tools; CodePartner applies the coder's edits and
+    runs the checks. agentic: always the tool-using CLI session. inline: inline whenever
+    the task has a plan whose source fits `context_chars`. auto: inline only when every
+    planned edit has lines (or is a new file) as well."""
+    mode: str = "agentic"
+    # Corrective calls after rejected edits or failing checks, per task attempt.
+    fix_rounds: int = 2
+    context_chars: int = 120_000
+    # Run after the edits with `{files}` replaced by the changed paths; empty: none.
+    lint_command: str = ""
+
+
 @dataclass(frozen=True)
 class RoutingConfig:
     models: dict[str, ModelRef]
@@ -134,6 +152,7 @@ class RoutingConfig:
     subagents: SubagentConfig = field(default_factory=SubagentConfig)
     # Claude coder prompt-cache TTL (`execution.prompt_cache_ttl`); see PlannerConfig.
     execution_cache_ttl: str = "5m"
+    inline: InlineConfig = field(default_factory=InlineConfig)
 
     def candidates_for(self, complexity: str) -> tuple[str, ...]:
         try:
@@ -251,7 +270,24 @@ def load_routing_config(path: Path | str | None = None) -> RoutingConfig:
         router_timeout_seconds=float(runtime.get("router_timeout_seconds", 10)),
         failure_threshold=int((raw.get("health") or {}).get("failure_threshold", 2)),
         execution_cache_ttl=execution_cache_ttl,
+        inline=_inline_config(execution),
     )
+
+
+def _inline_config(execution: dict) -> InlineConfig:
+    mode = execution.get("coder_mode", InlineConfig.mode)
+    if mode not in CODER_MODES:
+        raise RoutingConfigError(f"execution coder_mode must be one of {CODER_MODES}")
+    fix_rounds = execution.get("inline_fix_rounds", InlineConfig.fix_rounds)
+    if isinstance(fix_rounds, bool) or not isinstance(fix_rounds, int) or fix_rounds < 0:
+        raise RoutingConfigError("execution inline_fix_rounds must be a non-negative integer")
+    chars = execution.get("inline_context_chars", InlineConfig.context_chars)
+    if not _positive(chars):
+        raise RoutingConfigError("execution inline_context_chars must be a positive integer")
+    lint = execution.get("inline_lint_command", "") or ""
+    if not isinstance(lint, str):
+        raise RoutingConfigError("execution inline_lint_command must be a string")
+    return InlineConfig(mode, fix_rounds, chars, lint.strip())
 
 
 def _role_floors(raw: object) -> dict[str, int]:

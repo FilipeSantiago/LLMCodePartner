@@ -312,13 +312,14 @@ class CodexProvider(Provider):
             args = self._base_args(model, gateway_url, concrete_model, reasoning_effort,
                                    reviewer_mode, native,
                                    role_args(children, roles, request))
-            if hosted_planner or hosted_reader_child:
+            tool_free = bool(run.metadata.get("tool_free"))
+            if hosted_planner or hosted_reader_child or tool_free:
                 args += ["-c", "mcp_servers={}", "-c", "features.apps=false",
                          "-c", "features.plugins=false", "-c", "features.browser_use=false",
                          "-c", "features.computer_use=false"]
             args += self._mcp_args(url, run.registry.names(), reviewer_mode,
                                    preapprove_ide_tools)
-            if hosted_planner or hosted_reader_child:
+            if hosted_planner or hosted_reader_child or tool_free:
                 # Added after CODEX_ARGS so a local override cannot restore the
                 # parent shell; the separate reader process gets its own config.
                 args += ["-c", "features.shell_tool=false"]

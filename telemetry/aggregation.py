@@ -40,6 +40,10 @@ _TASK_SUBAGENT_KEYS = ("reader_calls", "checks_calls", "requests_without_paths",
                        "missing_context_reported", "empty_briefs", "brief_bytes")
 # Parent reads outside the plan's files, and the scope exceptions it stated.
 _TASK_SCOPE_KEYS = ("out_of_scope_reads", "scope_exceptions")
+# Inline attempts (`agent.routing.inline_execution`): tool-free model calls and their
+# corrective rounds; zero for native runs.
+_TASK_INLINE_KEYS = ("llm_calls", "fix_rounds", "patch_apply_failures",
+                     "need_context_requests", "fallback_to_agentic", "checks_failed_final")
 
 
 class TelemetryAggregation:
@@ -74,7 +78,8 @@ class TelemetryAggregation:
         }
 
     def task_comparison(self, job_ids: list[str]) -> dict:
-        """Per-task A/B totals of native runs, grouped by `exploration_mode`.
+        """Per-task A/B totals of native and inline runs, grouped by `exploration_mode`
+        (an inline attempt's mode is "inline").
 
         One row per (job, task) sums every recorded attempt of that task (coder retries
         and fallbacks on either provider; a WP review is its own row): normalized token
@@ -93,16 +98,18 @@ class TelemetryAggregation:
         result: dict[str, dict] = {}
         for job_id, task_id, provider, model, metrics_json, usage_json, cost in rows:
             metrics = json.loads(metrics_json)
-            if metrics.get("execution_mode") != "native":
+            if metrics.get("execution_mode") not in {"native", "inline"}:
                 continue
             exploration = metrics.get("exploration") or {}
-            mode = metrics.get("exploration_mode") or exploration.get("mode") or "unknown"
+            mode = ("inline" if metrics["execution_mode"] == "inline" else
+                    metrics.get("exploration_mode") or exploration.get("mode") or "unknown")
             row = result.setdefault(job_id, {}).setdefault(task_id or "?", {}).setdefault(
                 mode, {"attempts": 0, "providers": [], "cost_usd": 0.0, "cost_complete": True,
                        **{key: 0 for key in _TASK_USAGE_KEYS},
                        **{key: 0 for key in _TASK_EXPLORATION_KEYS},
                        **{key: 0 for key in _TASK_SUBAGENT_KEYS},
-                       **{key: 0 for key in _TASK_SCOPE_KEYS}})
+                       **{key: 0 for key in _TASK_SCOPE_KEYS},
+                       **{key: 0 for key in _TASK_INLINE_KEYS}})
             row["attempts"] += 1
             if f"{provider}:{model}" not in row["providers"]:
                 row["providers"].append(f"{provider}:{model}")
@@ -119,6 +126,8 @@ class TelemetryAggregation:
                 row[key] += (metrics.get("subagents") or {}).get(key) or 0
             row["out_of_scope_reads"] += len(metrics.get("out_of_scope_reads") or ())
             row["scope_exceptions"] += metrics.get("scope_exceptions") or 0
+            for key in _TASK_INLINE_KEYS:
+                row[key] += int(metrics.get(key) or 0)
         for tasks in result.values():
             for modes in tasks.values():
                 for row in modes.values():

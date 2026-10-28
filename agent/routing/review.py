@@ -1184,7 +1184,10 @@ class ReviewService:
             raise ReviewError("could not resolve project-root path assumption(s): "
                               + ", ".join(f"{item['claimed_path']} -> {item['path']}"
                                           for item in unresolved_roots[:3]))
-        reader_offered = native_root is not None and subagents.enabled()
+        # Inline review: the service's snapshot and reference source are the whole
+        # evidence, and the model pass gets no tools.
+        tool_free = bool(getattr(task, "_review_tool_free", False))
+        reader_offered = native_root is not None and subagents.enabled() and not tool_free
         messages = [PromptFactory.create(PromptRole.REVIEWER).with_context(ReviewerPromptContext(
             task, change.title, native=native_root is not None, reader_offered=reader_offered,
             workspace=native_root or "",
@@ -1199,11 +1202,14 @@ class ReviewService:
             optional_failures=optional_failures, read_outcomes=read_outcomes,
             unresolved=unresolved,
             unincluded_paths=[path for path in candidates if path not in selected_paths],
+            tool_free=tool_free,
+            reference_source=getattr(task, "_review_reference_source", "") if tool_free else "",
         )).build().user_message()]
         provider = providers.get(model.provider)
         kwargs = {"model": model.cli_model, "role": ROLE_OPTIMIZER,
-                  "direct_tool_handlers": review_handlers,
+                  "direct_tool_handlers": {} if tool_free else review_handlers,
                   "run_metadata": {"reviewer": True, "reviewer_model": reviewer_name,
+                                   **({"tool_free": True} if tool_free else {}),
                                    "enforce_scope": getattr(self.config.subagents,
                                                             "enforce_scope", True),
                                    "edit_files": list(mutation_paths),
@@ -1231,7 +1237,7 @@ class ReviewService:
                 invalid_tool_call = False
                 usage = None
                 native = (read_only_session(native_plan.project)
-                          if native_root is not None else None)
+                          if native_root is not None and not tool_free else None)
                 attempt_kwargs = {**kwargs,
                                   "native": native,
                                   "subagents": (self._reviewer_subagents(mutation_paths)
@@ -1243,7 +1249,7 @@ class ReviewService:
                 try:
                     model_running = True
                     async for event in provider.tools(
-                            conversation, specs, **attempt_kwargs):
+                            conversation, [] if tool_free else specs, **attempt_kwargs):
                         if isinstance(event, TextEvent):
                             parts.append(event.text)
                         elif isinstance(event, ErrorEvent):

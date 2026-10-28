@@ -46,6 +46,18 @@ roles:
 # a checks run longer than 5 minutes costs one cache rewrite.
 execution:
   prompt_cache_ttl: 5m
+  # agentic: the coder is a tool-using CLI session that reads and edits files itself.
+  # inline: a planned task's current source goes into the prompt; the coder and reviewer
+  # get no tools and reply once, CodePartner applies the edits and runs the checks.
+  # auto: inline only when every planned edit has exact lines. Unplanned tasks, IDE
+  # (non-native) projects and oversized context always run agentic.
+  coder_mode: ${CODEPARTNER_CODER_MODE:-agentic}
+  # Corrective calls after rejected edits or failing checks, per inline attempt.
+  inline_fix_rounds: 2
+  # Prompt source budget; a larger task runs agentic.
+  inline_context_chars: 120000
+  # Optional lint after inline edits; {files} becomes the changed paths.
+  inline_lint_command: ""
 
 # Work Package planner (codepartner-plan mode). Routed by WP complexity.
 planner:

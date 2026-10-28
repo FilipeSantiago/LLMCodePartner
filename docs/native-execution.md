@@ -333,7 +333,8 @@ one-tool request needs 1–3 turns).
 - Per completed task: `TelemetryAggregation.task_comparison(job_ids)` sums every attempt of
   a task (retries and fallbacks, both providers; a WP review is its own row) by
   `exploration_mode`: normalized tokens including `cache_read_tokens`, `cost_usd` (None when
-  any attempt reported no cost, as Codex does), and the counters above.
+  any attempt reported no cost, as Codex does), and the counters above. Inline attempts
+  (docs/inline-execution.md) appear under the mode `inline`, with their call counters.
   `aci_comparison` labels reader runs `+explore:reader`.
 
 ### What is and is not isolated

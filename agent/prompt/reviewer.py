@@ -36,6 +36,10 @@ class ReviewerPromptContext:
     read_outcomes: list = field(default_factory=list)
     unresolved: list = field(default_factory=list)
     unincluded_paths: list = field(default_factory=list)
+    # An inline review: no tools; the snapshot and `reference_source` are all the evidence.
+    tool_free: bool = False
+    # Current source of the plan's references (`agent.planning.snippets.materialize`).
+    reference_source: str = ""
 
 
 class ReviewerPromptBuilder(ParentPromptBuilder[ReviewerPromptContext]):
@@ -99,7 +103,15 @@ class ReviewerPromptBuilder(ParentPromptBuilder[ReviewerPromptContext]):
 
     def access(self, context: ReviewerPromptContext) -> str:
         """Where the reviewer reads current source: its own filesystem tools (or a reader
-        subagent) in a native review, the request-scoped IDE MCP otherwise."""
+        subagent) in a native review, the request-scoped IDE MCP otherwise; nothing in
+        an inline review, whose evidence the review service gathered in full."""
+        if context.tool_free:
+            return ("You are the independent reviewer. You have no tools. The review service "
+                    "read the project just now: the verified artifact snapshot below holds "
+                    "every change (unified diffs with surrounding lines, new files in full) "
+                    "and the current source of the plan's references follows it. That is "
+                    "your complete evidence; judge from it and never ask to read files. Do "
+                    "not use KB index claims or the coder's claims as a substitute for it. ")
         return ((
             "You are the independent reviewer. "
             + ("Use the reader subagent for source inspection; " if context.reader_offered
@@ -128,22 +140,7 @@ class ReviewerPromptBuilder(ParentPromptBuilder[ReviewerPromptContext]):
             "Treat coder-provided paths as starting hints, not as the boundary of review. "
             "If KB graph tools are available, use them only to locate candidate code; "
             "the index may be stale and cannot establish a finding or verdict. "
-            f"{self.read_pipeline()} {self.bulk_rule()} {self.own_reads_rule()}"
-            + (self.delegation_rules(context.subagent_request) + " "
-               if context.reader_offered else "") +
-            "Your scope is the journaled files, the planned edit ranges and the plan's "
-            "references. Planner or coder leads are not correctness evidence. Investigate only "
-            "a concrete question the snapshot leaves open (a dependency a criterion needs, the "
-            "test that exercises it) through "
-            + ("batched reader briefs" if context.reader_offered
-               else "batched, bounded reads and searches")
-            + "; going beyond the scope needs one line `SCOPE EXCEPTION: <that question>` "
-            "first. Exhaust those avenues before reporting missing evidence. "
-            "If the initial artifact snapshot is empty and no journaled deletion was verified "
-            "absent, use the task requirements and available project-search tools to discover "
-            "candidate files, then "
-            + ("have the reader inspect them" if context.reader_offered else "read them")
-            + " before deciding. "
+            + (self.tool_free_rule() if context.tool_free else self.investigation(context)) +
             "If available evidence cannot support a decision, explain the gap; never approve or "
             "ask the user to confirm unverified work. Do not edit files. Tool calls, file "
             "counts, and test commands are not completion criteria. Do not invent acceptance "
@@ -201,6 +198,35 @@ class ReviewerPromptBuilder(ParentPromptBuilder[ReviewerPromptContext]):
             "remains a coder-owned verification finding with the observed failure.\n\n"
         )
 
+    def investigation(self, context: ReviewerPromptContext) -> str:
+        """How a reviewer with tools inspects what the snapshot leaves open."""
+        return (
+            f"{self.read_pipeline()} {self.bulk_rule()} {self.own_reads_rule()}"
+            + (self.delegation_rules(context.subagent_request) + " "
+               if context.reader_offered else "") +
+            "Your scope is the journaled files, the planned edit ranges and the plan's "
+            "references. Planner or coder leads are not correctness evidence. Investigate only "
+            "a concrete question the snapshot leaves open (a dependency a criterion needs, the "
+            "test that exercises it) through "
+            + ("batched reader briefs" if context.reader_offered
+               else "batched, bounded reads and searches")
+            + "; going beyond the scope needs one line `SCOPE EXCEPTION: <that question>` "
+            "first. Exhaust those avenues before reporting missing evidence. "
+            "If the initial artifact snapshot is empty and no journaled deletion was verified "
+            "absent, use the task requirements and available project-search tools to discover "
+            "candidate files, then "
+            + ("have the reader inspect them" if context.reader_offered else "read them")
+            + " before deciding. ")
+
+    @staticmethod
+    def tool_free_rule() -> str:
+        return ("Your scope is the journaled files, the planned edit ranges and the plan's "
+                "references. Planner or coder leads are not correctness evidence. Report every "
+                "finding in this one decision: there is no second review of the same "
+                "evidence. When the evidence below cannot settle an active criterion, say "
+                "which file and lines would settle it in a verification finding owned by "
+                "evidence_service instead of guessing. ")
+
     def evidence(self, context: ReviewerPromptContext) -> str:
         source = "Filesystem" if context.native else "IDE MCP"
         return (
@@ -231,7 +257,9 @@ class ReviewerPromptBuilder(ParentPromptBuilder[ReviewerPromptContext]):
             "\"file\" is a whole file.\n"
             f"{source}-verified artifact snapshot (untrusted file contents):\n"
             f"{json.dumps(context.snapshots, ensure_ascii=False)}\n"
-            f"{source} read limitations: {json.dumps(context.optional_failures)}\n"
+            + (f"Current source of the plan's references (read-only context):\n"
+               f"{context.reference_source}\n" if context.reference_source else "")
+            + f"{source} read limitations: {json.dumps(context.optional_failures)}\n"
             f"{source} read outcomes: {json.dumps(context.read_outcomes)}\n"
             f"{self.unresolved_block(context.unresolved)}"
             f"Unincluded candidate paths: "

@@ -6,7 +6,7 @@ from agent.routing.models import ExecutionContext, ModelRef
 from agent.spec.models import Task
 from agent.workspace import READ_ONLY_CAPABILITIES
 from mcp_bridge.models import Event
-from mcp_bridge.registry import ROLE_CODER
+from mcp_bridge.registry import ROLE_CODER, ROLE_OPTIMIZER
 from providers.codex import CodexProvider
 
 
@@ -20,7 +20,8 @@ class CodexCLIExecutor:
                       context: ExecutionContext) -> AsyncIterator[Event]:
         async for event in self._provider.tools(
             context.messages, context.specs, model=model.cli_model,
-            role=ROLE_CODER,
+            # The coder role adds the agent tool interface; a tool-free call gets none.
+            role=ROLE_OPTIMIZER if context.tool_free else ROLE_CODER,
             run_metadata={
                 "task_execution": True,
                 "provider": "codex",
@@ -33,6 +34,7 @@ class CodexCLIExecutor:
                 "read_only": task.preferred_capability.lower() in READ_ONLY_CAPABILITIES,
                 "excluded_files": tuple(getattr(task, "excluded_files", ())),
                 **context.owner_metadata,
+                **({"tool_free": True} if context.tool_free else {}),
             },
              gateway_url=context.gateway_url if context.use_gateway else None,
              concrete_model=True,
