@@ -20,11 +20,12 @@ BIN = Path("/usr/local/bin/codebase-memory-mcp")
 DATA = Path("/var/lib/codebase-memory-mcp")
 SOCKET_DIR = Path("/run/kb-bridge")
 SOCKET = SOCKET_DIR / "mcp.sock"
-# Versions whose scout profile, storage layout and daemon are known to work; the
+# Versions whose analysis profile, storage layout and daemon are known to work; the
 # REQUIRED tool check below still guards each start.
 SUPPORTED_VERSION = re.compile(rb"codebase-memory-mcp 0\.(?:11\.0|12\.\d+)")
 REQUIRED = {"list_projects", "index_status", "get_architecture", "search_graph",
             "trace_path", "get_file_outline", "get_code_snippet"}
+_PROFILE = "analysis"
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s kb-bridge %(message)s")
@@ -49,18 +50,27 @@ def validate_paths() -> tuple[int, int]:
 
 def upstream() -> StdioTransport:
     return StdioTransport(
-        command=str(BIN), args=["--tool-profile=scout"],
+        command=str(BIN), args=([f"--tool-profile={_PROFILE}"] if _PROFILE else []),
         env={"CBM_CACHE_DIR": str(DATA), "CBM_LOG_LEVEL": "info"},
     )
 
 
 async def check_upstream() -> None:
-    async with Client(upstream()) as client:
-        names = {tool.name for tool in await client.list_tools()}
-        missing = REQUIRED - names
-        if missing:
-            raise RuntimeError("Codebase Memory is missing tools: " + ", ".join(sorted(missing)))
-        await client.call_tool("list_projects", {"format": "json", "limit": 1})
+    global _PROFILE
+    for profile in ([_PROFILE, ""] if _PROFILE else [""]):
+        _PROFILE = profile
+        async with Client(upstream()) as client:
+            names = {tool.name for tool in await client.list_tools()}
+            missing = REQUIRED - names
+            if missing and profile:
+                log.warning("analysis profile lacks %s; trying planner allowlist on full profile",
+                            ", ".join(sorted(missing)))
+                continue
+            if missing:
+                raise RuntimeError("Codebase Memory is missing tools: "
+                                   + ", ".join(sorted(missing)))
+            await client.call_tool("list_projects", {"format": "json", "limit": 1})
+            return
 
 
 async def health() -> int:

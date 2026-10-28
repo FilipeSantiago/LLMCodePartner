@@ -11,6 +11,7 @@
 // Transports: `--stdio` (local backend) or `--socket <path>` (sidecar).
 // `--health <path>` probes a running sidecar and exits 0 when it answers.
 
+import { unlinkSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import net from "node:net";
 import { dirname, join } from "node:path";
@@ -79,6 +80,15 @@ if (flag === "--stdio") {
 		socket.on("error", () => socket.destroy());
 	});
 	process.umask(0o007);
+	// The socket lives in a shared volume, so a container that was killed or recreated
+	// leaves its file behind and listen() fails with EADDRINUSE. Only this one bridge
+	// serves the volume, so a file present at startup is always stale.
+	// unlink needs only the write permission this process has (rm also stats the path).
+	try {
+		unlinkSync(value);
+	} catch (error) {
+		if (error.code !== "ENOENT") throw error;
+	}
 	server.listen(value, () => process.stderr.write(`compress-bridge ${VERSION} listening on ${value}\n`));
 	for (const signal of ["SIGTERM", "SIGINT"]) process.on(signal, () => server.close(() => process.exit(0)));
 } else if (flag === "--health" && value) {
