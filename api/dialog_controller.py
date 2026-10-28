@@ -54,7 +54,6 @@ from agent.spec.modes import request_shape
 from agent.spec.refinement import RefinementError, RefinementService
 from agent.spec.bridge_client import BridgeMcpFileClient, DirectMcpFileClient
 from agent import workspace
-from agent.kb_first import KbFirstPolicy, enforced_reads
 from agent.spec.filesystem_client import FilesystemFileClient
 from agent.spec.ide_mcp_sessions import (
     bind_workspace, claim_bootstrap_replay, configure_session, conversation_for_request,
@@ -68,7 +67,9 @@ from agent.spec.implementation_intent import selectors_in_text
 from agent.workflow.controller import (WorkflowController, parse_decision,
                                        BARE_CONFIRM, BARE_REJECT, PASSTHROUGH_ACTIONS,
                                        PLAN_APPROVAL, PLAN_DISCUSS, PlanStart)
+from agent.planning.models import WPPlanDraft
 from agent.planning.render import render_plan
+from agent.routing.review import model_identity
 from agent.planning.service import PlanningError, WPPlannerService, with_progress
 from agent.planning.knowledge_base import (KnowledgeBaseError, configured_execution_tools,
                                            catch_up_index, configured_planner_tools,
@@ -93,6 +94,7 @@ from mcp_bridge.models import DoneEvent, ErrorEvent, Event, TextEvent, ToolCallE
 from mcp_bridge.registry import ToolSpec
 from model.chat import ChatCompletionRequest, ChatCompletionResponse
 from logger.diagnostic import debug, new_trace_id
+from telemetry import tracing
 
 log = logging.getLogger("codepartner.api")
 
@@ -146,7 +148,27 @@ def _resume_service(run, session, active_specs):
         task_execution, task_execution.persistence, kb_refresh=_kb_refresher(session))
 
 
-def _kb_catch_up(session):
+async def _explained_plan(workflow, conversation_id: str) -> str:
+    """The detailed rendering of the plan under discussion, from its stored draft."""
+    session = await workflow.persistence.active_planning(conversation_id)
+    if session is None or session.get("draft") is None:
+        return "There is no plan to explain yet."
+    config = getattr(task_execution, "config", None)
+    try:
+        label = model_identity(config, session["planner_model"]).label
+    except Exception:
+        label = session["planner_model"]
+    return render_plan(
+        WPPlanDraft.from_dict(session["draft"], session["wp_id"], session["revision"]),
+        wp_complexity=session["wp_complexity"], planner_label=label,
+        gaps=session.get("gaps") or [], token=None,
+        queued_wp_ids=session.get("queued_wp_ids") or (), detail=True,
+        margin=getattr(getattr(config, "planner", None), "edit_margin_lines", 10))
+
+
+def _kb_catch_up(session, force: bool = False):
+    """Reindex when accepted edits are newer than the index; `force` always reindexes
+    (planning starts from a fresh index)."""
     if session is None or not getattr(session, "knowledge_base", None):
         return None
 
@@ -154,7 +176,7 @@ def _kb_catch_up(session):
         return await catch_up_index(
             task_execution.persistence, project_id, session.knowledge_base,
             getattr(session, "client", None), getattr(session, "project_path", None),
-            progress=progress)
+            progress=progress, force=force)
 
     return catch_up
 
@@ -200,6 +222,10 @@ async def _conversation_workflow_turn(request, messages, conversation_id, sessio
         return responder.reply(
             f"Planning for {closed['wp_id'] if closed else 'the work package'} closed. "
             "Nothing was implemented.", request.model, created)
+    if planning == "explain":
+        workflow.record_turn(conversation_id, "user", "planning", text, outcome="explain")
+        return responder.reply(await _explained_plan(workflow, conversation_id),
+                               request.model, created)
     if planning == "discuss":
         if PLAN_DISCUSS.fullmatch(text):
             return responder.reply(
@@ -475,7 +501,8 @@ def _plan_turn(request, workflow, session, active_specs, direct_handlers,
                 text,
             ))
             kb_context = ""
-            catch_up = _kb_catch_up(session)
+            # A new plan starts from a fresh index; revisions reuse it.
+            catch_up = _kb_catch_up(session, force=not discuss)
             if catch_up is not None:
                 async for kind, value in with_progress(lambda progress: catch_up(
                         getattr(session, "project_id", None),
@@ -583,15 +610,14 @@ class _NativeUnavailable(Exception):
     """Native execution is required for this conversation but cannot run."""
 
 
-def _chat_native(read_only: bool, controlled_reads: bool = False):
+def _chat_native(read_only: bool):
     """Native settings for a chat/workflow model turn of the active provider.
 
     Answers and `/review` are read-only sessions. Ad-hoc coding turns write without
     a change journal, exactly as their IDE-tool equivalent did; journaled
     writes belong to implementation jobs. None means the IDE path (`execution: ide`
     or `auto` without a usable workspace)."""
-    plan = workspace.plan_native(getattr(providers.active(), "NAME", None),
-                                 controlled_reads=controlled_reads)
+    plan = workspace.plan_native(getattr(providers.active(), "NAME", None))
     if plan.native:
         if read_only:
             return workspace.read_only_session(plan.project)
@@ -607,19 +633,11 @@ def _native_tools(read_only: bool, messages, specs, role, handlers, request, cre
                   prefix: str | None = None):
     """Stream one provider tool turn, natively when the conversation's project allows."""
     try:
-        discovery = load_routing_config().discovery
-        strict_reads = enforced_reads(discovery)
-        native = _chat_native(read_only, strict_reads)
+        native = _chat_native(read_only)
     except _NativeUnavailable as exc:
         return StreamingResponder().reply(str(exc), request.model, created)
-    policy = (KbFirstPolicy(role="coder" if role == ROLE_CODER else "reviewer",
-                            tool_names=[spec.name for spec in specs],
-                            outline_gate_lines=discovery.outline_gate_lines,
-                            enforce_reads=True)
-              if strict_reads else None)
     events = providers.active().tools(messages, specs, role=role,
-                                      direct_tool_handlers=handlers, native=native,
-                                      kb_first=policy)
+                                      direct_tool_handlers=handlers, native=native)
     if prefix is not None:
         events = _prefixed(prefix, events)
     return StreamingResponder().drain_events(events, request.model, created)
@@ -1035,6 +1053,7 @@ async def chat_completions(request: ChatCompletionRequest):
     # from earlier turns stay in the resent history of every later request.
     results = oreq.trailing_tool_results(request)
     conversation_id = conversation_for_request(request)
+    tracing.set_session(conversation_id)
     resumed_run = bridge.run_for(results[-1].tool_call_id) if results else None
     if (resumed_run is not None and resumed_run.metadata.get("mcp_bootstrap")
             and results):

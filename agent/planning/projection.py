@@ -11,16 +11,18 @@ from agent.planning.models import (
 )
 
 
-def validate_draft(draft: WPPlanDraft, task_ids: list[str]) -> list[str]:
-    """Return the gaps that keep this draft from being approvable (empty when complete)."""
+def validate_draft(draft: WPPlanDraft, task_ids: list[str],
+                   write_task_ids: list[str] | None = None) -> list[str]:
+    """Return the gaps that keep this draft from being approvable (empty when complete).
+
+    `write_task_ids` are the tasks that change files; each needs exact edit ranges."""
     gaps = []
     if not draft.summary:
         gaps.append("summary is empty")
-    if not draft.plan_markdown:
-        gaps.append("plan_markdown is empty")
     if not draft.shared.objective:
         gaps.append("shared.objective is empty")
     expected = [task_id.upper() for task_id in task_ids]
+    writing = {task_id.upper() for task_id in write_task_ids or ()}
     for task_id in expected:
         context = draft.tasks.get(task_id)
         if context is None:
@@ -30,6 +32,14 @@ def validate_draft(draft: WPPlanDraft, task_ids: list[str]) -> list[str]:
             gaps.append(f"tasks.{task_id}.objective is empty")
         if not context.approach:
             gaps.append(f"tasks.{task_id}.approach is empty")
+        if task_id in writing and not context.edits:
+            gaps.append(f"tasks.{task_id}.edits is empty: name the exact file lines to change "
+                        "(null lines for a new file)")
+        protected = set(context.do_not_modify) | set(draft.shared.do_not_modify)
+        blocked = sorted({path for path in context.edit_files() if path in protected})
+        if blocked:
+            gaps.append(f"tasks.{task_id}.edits target do-not-modify paths: "
+                        + ", ".join(blocked))
     unknown = sorted(set(draft.tasks) - set(expected))
     if unknown:
         gaps.append(f"tasks names unknown task ids: {', '.join(unknown)}")

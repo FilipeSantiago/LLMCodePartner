@@ -18,19 +18,25 @@ way for it to change the project is the IDE-backed write tools.
 This is the only module that shells out to `codex`.
 """
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import shlex
+import sys
+import tempfile
 from collections import Counter
 from collections.abc import AsyncIterator
+from dataclasses import asdict
+from pathlib import Path
 
 from mcp_bridge import mcp_http
 from mcp_bridge import server as engine
-from mcp_bridge.models import ErrorEvent, Event, Run, TextEvent
+from mcp_bridge.models import ErrorEvent, Event, ProgressEvent, Run, TextEvent
 from mcp_bridge.registry import ROLE_CODER, ToolSpec, allowed_for, native_bridged_specs
-from providers import compaction
+from providers import compaction, scope_guard, subagents
 from providers.base import Provider
+from telemetry import tracing
 
 log = logging.getLogger("codepartner.providers.codex")
 
@@ -48,6 +54,9 @@ _TIER_ENV = {
 
 # `codex exec --json` item types that mark a native context compaction.
 COMPACTION_ITEMS = frozenset({"context_compaction", "contextCompaction"})
+# Codex reports subagent spawns and waits as this item type; the child's own tool
+# calls never appear in the parent's stream.
+COLLAB_ITEM = "collab_tool_call"
 
 
 def parse_event(obj: dict) -> Event | None:
@@ -82,6 +91,10 @@ def usage_of(obj: dict) -> dict | None:
 def record_native_item(run: Run, item: dict) -> None:
     """Count a completed native codex item (shell command, file change, MCP call)."""
     kind = item.get("type")
+    if kind == "agent_message" and run.native is not None:
+        subagents.note_scope(run.metadata, run.metadata.setdefault(
+            "native_tool_metrics", run.native.metrics), text=item.get("text") or "")
+        return
     names = {"command_execution": "shell", "file_change": "file_change",
              "mcp_tool_call": str(item.get("tool") or "mcp")}
     if kind not in names:
@@ -92,12 +105,85 @@ def record_native_item(run: Run, item: dict) -> None:
     metrics["tools"][names[kind]] = metrics["tools"].get(names[kind], 0) + 1
     if kind == "mcp_tool_call" and names[kind].startswith("kb_"):
         metrics["kb_calls"] = metrics.get("kb_calls", 0) + 1
+    if kind == "command_execution":
+        reads = [read for read, _ in subagents.classify_command(item.get("command"))[1]]
+        subagents.note_scope(run.metadata, metrics, [
+            (run.native.relative(read) or read) if run.native is not None else read
+            for read in reads])
     for change in item.get("changes") or ():
         path = change.get("path") if isinstance(change, dict) else None
+        if isinstance(path, str) and run.native is not None:
+            path = run.native.relative(path) or path
         if isinstance(path, str) and path not in metrics["files"]:
             metrics["files"].append(path)
         if run.native is not None:
             run.native.record_write(path)
+
+
+def record_collab_item(tracker: subagents.Tracker, item: dict, briefed: set[str]
+                       ) -> list[str]:
+    """Count a completed subagent spawn, and each child's final reply once. Returns the
+    briefs newly received, for the progress lines."""
+    if item.get("type") != COLLAB_ITEM:
+        return []
+    if item.get("tool") == "spawn_agent":
+        # The item carries the request text but not the role name.
+        tracker.spawned(item.get("agent_type"), item.get("prompt"),
+                        background=bool(item.get("run_in_background") or item.get("async")),
+                        description=item.get("description"))
+    received = []
+    for thread, state in (item.get("agents_states") or {}).items():
+        message = state.get("message") if isinstance(state, dict) else None
+        if (isinstance(message, str) and message and thread not in briefed
+                and state.get("status") == "completed"):
+            briefed.add(thread)
+            tracker.brief(message)
+            received.append(message)
+    return received
+
+
+def progress_line(item: dict) -> str | None:
+    """The chat line for a native codex item as it starts: a shell command (reads shown
+    as reads) or a subagent request; None for anything else."""
+    kind = item.get("type")
+    if kind == "command_execution":
+        command = item.get("command")
+        verdict, reads = subagents.classify_command(command)
+        if verdict == "exact_read" and reads:
+            return "🔎 Reading " + ", ".join(f"`{path}`" for path, _ in reads[:4])
+        text = " ".join(str(command or "").split())
+        return f"🔎 Running `{text[:60]}{'…' if len(text) > 60 else ''}`"
+    if kind == COLLAB_ITEM and item.get("tool") == "spawn_agent":
+        return subagents.describe_spawn(item.get("agent_type") or subagents.READER,
+                                        item.get("prompt"))
+    return None
+
+
+def role_config(child: subagents.Subagent,
+                request: subagents.Request | None = None) -> str:
+    """One subagent's Codex role file on the configured reader model. JSON strings are
+    valid TOML basic strings."""
+    model, effort = (request.model_for(CodexProvider.NAME) if request is not None
+                     else (None, None))
+    lines = [f"model_reasoning_effort = {json.dumps(effort or 'low')}",
+             f"developer_instructions = {json.dumps(child.prompt)}"]
+    model = model or model_for("haiku")
+    if model:  # unset: the role inherits the parent's model
+        lines.insert(0, f"model = {json.dumps(model)}")
+    return "\n".join(lines) + "\n"
+
+
+def role_args(children: list[subagents.Subagent], directory: str,
+              request: subagents.Request | None = None) -> list[str]:
+    """`-c` flags defining this run's subagent roles; their files go in `directory`."""
+    args: list[str] = []
+    for child in children:
+        path = os.path.join(directory, f"{child.name}.toml")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(role_config(child, request))
+        args += ["-c", f"agents.{child.name}.description={json.dumps(child.description)}",
+                 "-c", f"agents.{child.name}.config_file={json.dumps(path)}"]
+    return args + ["-c", "agents.max_depth=1"] if args else args
 
 
 def model_for(model: str | None) -> str | None:
@@ -136,7 +222,7 @@ class CodexProvider(Provider):
                      direct_tool_handlers: dict | None = None,
                      reviewer_mode: bool = False,
                      preapprove_ide_tools: bool = False,
-                     kb_first=None, native=None,
+                     native=None, subagents=None,
                     **kwargs) -> AsyncIterator[Event]:
         """Stateful like Claude's, and for the same reason: the `codex` process stays
         alive across HTTP requests, blocked inside its MCP tool call, while JetBrains
@@ -165,10 +251,13 @@ class CodexProvider(Provider):
             run = engine.start_run(prompt, system, specs, strategy=strategy,
                                    allowed=allowed_for(role),
                                    direct_tool_handlers=direct_tool_handlers,
-                                   agent_tool_interface=role == ROLE_CODER and native is None)
+                                   agent_tool_interface=role == ROLE_CODER and native is None,
+                                   trace_kind="llm", trace_provider=self.NAME,
+                                   trace_model=model if concrete_model else model_for(model),
+                                   trace_reasoning_effort=reasoning_effort)
             run.metadata.update(run_metadata or {})
-            run.kb_first = kb_first
             run.native = native
+            run.subagents = subagents
 
         async for event in self._drain_queue(run):
             yield event
@@ -186,24 +275,93 @@ class CodexProvider(Provider):
         terminal reason. The MCP endpoint is opened and closed with the process, so a
         finished (or cancelled) run leaves nothing callable behind."""
         native = run.native
+        hosted_planner = bool(run.metadata.get("planner") and
+                              run.metadata.get("hosted_reader"))
+        hosted_reader_child = bool(run.metadata.get("hosted_reader") and not
+                                   run.metadata.get("planner"))
         if native is not None:
-            native.agent_can_write = True  # its shell can write even in a read-only run
-        async with mcp_http.serve_run(run) as url:
+            native.agent_can_write = not hosted_planner
+        request = getattr(run, "subagents", None)
+        children = subagents.resolve(request, native)
+        policy = scope_guard.policy_from_run(run, children)
+        if hosted_planner and "planner_reader" not in run.registry.names():
+            await run.put(ErrorEvent(
+                "Scoped Codex planner has no hosted reader; stopped before model execution."))
+            return "failed"
+        if policy is not None and policy.active:
+            # This CLI currently inherits the parent's disabled shell surface into
+            # reader children and exposes no child identity to PreToolUse. A hook
+            # cannot make that an access boundary, so do not start the model.
+            await run.put(ErrorEvent(
+                "Scoped Codex native execution cannot separate parent and reader file "
+                "access with this CLI; the run was stopped before model execution."))
+            return "failed"
+        tracker = (subagents.Tracker(native.metrics, request, offered=bool(children),
+                                     native=native)
+                   if native is not None else None)
+        if native is not None:
+            run.metadata["exploration_mode"] = "reader" if children else "off"
+        briefed: set[str] = set()
+        shows_progress = any(run.metadata.get(kind)
+                             for kind in ("task_execution", "planner", "reviewer"))
+        async with contextlib.AsyncExitStack() as stack:
+            # Role files live only as long as the process that reads them.
+            roles = (stack.enter_context(tempfile.TemporaryDirectory(
+                prefix="codepartner-agents-")) if children or policy is not None else "")
+            url = await stack.enter_async_context(mcp_http.serve_run(run))
             args = self._base_args(model, gateway_url, concrete_model, reasoning_effort,
-                                   reviewer_mode, native) + self._mcp_args(
-                                       url, run.registry.names(), reviewer_mode,
-                                       preapprove_ide_tools)
+                                   reviewer_mode, native,
+                                   role_args(children, roles, request))
+            if hosted_planner or hosted_reader_child:
+                args += ["-c", "mcp_servers={}", "-c", "features.apps=false",
+                         "-c", "features.plugins=false", "-c", "features.browser_use=false",
+                         "-c", "features.computer_use=false"]
+            args += self._mcp_args(url, run.registry.names(), reviewer_mode,
+                                   preapprove_ide_tools)
+            if hosted_planner or hosted_reader_child:
+                # Added after CODEX_ARGS so a local override cannot restore the
+                # parent shell; the separate reader process gets its own config.
+                args += ["-c", "features.shell_tool=false"]
+            if policy is not None:
+                policy_path = Path(roles) / "scope_policy.json"
+                policy_path.write_text(json.dumps(asdict(policy)))
+                hook_command = (f"{shlex.quote(sys.executable)} "
+                                f"{shlex.quote(str(Path(scope_guard.__file__).resolve()))} "
+                                f"{shlex.quote(str(policy_path))}")
+                hook = [{"matcher": "Agent|spawn_agent|collaborationspawn_agent|Bash|exec_command|shell|local_shell|apply_patch|Read|Grep|Glob",
+                         "hooks": [{"type": "command", "command": hook_command}]}]
+                args += ["-c", "features.hooks=true", "-c",
+                         "hooks.PreToolUse=" + json.dumps(hook),
+                         "--dangerously-bypass-hook-trust"]
+            if hosted_planner:
+                run.metadata["exploration_mode"] = "reader"
             run.metadata["context_compaction"] = compaction.requested(
                 "codex model_auto_compact_token_limit")
             item_types: Counter[str] = Counter()
             reviewer_tool_activity: list[dict[str, str | bool]] = []
+            turn_open = False
             async for obj in self._exec(args, self._join(prompt, system),
                                         env=native.env if native is not None else None,
                                         report_exit=native is not None):
+                if obj.get("type") == "turn.started":
+                    tracing.start_turn(run, model if concrete_model else model_for(model))
+                    turn_open = True
+                if (native is not None and shows_progress
+                        and obj.get("type") == "item.started"):
+                    line = progress_line(obj.get("item") or {})
+                    if line:
+                        await run.put(ProgressEvent(f"- {line}\n"))
                 if native is not None and obj.get("type") == "item.completed":
                     item = obj.get("item") or {}
                     record_native_item(run, item)
+                    if tracker is not None:
+                        for brief in record_collab_item(tracker, item, briefed):
+                            if shows_progress:
+                                await run.put(ProgressEvent(
+                                    f"- {subagents.describe_brief(None, brief)}\n"))
                     if item.get("type") == "command_execution":
+                        if tracker is not None:
+                            tracker.parent_command(item.get("command"))
                         code = item.get("exit_code")
                         await native.command_finished(
                             item.get("command"), item.get("aggregated_output"),
@@ -230,13 +388,38 @@ class CodexProvider(Provider):
                     await run.put(event)
                 usage = usage_of(obj)
                 if usage is not None:
-                    run.usage = usage
+                    if not turn_open:
+                        tracing.start_turn(run, model if concrete_model else model_for(model))
+                    tracing.record_turn_usage(run, usage)
+                    tracing.finish_turn(run)
+                    turn_open = False
+                    if run.usage is None:
+                        run.usage = dict(usage)
+                    else:
+                        for key, value in usage.items():
+                            if isinstance(value, int) and not isinstance(value, bool):
+                                run.usage[key] = run.usage.get(key, 0) + value
                     log.info("codex usage: role=%s model=%s usage=%s",
                              "reviewer" if reviewer_mode else "coder",
                              model_for(model) or "default", usage)
             if reviewer_mode:
                 log.info("codex_reviewer_activity model=%s item_types=%s mcp_tools=%s",
                          model or "default", dict(item_types), reviewer_tool_activity)
+            if policy is not None:
+                denial_file = Path(roles) / "scope_denials.jsonl"
+                if denial_file.exists():
+                    for line in denial_file.read_text().splitlines():
+                        try:
+                            tool = json.loads(line).get("tool") or "unknown"
+                        except json.JSONDecodeError:
+                            tool = "unknown"
+                        counts = native.metrics.setdefault("scope_denials", {})
+                        counts[tool] = counts.get(tool, 0) + 1
+        if children and native is not None:
+            # The parent's stream carries no per-child usage: only the parent's totals.
+            native.metrics["cost_attribution"] = {
+                "parent": dict(run.usage or {}), "subagents": None,
+                "method": "parent_only", "tokens_method": "parent_only"}
         return "endTurn"
 
     @staticmethod
@@ -258,7 +441,8 @@ class CodexProvider(Provider):
     def _base_args(self, model: str | None = None, gateway_url: str | None = None,
                     concrete_model: bool = False,
                     reasoning_effort: str | None = None,
-                    reviewer_mode: bool = False, native=None) -> list[str]:
+                    reviewer_mode: bool = False, native=None,
+                    subagent_args: list[str] | None = None) -> list[str]:
         """`codex exec` flags shared by both surfaces. Without `native`, `read-only`
         with no shell is the locked tool surface: codex may reason, but every read and
         write goes through the IDE tools. With `native`, codex works in the registered
@@ -286,6 +470,8 @@ class CodexProvider(Provider):
             ]
         # Native auto-compaction threshold; `CODEX_ARGS` below can still override it.
         args += compaction.codex_args()
+        # This run's subagent roles (`providers.subagents`); native runs only.
+        args += subagent_args or []
         # Escape hatch for CLI-level choices we don't model (`--oss`, `--profile`,
         # extra `-c` overrides).
         args += shlex.split(os.getenv("CODEX_ARGS", ""))

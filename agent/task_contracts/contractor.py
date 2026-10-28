@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 
+from agent.paths import paths_in
 from agent.spec.models import Task
 from agent.task_contracts.models import (
     AcceptanceCriterion, CoderOutcome, CoderResult, ContextFact,
@@ -16,7 +17,6 @@ from agent.task_contracts.policy import (
 )
 from mcp_bridge.registry import OP_SHELL_EXECUTE, ToolSpec, classify_tool
 
-_PATH = re.compile(r"(?<![\w/.-])(?:[\w.-]+/)*[\w.-]+\.[A-Za-z0-9]{1,12}(?![\w/-])")
 _SYMBOL = re.compile(r"`([A-Za-z_][A-Za-z0-9_.]{2,})`")
 _VERB = r"(?:read|touch|modify|inspect|use|change|edit|open)"
 _EXCLUSION = re.compile(
@@ -114,9 +114,16 @@ class TaskContractor:
         """`task_context` is an approved planner `TaskContext` for this task, if any."""
         policy = policy_for(task.complexity)
         text = "\n".join((task.title, task.description, task.context, instruction))
-        planned_paths = tuple(task_context.relevant_files) if task_context else ()
+        # An edit-range plan names its files in edits and references, not relevant_files.
+        planned_paths = (*(task_context.edit_files() if hasattr(task_context, "edit_files")
+                           else ()),
+                         *(task_context.relevant_files if task_context else ()))
+        references = tuple(dict.fromkeys(
+            path for path in (task_context.reference_files()
+                              if hasattr(task_context, "reference_files") else ())
+            if self._safe_path(path)))
         paths = tuple(dict.fromkeys(
-            path for path in (*_PATH.findall(text), *planned_paths) if self._safe_path(path)))
+            path for path in (*paths_in(text), *planned_paths) if self._safe_path(path)))
         symbols = tuple(dict.fromkeys((*_SYMBOL.findall(text),
                                        *(task_context.symbols if task_context else ()))))
         criteria = task.acceptance_criteria or [task.description]
@@ -151,7 +158,8 @@ class TaskContractor:
                 AcceptanceCriterion(f"AC{index}", criterion)
                 for index, criterion in enumerate(criteria, 1)),
             primary_files=() if read_only else paths, primary_symbols=symbols,
-            reference_files=(), known_context=context, allowed_tools=allowed,
+            reference_files=() if read_only else references, known_context=context,
+            allowed_tools=allowed,
             allowed_operations=operations, execution_limits=policy.limits,
             escalation_conditions=(
                 "A required file or symbol is outside the contract scope",

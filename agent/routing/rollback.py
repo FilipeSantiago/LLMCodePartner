@@ -185,6 +185,43 @@ def _oid(root: str, data: bytes) -> str:
     return _git(root, "hash-object", "--no-filters", "--stdin", data=data).decode().strip()
 
 
+# Preimages above this size are not kept; the reviewer then sees the whole file.
+_MAX_PREIMAGE_CHARS = 512_000
+
+
+def _preimage(content: str | None) -> str | None:
+    return content if content is not None and len(content) <= _MAX_PREIMAGE_CHARS else None
+
+
+def _read_preimages(root: str, paths: tuple[str, ...]) -> dict[str, str]:
+    """The current text of each existing regular file in `paths`."""
+    preimages = {}
+    for path in dict.fromkeys(paths):
+        info = _lstat(root, path)
+        if info is None or stat.S_ISLNK(info.st_mode) or info.st_size > _MAX_PREIMAGE_CHARS:
+            continue
+        try:
+            preimages[path] = _file_bytes(root, path, info).decode()
+        except (OSError, UnicodeDecodeError):
+            continue
+    return preimages
+
+
+def _baseline_preimage(baseline: dict, path: str) -> str | None:
+    """A changed file's content at the baseline: captured up front for planned files,
+    otherwise its baseline blob when git already stores it (clean tracked files)."""
+    if path in baseline.get("preimages", {}):
+        return baseline["preimages"][path]
+    oid = (baseline["files"].get(path) or {}).get("oid")
+    if not oid:
+        return None
+    try:
+        data = _git(baseline["root"], "cat-file", "blob", oid)
+        return _preimage(data.decode())
+    except Exception:
+        return None
+
+
 def _capture_baseline(root: str) -> dict:
     head = subprocess.run(["git", "-C", root, "rev-parse", "--verify", "-q", "HEAD"],
                           capture_output=True, text=True, timeout=_GIT_TIMEOUT).stdout.strip()
@@ -312,11 +349,11 @@ class RollbackJournal:
                     continue
                 tracked.append(path)
                 continue
-            # Only existence matters (review needs before/after); no preimage is kept.
-            # An unreadable file is assumed to exist rather than blocking the write.
-            exists, _, error = await self._read(path)
+            # The preimage is kept only for the reviewer's diff; nothing is restored from
+            # it. An unreadable file is assumed to exist rather than blocking the write.
+            exists, before, error = await self._read(path)
             if error:
-                exists = True
+                exists, before = True, None
             if (not exists and _communication_artifact(path, mutation_text)
                     and path not in self.allowed_artifacts):
                 issues.append(("project_artifact_policy", {
@@ -327,16 +364,16 @@ class RollbackJournal:
                               "repository; run the check through the execution capability"),
                 }))
                 continue
-            pending.append((path, exists))
+            pending.append((path, exists, _preimage(before)))
         if issues:
             await self.persistence.advance_mutation(
                 mutation_id, "planned", "snapshot",
                 "; ".join(str(payload.get("error") or payload.get("path") or action)
                           for action, payload in issues))
             return mutation_id, [], issues
-        for path, exists in pending:
+        for path, exists, before in pending:
             await self.persistence.record_rollback_file(
-                self.job_id, self.position, path, exists)
+                self.job_id, self.position, path, exists, before_content=before)
             tracked.append(path)
         await self.persistence.advance_mutation(mutation_id, "snapshotted")
         return mutation_id, tracked, issues
@@ -481,9 +518,12 @@ class RollbackJournal:
             wrapped[name] = call
         return wrapped
 
-    async def record_git_baseline(self, root: str) -> None:
-        """Snapshot a native run's work tree, index and HEAD before it starts."""
+    async def record_git_baseline(self, root: str, preimage_paths: tuple[str, ...] = ()) -> None:
+        """Snapshot a native run's work tree, index and HEAD before it starts, keeping
+        the content of `preimage_paths` (the files the plan edits) for the review diff."""
         self._native_baseline = await asyncio.to_thread(_capture_baseline, root)
+        self._native_baseline["preimages"] = await asyncio.to_thread(
+            _read_preimages, root, preimage_paths)
 
     async def record_native_changes(self, excluded_files: tuple[str, ...] = ()) -> list[str]:
         """Journal every path the native run changed since `record_git_baseline`.
@@ -504,9 +544,11 @@ class RollbackJournal:
                          "file_replace")
             mutation_id = await self.persistence.plan_mutation(
                 self.job_id, self.position, "native_cli", operation, [path])
+            before = (await asyncio.to_thread(_baseline_preimage, baseline, path)
+                      if change["before_exists"] else None)
             await self.persistence.record_rollback_file(
                 self.job_id, self.position, path, change["before_exists"],
-                change["expected_hash"])
+                change["expected_hash"], before)
             await self.persistence.update_rollback_hash(
                 self.job_id, self.position, path, change["expected_hash"])
             await self.persistence.advance_mutation(mutation_id, "postimage_verified")

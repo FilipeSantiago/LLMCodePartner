@@ -29,7 +29,9 @@ DEFINITIONS = (
     # the exact ``file_search`` operation.
     _d(("find_text", "exact_search", "search_in_files_by_text", "search_regex", "search_text"), (CAP_READ, CAP_SEARCH), DOMAIN_SOURCE, ("file_text_search",), "search"),
     _d(("list_files_in_folder", "list_directory_tree", "get_symbol_info", "get_file_problems", "get_all_open_file_paths", "get_git_diff_all", "get_vcs_log", "open_commit", "documentation_search", "get_project_dependencies", "get_project_modules", "find_usages"), (CAP_READ,), DOMAIN_PROJECT, ("project_inspect",), "inspect"),
-    _d(("kb_get_architecture", "kb_search_graph", "kb_trace_path", "kb_get_file_outline", "kb_get_code_snippet", "kb_index_status"), (CAP_READ,), DOMAIN_PROJECT, ("kb_inspect",), "inspect"),
+    _d(("kb_get_architecture", "kb_search_graph", "kb_trace_path", "kb_get_file_outline", "kb_get_code_snippet", "kb_index_status", "kb_query_graph"), (CAP_READ,), DOMAIN_PROJECT, ("kb_inspect",), "inspect"),
+    _d(("planner_reader", "planner_declarations"), (CAP_READ,), DOMAIN_PROJECT,
+       ("planner_inspect",), "virtual"),
     _d(("create_new_file", "create_new_file_with_text"), (CAP_WRITE,), DOMAIN_SOURCE, (OP_FILE_CREATE,), "create"),
     _d(("replace_file_text_by_path", "replace_specific_text", "replace_text_in_file"), (CAP_WRITE,), DOMAIN_SOURCE, (OP_FILE_REPLACE,), "replace"),
     _d(("apply_patch",), (CAP_WRITE,), DOMAIN_SOURCE, (OP_FILE_PATCH,), "patch"),
@@ -49,6 +51,10 @@ SEARCH = frozenset(a for d in DEFINITIONS if CAP_SEARCH in d.capabilities for a 
 WRITE = frozenset(a for d in DEFINITIONS if CAP_WRITE in d.capabilities for a in d.aliases)
 REFACTOR = frozenset(a for d in DEFINITIONS if CAP_REFACTOR in d.capabilities for a in d.aliases)
 MUTATING, SUPPORTED = WRITE | REFACTOR, READ | SEARCH | WRITE | REFACTOR | frozenset(a for d in DEFINITIONS if CAP_EXECUTE in d.capabilities for a in d.aliases)
+# KB tools that return paths, symbols and line ranges but no source text: a scoped
+# parent may navigate with them while source reads stay bounded.
+KB_NAVIGATION_TOOLS = frozenset(("kb_get_architecture", "kb_search_graph", "kb_trace_path",
+                                 "kb_get_file_outline", "kb_index_status"))
 ROLE_OPTIMIZER, ROLE_CODER = "optimizer", "coder"
 ROLES = {ROLE_OPTIMIZER: READ | SEARCH, ROLE_CODER: SUPPORTED}
 def allowed_for(role: str | None) -> frozenset[str]: return SUPPORTED if role is None else ROLES.get(role, READ | SEARCH)

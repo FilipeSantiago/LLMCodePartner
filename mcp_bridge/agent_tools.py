@@ -25,7 +25,9 @@ from mcp_bridge.read_metrics import SourceReadStats
 # The IDE's read_file tool rejects a single request above 5,000 lines. This is
 # a transport constraint, not a limit on what the coder may request.
 IDE_READ_PAGE = 5000
+DEFAULT_READ_WINDOW = 200
 REWRITE_GUARD_LINES = 60
+REPEATED_READ_REFERENCE_BYTES = 4096
 _NUMBERED = re.compile(r"^L(\d+): ?(.*)$")
 _TRUNCATED = re.compile(r"…\d+ lines truncated…")
 _PATH_KEYS = frozenset({
@@ -60,12 +62,15 @@ def tool_failed(raw: str | None) -> bool:
 def tool_specs() -> list[ToolSpec]:
     return [
         ToolSpec("codepartner_read_file",
-                 "Read a complete project file by default, or exactly the requested line range. "
-                 "Repeated reads reuse the run-local result; refresh=true rereads the IDE.",
+                 "Read up to 200 lines by default. Specify start_line and end_line for an "
+                 "exact range, or full_file=true for the complete file. Partial reads "
+                 "identify remaining lines; repeated reads reuse the run-local result; "
+                 "refresh=true rereads the IDE.",
                  {"type": "object", "properties": {
                      "path": {"type": "string"},
                      "start_line": {"type": "integer", "minimum": 1},
                      "end_line": {"type": "integer", "minimum": 1},
+                     "full_file": {"type": "boolean"},
                      "refresh": {"type": "boolean"},
                  }, "required": ["path"]}),
         ToolSpec("codepartner_search_in_file",
@@ -168,7 +173,7 @@ def _paths(arguments: dict) -> tuple[str, ...]:
 
 
 def _read_result(raw: str, path: str, start: int, count: int | None,
-                 total_hint: int | None = None) -> tuple[str, int, str]:
+                 total_hint: int | None = None, *, total_known: bool = True) -> tuple[str, int, str]:
     text = _unwrap(raw)
     if (text.lstrip().lower().startswith("error")
             or re.search(r"\b(?:does not exist|doesn't exist|cannot be opened|can't be opened|not found)\b",
@@ -201,11 +206,13 @@ def _read_result(raw: str, path: str, start: int, count: int | None,
                      for number in range(start, stop + 1))
     returned = stop - start + 1
     actual_end = start + returned - 1 if returned else start - 1
-    more = actual_end < total
-    header = (f"READ COMPLETE\n{path} — lines {start}–{actual_end} of {total}\n"
+    more = not total_known or actual_end < total
+    total_label = str(total) if total_known else "unknown"
+    header = (f"READ COMPLETE\n{path} — lines {start}–{actual_end} of {total_label}\n"
               f"truncated={'true' if more else 'false'}\n")
     if more:
-        header += f"Remaining: {actual_end + 1}–{total}\n"
+        header += (f"Remaining: {actual_end + 1}–{total}\n" if total_known
+                   else f"Remaining: {actual_end + 1} onward (file length unknown)\n")
     return header + body, returned, body
 
 
@@ -408,15 +415,25 @@ class AgentToolInterface:
         self.complete_reads: dict[str, str] = {}
         self.rewrite_pending: set[str] = set()
         self.prior_search: dict[tuple, str] = {}
+        self.read_observations: dict[tuple, str] = {}
+        self.read_raw_observations: dict[str, set[str]] = {}
+        self.preview_raw_observations: set[str] = set()
         self.counter = 0
         self.metrics: Counter[str] = Counter()
         self.source_metrics = SourceReadStats()
         self.files_read: set[str] = set()
+        self.previewed_paths: set[str] = set()
+        self.delivered_read_paths: set[str] = set()
         self.observed: list[str] = []
         self.started_at = time.monotonic()
 
     def summary(self) -> dict:
-        return {**dict(self.metrics), **self.source_metrics.summary(),
+        read_metrics = {key: self.metrics[key] for key in (
+            "first_source_read_bytes", "bounded_preview_reads", "bounded_preview_bytes",
+            "preview_followup_reads", "explicit_full_file_reads", "explicit_full_file_bytes",
+            "path_only_complete_reads", "explicit_range_reads", "explicit_range_bytes",
+            "preview_observation_expansions", "preview_observation_bytes")}
+        return {**dict(self.metrics), **read_metrics, **self.source_metrics.summary(),
                 "unique_files_read": sorted(self.files_read),
                 "elapsed_ms": int((time.monotonic() - self.started_at) * 1000),
                 "observation_mode": "compact" if self.compact else "baseline",
@@ -428,6 +445,33 @@ class AgentToolInterface:
         if bare == "execute_tool":
             bare, arguments = _dispatcher(arguments)
         self.source_metrics.observe(bare, arguments, result, read=bare in _READ)
+        if bare not in _READ or not result.startswith("READ COMPLETE"):
+            return
+        path = arguments.get("path") or arguments.get("file_path")
+        if not isinstance(path, str):
+            return
+        size = len(result.encode("utf-8"))
+        if path not in self.delivered_read_paths:
+            self.metrics["first_source_read_bytes"] += size
+            self.delivered_read_paths.add(path)
+        if bare != "codepartner_read_file":
+            return
+        if path in self.previewed_paths and (arguments.get("full_file") or
+                                             "start_line" in arguments or "end_line" in arguments):
+            self.metrics["preview_followup_reads"] += 1
+        if arguments.get("full_file"):
+            self.metrics["explicit_full_file_reads"] += 1
+            self.metrics["explicit_full_file_bytes"] += size
+        elif "start_line" not in arguments and "end_line" not in arguments:
+            if "truncated=true" in result.split("\n", 4)[:4]:
+                self.metrics["bounded_preview_reads"] += 1
+                self.metrics["bounded_preview_bytes"] += size
+                self.previewed_paths.add(path)
+            else:
+                self.metrics["path_only_complete_reads"] += 1
+        else:
+            self.metrics["explicit_range_reads"] += 1
+            self.metrics["explicit_range_bytes"] += size
 
     def _remember(self, result: str, raw: str, *, category: str) -> str:
         self.counter += 1
@@ -436,16 +480,37 @@ class AgentToolInterface:
         if raw and raw != result:
             self.observations[key] = raw
             self._delivery = (key, category, raw)
-            suffix = f"\nFull authorized output: codepartner_get_observation(observation_id={key!r})"
+            label = "Original IDE output for this read" if category == "read" else "Full authorized output"
+            suffix = f"\n{label}: codepartner_get_observation(observation_id={key!r})"
             return result + suffix
         self._delivery = (None, category, raw)
         return result
+
+    def _remember_read(self, result: str, raw: str, path: str) -> str:
+        delivered = self._remember(result, raw, category="read")
+        if raw and raw != result:
+            self.read_raw_observations.setdefault(path, set()).add(f"obs-{self.counter}")
+        return delivered
 
     def _new_observation(self, content: str) -> str:
         self.counter += 1
         key = f"obs-{self.counter}"
         self.observations[key] = content
         return key
+
+    def _repeat_read(self, signature: tuple, result: str) -> str:
+        if len(result.encode("utf-8")) < REPEATED_READ_REFERENCE_BYTES:
+            return self._remember(result, "", category="read")
+        key = self.read_observations.get(signature)
+        if key is None:
+            key = self._new_observation(result)
+            self.read_observations[signature] = key
+        self.metrics["read_calls"] += 1
+        self.metrics["read_reference_hits"] += 1
+        self.metrics["read_reference_bytes_saved"] += len(result.encode("utf-8"))
+        return ("IDENTICAL READ RESULT\nOriginal result: "
+                f"codepartner_get_observation(observation_id={key!r}). "
+                "Use refresh=true if the file may have changed outside this run.")
 
     def _mark_stale(self, paths: list[str]) -> None:
         changed = set(paths)
@@ -486,6 +551,8 @@ class AgentToolInterface:
             ("SEARCH FAILED", "TOOL FAILED", "COMMAND FAILED", "ACCESS DENIED"))
         outcome = await self.compression.compress(category, body, failed=failed)
         large = outcome.bytes_in >= self.compression.config.min_bytes
+        if large and not failed:
+            self.metrics["compress_attempts"] += 1
         duplicate_of = self._digests.get(outcome.content_sha256) if large else None
         delivered = result
         if duplicate_of:
@@ -585,6 +652,9 @@ class AgentToolInterface:
             return "OBSERVATION ERROR\noffset must be a nonnegative integer."
         data = raw.encode()
         segment = data[offset:].decode("utf-8", errors="replace")
+        if key in self.preview_raw_observations:
+            self.metrics["preview_observation_expansions"] += 1
+            self.metrics["preview_observation_bytes"] += len(segment.encode("utf-8"))
         stale = ("STALE: a resource in this observation was modified after it was "
                  "recorded; rerun the tool for current content.\n" if key in self.stale else "")
         return (f"OBSERVATION COMPLETE\nid={key}\nbytes={offset}–{len(data)} of {len(data)}\n"
@@ -637,7 +707,8 @@ class AgentToolInterface:
                 return f"READ ERROR\n{path}: IDE made no progress beyond line {offset}.", "", 0
             offset = cursor
         assembled = "\n".join(f"L{number}: {lines[number]}" for number in sorted(lines))
-        result, returned, _ = _read_result(assembled, path, start, count, total)
+        result, returned, _ = _read_result(
+            assembled, path, start, count, total, total_known=total is not None)
         return result, assembled, returned
 
     async def _validate_mutation(self, paths: list[str],
@@ -849,6 +920,7 @@ class AgentToolInterface:
                     path = arguments["path"]
                     start = arguments.get("start_line", 1)
                     end = arguments.get("end_line")
+                    full_file = arguments.get("full_file", False)
                     refresh = arguments.get("refresh", False)
                 else:
                     path = inner.get("file_path") or inner.get("path")
@@ -859,11 +931,14 @@ class AgentToolInterface:
                     if isinstance(limit, str) and limit.isdecimal():
                         limit = int(limit)
                     end = start + limit - 1 if isinstance(start, int) and isinstance(limit, int) else None
+                    full_file = False
                     refresh = inner.get("refresh", False)
             except (KeyError, TypeError, ValueError):
                 return "READ ERROR\nInvalid file path or line range."
             if (not isinstance(path, str) or type(start) is not int or start < 1
                     or end is not None and (type(end) is not int or end < start)
+                    or type(full_file) is not bool
+                    or full_file and ("start_line" in arguments or "end_line" in arguments)
                     or type(refresh) is not bool
                     or bare != "codepartner_read_file" and inner.get("limit") is not None
                     and (type(limit) is not int or limit < 1)):
@@ -871,21 +946,30 @@ class AgentToolInterface:
             reason = _path_reason(path, exclusions=tuple(self.run.metadata.get("excluded_files", ())))
             if reason:
                 return f"ACCESS DENIED\n{path}: {reason}. Do not retry this path."
+            if (bare == "codepartner_read_file" and self.compact and not full_file
+                    and "start_line" not in arguments and "end_line" not in arguments):
+                end = DEFAULT_READ_WINDOW
             count = end - start + 1 if end is not None else None
             signature = ("read", path, start, end)
             if refresh:
+                self.stale.update(value for key, value in self.read_observations.items()
+                                  if key[1] == path)
+                self.stale.update(self.read_raw_observations.get(path, ()))
                 self.prior = {key: value for key, value in self.prior.items() if key[1] != path}
+                self.read_observations = {key: value for key, value in
+                                          self.read_observations.items() if key[1] != path}
                 self.complete_reads.pop(path, None)
             elif signature in self.prior:
                 self.metrics["duplicate_calls"] += 1
-                return self._remember(self.prior[signature][1], "", category="read")
+                return self._repeat_read(signature, self.prior[signature][1])
             elif path in self.complete_reads:
                 result, returned, body = _read_result(self.complete_reads[path], path, start, count)
                 if result.startswith("READ COMPLETE"):
                     self.prior[signature] = (body, result)
                     self.metrics["duplicate_calls"] += 1
                     self.metrics["lines_returned"] += returned
-                return self._remember(result, "", category="read")
+                    return self._repeat_read(signature, result)
+                return self._remember_read(result, "", path)
             if bare == "codepartner_read_file":
                 candidate = next((s for s in self.run.registry.tools() if _bare(s.name) == "read_file"), None)
                 if candidate is None:
@@ -901,7 +985,7 @@ class AgentToolInterface:
                     if result.startswith("READ COMPLETE"):
                         self.prior[signature] = (body, result)
                         self.metrics["lines_returned"] += returned
-                    return self._remember(result, raw, category="read")
+                    return self._remember_read(result, raw, path)
             result, raw, returned = await self._fetch_read(
                 name, path, start, count, backend, dispatcher=bare == "execute_tool")
             self.files_read.add(path)
@@ -911,14 +995,24 @@ class AgentToolInterface:
                 self.prior[signature] = (body, result)
                 self.metrics["lines_returned"] += returned
                 numbered, _ = _numbered_lines(raw)
-                if (count is None and numbered and min(numbered) == 1
+                if ("truncated=false" in result.split("\n", 4)[:4]
+                        and numbered and min(numbered) == 1
                         and len(numbered) == max(numbered)):
                     self.complete_reads[path] = raw
-            return self._remember(result, raw, category="read")
+            delivered = self._remember_read(result, raw, path)
+            if (bare == "codepartner_read_file" and not full_file
+                    and "start_line" not in arguments and "end_line" not in arguments
+                    and "truncated=true" in result.split("\n", 4)[:4]
+                    and raw and raw != result):
+                self.preview_raw_observations.add(f"obs-{self.counter}")
+            return delivered
         self._last_paths = list(paths)
         raw = await backend(name, arguments)
         if mutating:
+            self.stale.update(self.read_observations.values())
+            self.stale.update(key for keys in self.read_raw_observations.values() for key in keys)
             self.prior.clear()
+            self.read_observations.clear()
             self.complete_reads.clear()
             self.prior_search.clear()
             status = ("EDIT FAILED OR UNCERTAIN" if tool_failed(raw)

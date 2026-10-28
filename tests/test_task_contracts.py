@@ -601,6 +601,18 @@ class ScopeNegotiationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(revised.primary_files, ())
         self.assertNotIn("apply_patch", revised.allowed_tools)
 
+    def test_abbreviations_are_not_files_and_the_plan_names_the_scope(self):
+        from tests.test_precise_plans import approved
+
+        task = replace(_config_task(), description=(
+            "Update the loader, e.g. the generation/factory.py dispatch."))
+        contract = TaskContractor().initial_contract(
+            task, _write_specs(), task_context=approved().tasks["WP1-T1"])
+        self.assertNotIn("e.g", contract.primary_files)
+        self.assertIn("generation/factory.py", contract.primary_files)
+        self.assertTrue({"src/a.py", "src/new.py"} <= set(contract.primary_files))
+        self.assertEqual(contract.reference_files, ("src/registry.py",))
+
     def test_free_text_requested_files_are_reduced_to_paths(self):
         contract = TaskContractor().initial_contract(_config_task(), _write_specs())
         result = parse_coder_result(_handoff(contract, requested_files=[

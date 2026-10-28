@@ -80,6 +80,66 @@ class DiscoveryFile:
                    [item.upper() for item in _strings(value.get("task_ids"))])
 
 
+def _project_path(value) -> str:
+    """A safe project-relative path, or "" when the value is not one."""
+    path = _text(value)
+    parts = path.split("/")
+    if (not path or PurePosixPath(path).is_absolute() or "\\" in path
+            or any(part in {"", ".", "..", ".git"} for part in parts)):
+        return ""
+    return path
+
+
+def _line_range(value: dict) -> tuple[int | None, int | None] | None:
+    """(start, end) when both are positive with end >= start, (None, None) when both
+    are absent, and None when the range is invalid."""
+    start, end = value.get("start_line"), value.get("end_line")
+    if start is None and end is None:
+        return None, None
+    if (type(start) is not int or type(end) is not int or start < 1 or end < start):
+        return None
+    return start, end
+
+
+@dataclass(frozen=True)
+class EditRange:
+    """Lines a coder changes: exact planner lines, or a new file (no lines)."""
+    file: str
+    change: str
+    start_line: int | None = None
+    end_line: int | None = None
+    symbol: str = ""
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "EditRange | None":
+        path, change, lines = (_project_path(value.get("file")), _text(value.get("change")),
+                               _line_range(value))
+        if not path or not change or lines is None:
+            return None
+        return cls(path, change, *lines, _text(value.get("symbol")))
+
+
+@dataclass(frozen=True)
+class ReferenceRange:
+    """Context a coder reads but does not change; no lines means the whole file."""
+    file: str
+    why: str = ""
+    start_line: int | None = None
+    end_line: int | None = None
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "ReferenceRange | None":
+        path, lines = _project_path(value.get("file")), _line_range(value)
+        if not path or lines is None:
+            return None
+        return cls(path, _text(value.get("why")), *lines)
+
+
+def _ranges(value, cls) -> list:
+    return [entry for item in value if isinstance(item, dict)
+            if (entry := cls.from_dict(item)) is not None] if isinstance(value, list) else []
+
+
 def _discovery(value) -> list[DiscoveryFile]:
     return [entry for item in value if isinstance(item, dict)
             if (entry := DiscoveryFile.from_dict(item)) is not None] if isinstance(value, list) else []
@@ -158,6 +218,10 @@ class TaskContext:
     expected_tests: list[str] = field(default_factory=list)
     finding_ids: list[str] = field(default_factory=list)
     findings: list[PlannerFinding] = field(default_factory=list)
+    # The exact lines to change and the context to read; plans from before these
+    # fields have neither and fall back to `relevant_files`.
+    edits: list[EditRange] = field(default_factory=list)
+    references: list[ReferenceRange] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, value: dict, task_id: str = "") -> "TaskContext":
@@ -170,7 +234,17 @@ class TaskContext:
             "approach": _text(value.get("approach")),
             "findings": [PlannerFinding.from_dict(item) for item in value.get("findings") or []
                          if isinstance(item, dict)],
+            "edits": _ranges(value.get("edits"), EditRange),
+            "references": _ranges(value.get("references"), ReferenceRange),
         })
+
+    def edit_files(self) -> list[str]:
+        return list(dict.fromkeys(edit.file for edit in self.edits))
+
+    def reference_files(self) -> list[str]:
+        edited = set(self.edit_files())
+        return list(dict.fromkeys(ref.file for ref in self.references
+                                  if ref.file not in edited))
 
 
 @dataclass(frozen=True)
@@ -200,6 +274,25 @@ class ReviewerContext:
             "findings": [PlannerFinding.from_dict(item) for item in value.get("findings") or []
                          if isinstance(item, dict)],
         })
+
+
+def plan_outline(shared: WPSharedContext, tasks: dict[str, TaskContext]) -> str:
+    """The human-readable plan, rendered from the structured fields."""
+    lines = [f"**Objective:** {shared.objective}", ""] if shared.objective else []
+    for task_id, task in sorted(tasks.items()):
+        lines.append(f"- **{task_id}** — {task.objective}")
+        if task.approach:
+            lines.append(f"  - Approach: {task.approach}")
+        files = task.edit_files() or task.relevant_files
+        if files:
+            lines.append("  - Files: " + ", ".join(f"`{path}`" for path in files))
+        if task.depends_on:
+            lines.append("  - After: " + ", ".join(task.depends_on))
+        if task.expected_tests:
+            lines.append("  - Tests: " + "; ".join(task.expected_tests))
+    if shared.test_strategy:
+        lines += ["", "**Validation:**", *(f"- {item}" for item in shared.test_strategy)]
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -236,12 +329,15 @@ class WPPlanDraft:
             if isinstance(item, dict):
                 context = TaskContext.from_dict(item, str(key))
                 tasks[context.task_id] = context
+        shared = WPSharedContext.from_dict(value.get("shared") or {}, wp_id)
         return cls(
             wp_id=wp_id,
             revision=revision if revision is not None else int(value.get("revision") or 1),
             summary=_text(value.get("summary")),
-            plan_markdown=_text(value.get("plan_markdown")),
-            shared=WPSharedContext.from_dict(value.get("shared") or {}, wp_id),
+            # Planners no longer write prose; older drafts keep theirs.
+            plan_markdown=(_text(value.get("plan_markdown"))
+                           or plan_outline(shared, tasks)),
+            shared=shared,
             tasks=tasks,
             reviewer=ReviewerContext.from_dict(value.get("reviewer") or {}, wp_id),
             decisions=_strings(value.get("decisions")),

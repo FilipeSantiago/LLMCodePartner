@@ -1746,39 +1746,6 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
-    async def test_kb_first_review_defers_full_snapshot_and_uses_read_policy(self):
-        from agent.routing.config import load_routing_config as load_real_config
-
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                self.prompt = messages[0]["content"]
-                self.policy = kwargs["kb_first"]
-                self.native = kwargs["native"]
-                await kwargs["direct_tool_handlers"]["read_file"]({
-                    "file_path": "src/app.py", "offset": 1, "limit": 1})
-                yield TextEvent(json.dumps({
-                    "verdict": "done", "rationale": "Reviewed source",
-                    "evidence": ["Inspected src/app.py"],
-                    "inspected_paths": ["src/app.py"], "findings": [],
-                }))
-                yield DoneEvent("endTurn")
-
-        async def read_file(_arguments):
-            return "SECRET_FULL_FILE_CONTENT"
-
-        provider = FakeProvider()
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            await ReviewService(config=load_real_config()).review(
-                SimpleNamespace(title="Change", work_packages=[]), task(),
-                "Changed `src/app.py`.", "claude-haiku",
-                [ToolSpec("read_file", "Read", {"type": "object", "properties": {
-                    "file_path": {"type": "string"}, "offset": {"type": "integer"},
-                    "limit": {"type": "integer"}}})], {"read_file": read_file})
-        self.assertIsNone(provider.native)
-        self.assertTrue(provider.policy.enforce_reads)
-        self.assertNotIn("SECRET_FULL_FILE_CONTENT", provider.prompt)
-        self.assertIn('"status": "deferred"', provider.prompt)
-
     async def test_required_journaled_source_is_paginated_before_review(self):
         class FakeProvider:
             async def tools(self, messages, specs, **kwargs):
@@ -2020,6 +1987,7 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider.reasoning_effort, "medium")
         self.assertEqual(provider.run_metadata,
                          {"reviewer": True, "reviewer_model": "codex-luna-low",
+                      "enforce_scope": True, "edit_files": [],
                           "gateway_used": False})
         self.assertEqual(decision.verdict, "done")
         self.assertEqual(decision.reviewer_model, "codex-luna-low")

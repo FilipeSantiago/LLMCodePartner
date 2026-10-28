@@ -7,8 +7,11 @@ trusted paths; only model-facing coder calls are shaped.
 
 ## Observations
 
-`codepartner_read_file(path, start_line?, end_line?, refresh?)` returns the whole
-file by default, or only the requested inclusive line range. The IDE reader accepts
+`codepartner_read_file(path, start_line?, end_line?, full_file?, refresh?)` returns
+up to 200 lines for a path-only request in compact mode, an exact inclusive line
+range when supplied, or the whole file with `full_file=true`. Partial results
+name the remaining range and use `unknown` when total length is not verified.
+The IDE reader accepts
 at most 5,000 lines per request and may return head/tail portions for longer files;
 the interface assembles distinct requests and verifies contiguous line numbers.
 An incomplete or denied read produces an explicit error, not a false complete result.
@@ -38,6 +41,9 @@ Repeated reads reuse the run-local result without another IDE request. Pass
 `refresh=true` to force a new read; mutations clear cached reads. The IDE does
 not expose a reliable file revision token, so external edits require refresh.
 Searches are compared after the IDE responds again.
+The original IDE output for a partial read remains retrievable as an observation,
+but it is not necessarily the complete file. Further ranges or `full_file=true`
+retrieve current source when needed.
 
 ## Mutations and boundaries
 
@@ -66,7 +72,9 @@ files, and filters protected search and listing results.
 ## Measurement
 
 `telemetry_aci_attempts` records one row per coder run, including agent calls,
-backend calls, returned lines, visible and backend output bytes, duplicate
+backend calls, returned lines, visible and backend output bytes, first-read bytes,
+bounded previews, explicit complete and ranged reads, preview follow-ups and
+observation expansions, duplicate
 calls, time to first edit, provider usage, and available cost. It never stores
 source text or complete tool results. `TelemetryAggregation.aci_comparison()`
 groups rows by task and observation mode.

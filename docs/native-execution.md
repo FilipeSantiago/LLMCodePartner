@@ -22,10 +22,9 @@ This covers every agent and Code Partner's own file work:
 The IDE MCP bridge stays available **only for IDE-specific extras**: inspections
 (`get_file_problems`), symbol lookups, `find_usages`, refactorings, formatting, run
 configurations and notebooks. The IDE chat also still identifies the conversation
-and its project. Codebase Memory (`kb_*`) is used on demand; native runs have no
-KB-first gates or interception. With `discovery.policy: kb_first`, project-file
-access instead uses the controlled IDE path for every role; native CLI file and
-shell access is disabled for that run.
+and its project. Codebase Memory (`kb_*`) stays available to native runs. Under
+`discovery.policy: kb_first` their prompt says they MUST consult it before the first
+read of each code file; nothing intercepts their reads (docs/codebase-memory.md).
 
 ## How a conversation finds its project
 
@@ -146,10 +145,10 @@ IDE-specific tools stay available: inspections (`get_file_problems`), symbol
 lookups, `find_usages`, refactorings, formatting, run configurations, notebooks
 and the IDE dispatcher. Codebase Memory `kb_*` tools stay too.
 
-**KB-first.** Native agents keep Codebase Memory `kb_*` tools in non-strict modes.
-Under `discovery.policy: kb_first`, agents use the IDE path so that a KB outline
-or file-scoped search precedes each file's first source read, and every source read
-is bounded. See docs/codebase-memory.md.
+**KB-first.** Native agents keep Codebase Memory `kb_*` tools under every policy. Under
+`discovery.policy: kb_first` their prompt requires a KB lookup before the first read of
+each code file; it is a prompt rule, not an interception, so native execution is
+unaffected. See docs/codebase-memory.md.
 
 **Limits.** The planner's `max_tool_calls` / `max_file_reads` budgets count IDE and
 KB tool calls only; native tool calls are counted in `native_tool_metrics` but not
@@ -209,6 +208,134 @@ appends to `compactions` only when the CLI actually reports a compaction: Claude
 `context_compaction` item. The task contract and CodePartner's execution records stay
 authoritative after a compaction.
 
+### Subagents: Delegation and source-reading rules
+
+Every tool result a native run receives stays in the CLI's transcript and is read again on
+every later turn. With `CODEPARTNER_READER_SUBAGENT=true` (off by default, for A/B tests),
+native planner, coder and reviewer runs follow explicit source-delegation rules
+(each parent role's `delegation_rules` in `agent/prompt`, see [prompts](prompts.md)): reading
+source goes to a `reader` subagent on
+a cheap model whose transcript stays outside the parent's context.
+
+A subagent is an **executor, not an investigator**. The parent locates the code itself
+(Codebase Memory first, then path-only `Glob`/`Grep` or shell searches) and hands over the full
+context: exact paths and line ranges plus the questions for a `reader`, exact commands for
+`checks`. Each subagent has one basic tool, never searches and never consults the KB; when a
+request lacks something, it reports it under "Missing context:" instead of looking for it.
+
+| Run | Subagents | Scope (the parent's) |
+|---|---|---|
+| Planner (read-only) | `reader` | unrestricted: as wide as the WP needs |
+| Coder and test tasks | `reader`, `checks` | the task's planner-assigned files (`render.task_files`) |
+| Read-only tasks, reviewer | `reader` | planner-assigned files plus the journaled changed files |
+
+**Delegation rules (parent).** Locate the code, then delegate the reading: related files and
+questions of one objective go in one request, independent requests go together. Every reader
+request lists project-relative paths with line ranges; every checks request gives the exact
+commands. On "Missing context:", locate what it names and send one follow-up. Coders and
+reviewers locate code within their planner-assigned files first.
+
+**Coders work from the plan.** A coder treats the approved plan context as its
+investigation. Its scope is split into "Files to change" and "Read-only context" (the plan's
+do-not-modify paths, `render.task_read_only_files`). It reads the files it changes itself,
+only the ranges it edits, because Edit needs the agent's own Read. It never has a reader
+transcribe them. It asks the reader only questions the plan leaves open, does not reread
+files after editing, and gets the project file list for locating paths. Shell source dumps
+stay forbidden. Telemetry counts `out_of_scope_paths` (reader-request paths outside the
+scope), `whole_reads_of_edited` and `post_edit_rereads`. Claude coder runs write a 5-minute
+prompt cache (`execution.prompt_cache_ttl`, default `5m`).
+
+**No direct source reads (planner and reviewer).** Do not use shell commands, scripts or
+parent file tools to display project-file contents, including source, tests and
+configuration, even for known ranges. This includes `rg`/`grep` matched lines,
+`cat`/`sed`/`head`/`tail`, and source diff output. Path-only discovery such as `rg --files`,
+`rg -l` and `git diff --name-only` is allowed. Send source-inspection questions to the reader;
+if it is unavailable or fails, report the evidence gap. This rule is prompt guidance, not a
+shell-enforced restriction; telemetry observes command categories without blocking them.
+
+**Subagent procedures.** `reader` (tool: `Read`): read every listed range in one response,
+answer each question (≤ 300 words, `path:line` references), list anything unlisted it would
+need under "Missing context:". `checks` (tool: `Bash`): run exactly the given commands and
+return only exit codes, counts and failures; its commands still become test evidence.
+
+**KB paths.** Codebase Memory indexes the project on the host (`host_path` in
+`config/projects.yaml`), while native agents see it at its `workspace`. The bridge
+(`mcp_bridge/bridge.py`) translates `kb_*` arguments to host paths and `kb_*` results to
+workspace paths (`agent/workspace.py` `to_host`/`to_workspace`), so every path the parent
+hands to a subagent exists in the container. Telemetry stores paths project-relative
+(`NativeRun.relative`).
+
+**Model.** One cheap model per provider in `config/model-routing.yaml`:
+`subagents.reader_model: {claude: claude-haiku, codex: codex-luna-low}` (entries of
+`models`, so their `cli_model` and `reasoning_effort` are reused) and `subagents.max_turns`
+(`CODEPARTNER_SUBAGENT_MAX_TURNS` overrides it; default 5, since a fully specified
+one-tool request needs 1–3 turns).
+
+- **Claude Code.** `ClaudeAgentOptions.agents` with `background=False`. That flag alone
+  does not keep a call in the foreground: Claude Code 2.1.287 starts an `Agent` call whose
+  input omits `run_in_background` in the background, answers "Async agent launched", and
+  delivers the brief later as a notification that ends the parent's turn (one more
+  context re-read per call). Every run with subagents therefore has a PreToolUse hook that
+  sets `run_in_background: false` on each `Agent` call and refuses subagent types other
+  than the offered `reader`/`checks`; `CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS=1` also
+  hides the built-in agents. The `reader` gets only `Read` and `checks` only `Bash`
+  (`SUBAGENT_TOOLS`); a subagent can only use tools that exist in the session, so `Bash`
+  is in the parent's tool set whenever `checks` is offered. With
+  `subagents.enforce_scope: true`, the parent is offered role-specific file tools,
+  `Agent` and the KB navigation tools (`KB_NAVIGATION_TOOLS`: paths, symbols and line
+  ranges, no source). A PreToolUse policy checks paths, bounded reads and writes, denies
+  the parent's own `Bash`, unrestricted shell, search and MCP source tools, and refuses a
+  coder's second `reader` request unless its prompt states `SCOPE EXCEPTION:`.
+  The coder's prompt sets one work order, each step in one response: KB navigation of
+  the context files, at most one reader request, all planned edit ranges read together,
+  then edits and one checks request.
+  Every subagent tool is in the parent's allow list, so no subagent call is
+  permission-denied. Runs use `strict_mcp_config`, so only Code Partner's MCP server loads,
+  never the account's claude.ai connectors or user/project MCP config.
+- **Codex CLI.** Roles via `-c agents.<role>.description=…` / `config_file=…` and
+  `-c agents.max_depth=1`; the role file (a temp file for the process's lifetime) sets the
+  reader model, effort and prompt. Its shell stays, so the one-tool rule is prompt-only. Checked
+  with Codex 0.164: `-c` roles work despite `--ignore-user-config`; the parent `wait`s for
+  the child's reply; spawns and waits appear as `collab_tool_call` items, while the child's
+  own tool calls and usage do not appear in the parent's stream. Native Codex runs have no
+  sandbox, so a `reader` is read-only by instruction; a read-only session still fails if
+  anything changed. Not yet checked: whether a child reaches the bridged `kb_*` tools and
+  the gateway provider. A Codex 0.164 probe confirmed that disabling the parent's
+  shell also removes the reader child's shell, while PreToolUse has no documented
+  child identity. When scope enforcement and a reader are both enabled, CodePartner
+  stops a Codex native coder or reviewer before model execution rather than claiming
+  that a hook alone confines arbitrary shell reads.
+
+**Telemetry:**
+- `native_tool_metrics.exploration`, for every native run whatever the flag (so A/B
+  compares like with like): `mode` (`off` | `reader`), `direct_reads`, `ranged_reads`,
+  `whole_file_reads`, `read_turns` (parent responses with reads; the work order expects
+  1), `batched_read_turns`, `reads_in_batches`, `exact_rereads`,
+  `bash_exploration`, `bash_exact_reads` (shell commands classified for Claude `Bash` and
+  Codex `command_execution` alike), `brief_file_reads`, `brief_full_rereads`.
+- `native_tool_metrics.subagents` when offered: `reader_calls`, `checks_calls`,
+  `objectives_paths`, `requests_without_paths` (a reader request with no path or a checks
+  request with no quoted command: the parent under-specified), `missing_context_reported`,
+  `empty_briefs` (a reader reply with no citation, typically its turn limit),
+  `async_launches` (an `Agent` call the CLI ran in the background; expected 0),
+  `child_tool_calls`, `child_kb_calls` (expected 0), `child_tools`,
+  `child_bash_exploration`, `brief_bytes`, `cited_files`, `child_usage`,
+  `foreground_calls`, `background_calls`, `background_requests`, and spawn
+  `descriptions`.
+- `native_tool_metrics.scope_denials` counts denied parent tool calls by tool name;
+  Claude also records `result_segments` for usage reconciliation.
+- Native Codex planner turns with scope enforcement record `hosted_reader.calls`,
+  `rejected`, `failures`, and separate reader `usage` under `native_tool_metrics`.
+- `native_tool_metrics.cost_attribution`: parent vs subagent cost and tokens with
+  `method`/`tokens_method`. Claude tokens are `exact` when the `Agent` result reports usage;
+  the cost split is always `estimated_by_model` (flagged `ambiguous` when the reader and
+  parent share a model). Codex: `parent_only`.
+- Per completed task: `TelemetryAggregation.task_comparison(job_ids)` sums every attempt of
+  a task (retries and fallbacks, both providers; a WP review is its own row) by
+  `exploration_mode`: normalized tokens including `cache_read_tokens`, `cost_usd` (None when
+  any attempt reported no cost, as Codex does), and the counters above.
+  `aci_comparison` labels reader runs `+explore:reader`.
+
 ### What is and is not isolated
 
 **Codex runs without its own sandbox.** Its Linux sandbox (bubblewrap) needs
@@ -234,12 +361,19 @@ tool runs with the container's permissions. To opt Codex out, set
 `CODEPARTNER_NATIVE_PROVIDERS=claude`; its attempts then fail in `native` mode or
 use the IDE path in `auto` mode.
 
-### Read-only runs: detection, not a sandbox
+### Read-only runs: detection and tool restrictions
 
 Planner, reviewer, chat-answer and `/review` runs are read-only sessions:
 - Claude gets only `Read`, `Grep` and `Glob`, so it has no tool that writes. This is
   a real restriction at the tool level.
-- Codex has its shell, which can write. Nothing prevents that.
+- A native Codex planner with `subagents.enforce_scope: true` has its shell,
+  configured apps, plugins, and direct source tools disabled. It receives only
+  restricted KB navigation tools, a bulk declaration tool, and `planner_reader`.
+  CodePartner reads the exact requested ranges (up to 200 lines per file and
+  1200 lines total) and passes them to a separate Codex reader run with no shell
+  or project tools. The planner receives that run's `path:line` brief. If the
+  hosted reader or its model is unavailable, the planner attempt fails closed.
+- Other native Codex read-only runs may still have a shell and can write.
 
 Before the run, Code Partner takes a git baseline of the work tree (as for coder
 runs). After the run, even when it fails, times out or is cancelled, it compares,
@@ -264,8 +398,24 @@ with whether they existed before and their post-run hash. Changed means a differ
 file content, mode or existence, or a different index entry. The reviewer's mutation
 manifest and the retry logic use this journal.
 
-**There is no undo.** No preimages are kept, and task changes stay in the project;
-use git to revert them. If a run moved `HEAD` (a commit or checkout) or a change
+**Preimages, for the review diff only.** Each touched file's content before its first
+touch is kept in `implementation_rollback_files.before_content`: the IDE path keeps the
+content it already reads before a write; the native path reads the plan's edit files at
+the baseline and, for other changed files, recovers the baseline blob when git already
+stores it (clean tracked files). The reviewer then sees each change as a unified diff
+with `planner.edit_margin_lines` of context, plus planned lines the coder left
+unchanged; new files stay whole, and a file without a preimage is shown whole.
+
+**Planned ranges follow earlier tasks.** The planner's ranges are line numbers of the
+source it saw. Before a coder or reviewer starts, each planned edit and reference range
+on a file an earlier task changed is mapped through the diff between that file's first
+preimage in the job and its current content (`agent/planning/rebase.py`), so a later
+task's scope and its range-bounded reads point at the planned code. A planned new Python
+package also gets its `__init__.py` as a new-file edit when no task plans one and a
+sibling package has one.
+
+**There is no undo.** Preimages are never restored, and task changes stay in the
+project; use git to revert them. If a run moved `HEAD` (a commit or checkout) or a change
 could not be verified, the job continues and the reviewer is told.
 
 **Limitations.**
@@ -339,6 +489,11 @@ Every coder attempt carries `execution_mode` (`native` or `ide`) and
 `tool_metrics`; the file paths there are best-effort observations, not evidence. Native attempts write a
 `telemetry_aci_attempts` row whose `metrics_json` has `execution_mode: native`,
 `tool_calls`, per-tool counts (`tools`) and the files touched (`files`), next to
-the provider-reported usage and cost. IDE attempts keep writing their existing
-metrics there. Native execution has not been benchmarked here. Compare
+the provider-reported usage and cost. With an approved plan, the run metadata carries
+`scope_files` (the task's edit and reference files; for the reviewer, also the
+journaled files), and `native_tool_metrics` counts `out_of_scope_reads` (parent reads
+and content searches outside them; subagent reads are not counted) and
+`scope_exceptions` (stated `SCOPE EXCEPTION:` lines). Both are telemetry only and appear
+in the per-task aggregation and the `codepartner.native.*` trace attributes. IDE
+attempts keep writing their existing metrics there. Native execution has not been benchmarked here. Compare
 arms on your own runs before drawing conclusions.

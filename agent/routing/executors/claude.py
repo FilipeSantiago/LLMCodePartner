@@ -21,6 +21,8 @@ class ClaudeCLIExecutor:
         env = {}
         if context.use_gateway and context.gateway_url:
             env["ANTHROPIC_BASE_URL"] = context.gateway_url
+        if context.prompt_cache_ttl == "5m":
+            env["FORCE_PROMPT_CACHING_5M"] = "1"
         async for event in self._provider.tools(
             context.messages, context.specs, model=model.cli_model,
             role=ROLE_CODER,
@@ -39,7 +41,7 @@ class ClaudeCLIExecutor:
             },
             execution_env=env,
             direct_tool_handlers=context.direct_tool_handlers,
-            kb_first=context.kb_first,
             native=context.native,
+            subagents=context.subagents,
         ):
             yield event

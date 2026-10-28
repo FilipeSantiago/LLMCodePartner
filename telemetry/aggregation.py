@@ -24,11 +24,22 @@ def normalize_usage(usage: dict | None) -> dict:
         uncached = input_tokens
     else:
         read = usage.get("cached_input_tokens") or 0
-        write = 0
-        uncached = max(input_tokens - read, 0)
+        write = usage.get("cache_write_input_tokens") or 0
+        uncached = max(input_tokens - read - write, 0)
     return {"uncached_input_tokens": uncached, "cache_read_tokens": read,
             "cache_write_tokens": write, "output_tokens": output_tokens,
             "total_input_tokens": uncached + read + write}
+
+
+_TASK_USAGE_KEYS = ("uncached_input_tokens", "cache_read_tokens", "cache_write_tokens",
+                    "output_tokens", "total_input_tokens")
+_TASK_EXPLORATION_KEYS = ("direct_reads", "ranged_reads", "whole_file_reads",
+                          "exact_rereads", "batched_read_turns", "bash_exploration",
+                          "bash_exact_reads", "brief_file_reads", "brief_full_rereads")
+_TASK_SUBAGENT_KEYS = ("reader_calls", "checks_calls", "requests_without_paths",
+                       "missing_context_reported", "empty_briefs", "brief_bytes")
+# Parent reads outside the plan's files, and the scope exceptions it stated.
+_TASK_SCOPE_KEYS = ("out_of_scope_reads", "scope_exceptions")
 
 
 class TelemetryAggregation:
@@ -62,6 +73,59 @@ class TelemetryAggregation:
             "final_outcome": rows[-1][8] if rows else None,
         }
 
+    def task_comparison(self, job_ids: list[str]) -> dict:
+        """Per-task A/B totals of native runs, grouped by `exploration_mode`.
+
+        One row per (job, task) sums every recorded attempt of that task (coder retries
+        and fallbacks on either provider; a WP review is its own row): normalized token
+        usage including cache reads, total cost, and the exploration counters. Cost is
+        None when an attempt had no reported cost (Codex reports tokens only), so a
+        partial sum is never presented as the total."""
+        if not job_ids:
+            return {}
+        placeholders = ",".join("?" for _ in job_ids)
+        with self.storage._database() as db:
+            rows = db.execute(
+                "SELECT job_id, task_id, provider, model, metrics_json, usage_json, cost_usd "
+                "FROM telemetry_aci_attempts WHERE job_id IN (" + placeholders + ")",
+                tuple(job_ids),
+            ).fetchall()
+        result: dict[str, dict] = {}
+        for job_id, task_id, provider, model, metrics_json, usage_json, cost in rows:
+            metrics = json.loads(metrics_json)
+            if metrics.get("execution_mode") != "native":
+                continue
+            exploration = metrics.get("exploration") or {}
+            mode = metrics.get("exploration_mode") or exploration.get("mode") or "unknown"
+            row = result.setdefault(job_id, {}).setdefault(task_id or "?", {}).setdefault(
+                mode, {"attempts": 0, "providers": [], "cost_usd": 0.0, "cost_complete": True,
+                       **{key: 0 for key in _TASK_USAGE_KEYS},
+                       **{key: 0 for key in _TASK_EXPLORATION_KEYS},
+                       **{key: 0 for key in _TASK_SUBAGENT_KEYS},
+                       **{key: 0 for key in _TASK_SCOPE_KEYS}})
+            row["attempts"] += 1
+            if f"{provider}:{model}" not in row["providers"]:
+                row["providers"].append(f"{provider}:{model}")
+            for key, value in normalize_usage(json.loads(usage_json) if usage_json
+                                              else {}).items():
+                row[key] += value
+            if cost is None:
+                row["cost_complete"] = False
+            else:
+                row["cost_usd"] += cost
+            for key in _TASK_EXPLORATION_KEYS:
+                row[key] += exploration.get(key) or 0
+            for key in _TASK_SUBAGENT_KEYS:
+                row[key] += (metrics.get("subagents") or {}).get(key) or 0
+            row["out_of_scope_reads"] += len(metrics.get("out_of_scope_reads") or ())
+            row["scope_exceptions"] += metrics.get("scope_exceptions") or 0
+        for tasks in result.values():
+            for modes in tasks.values():
+                for row in modes.values():
+                    if not row.pop("cost_complete"):
+                        row["cost_usd"] = None
+        return result
+
     def aci_comparison(self, task_ids: list[str]) -> dict:
         """Compare recorded coder attempts by observation mode without source data."""
         if not task_ids:
@@ -81,6 +145,8 @@ class TelemetryAggregation:
             compression = metrics.get("compression_mode", "off")
             if compression != "off":
                 mode = f"{mode}+compress:{compression}"
+            if metrics.get("exploration_mode") == "reader":
+                mode = f"{mode}+explore:reader"
             group = result.setdefault(task_id, {}).setdefault(mode, {
                 "attempts": 0, "agent_calls": 0, "backend_calls": 0,
                 "lines_returned": 0, "model_output_bytes": 0,

@@ -41,6 +41,12 @@ roles:
   reviewer:
     min_capability: 1
 
+# Task execution (coders). Claude prompt-cache TTL, 5m or 1h: a coder's calls are
+# usually seconds apart, so 5m cache writes (1.25x input) beat the CLI's 1h (2x);
+# a checks run longer than 5 minutes costs one cache rewrite.
+execution:
+  prompt_cache_ttl: 5m
+
 # Work Package planner (codepartner-plan mode). Routed by WP complexity.
 planner:
   tiers:
@@ -64,23 +70,34 @@ planner:
   # One short "what I'm checking and why" line before each tool call
   # (~15-25 output tokens per call). Turn off to compare planner cost.
   narrate: true
+  # Claude planner prompt-cache TTL (5m or 1h). A planning turn's calls are seconds
+  # apart, so 5m cache writes (1.25x input) suffice; 1h writes cost 2x.
+  prompt_cache_ttl: 5m
+  # Lines added above and below each planner edit range in the coder and reviewer
+  # context and the reviewer's diff snapshot.
+  edit_margin_lines: 10
+# Native reader/checks subagents (CODEPARTNER_READER_SUBAGENT=true; off by default).
+# One cheap model per provider, named by its entry under `models`. The parent locates
+# code and hands over paths or commands; a subagent only reads or runs them, so a few
+# turns suffice (docs/native-execution.md).
+subagents:
+  enforce_scope: true
+  reader_model:
+    claude: claude-haiku
+    codex: codex-luna-low
+  max_turns: 20
 # Shared KB-first discovery and advisory telemetry (docs/codebase-memory.md).
 # Global disable preserves the original authorized tool behavior; advisories
 # never replace the hard planner caps above.
 discovery:
   enabled: true
-  # kb_first: every role answers architecture and dependency questions through Codebase
-  # Memory first. Every role uses controlled IDE reads: the first read of a file
-  # obtains its KB outline, then only bounded source ranges are allowed. Missing
-  # KB entries require a file-scoped search before a bounded read. Coders and
-  # reviewers read plan files, changed files and code files the index lacks directly
-  # (KB to locate, files as truth). Native file access is unavailable in this mode. selective preserves native execution and
-  # makes KB use optional for coders and reviewers.
+  # kb_first: every agent's prompt says it MUST consult Codebase Memory before the first
+  # read of each code file, then read only the ranges it points to (KB to locate, files
+  # as truth). A prompt rule only: nothing intercepts reads, so native execution and
+  # subagents stay available. selective makes KB use optional for coders and reviewers.
   policy: kb_first
   mode: advise
-  search_gate_max: 5
   small_file_bytes: 6000
-  outline_gate_lines: 120
   roles:
     planner:
       mode: advise

@@ -101,3 +101,37 @@ def describe_call(name: str, arguments: dict) -> str:
         command = str(arguments.get("command", ""))
         return f"Running `{command[:60]}{'…' if len(command) > 60 else ''}`"
     return f"`{bare}`" + (f" on `{path}`" if path else "")
+
+
+_NATIVE_VERBS = {"Edit": "Editing", "MultiEdit": "Editing", "Write": "Writing",
+                 "NotebookEdit": "Editing"}
+
+
+def _command(command: object) -> str:
+    text = " ".join(str(command or "").split())
+    return f"Running `{text[:60]}{'…' if len(text) > 60 else ''}`"
+
+
+def describe_native(name: str, arguments: dict | None, workspace: str | None = None
+                    ) -> str | None:
+    """One progress line for a native CLI tool call (Claude Code built-ins), in the same
+    shape as `describe_call`; None for calls described elsewhere (Agent) or unknown."""
+    arguments = arguments or {}
+    path = str(arguments.get("file_path") or arguments.get("path") or "")
+    if workspace and path.startswith(workspace.rstrip("/") + "/"):
+        path = path[len(workspace.rstrip("/")) + 1:]
+    if name == "Read":
+        offset, limit = arguments.get("offset"), arguments.get("limit")
+        start = offset if isinstance(offset, int) else 1
+        span = (f" (lines {start}–{start + limit - 1})" if isinstance(limit, int)
+                else f" (from line {offset})" if isinstance(offset, int) else "")
+        return f"Reading `{path or 'a file'}`{span}"
+    if name in _NATIVE_VERBS:
+        return f"{_NATIVE_VERBS[name]} `{path or 'a file'}`"
+    if name == "Bash":
+        return _command(arguments.get("command"))
+    if name in {"Grep", "Glob"}:
+        pattern = arguments.get("pattern")
+        return f"Searching for `{pattern}`" if pattern else "Searching files"
+    # Bridged tools (mcp__…, KB included) get their line where the bridge runs them.
+    return None

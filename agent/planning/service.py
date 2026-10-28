@@ -14,23 +14,26 @@ from dataclasses import asdict, dataclass, field
 from uuid import uuid4
 
 import providers
-from agent.kb_first import (DiscoveryTracker, EvidenceSeed, KbFirstPolicy,
-                            evidence_seed, enforced_reads, native_gate_metadata)
+from agent.kb_first import DiscoveryTracker, EvidenceSeed, evidence_seed
 from agent.planning.complexity import effective_wp_complexity
+from agent.planning.hosted_reader import (DECLARATIONS_SPEC, READER_SPEC,
+                                          declarations_query, read_brief)
 from agent.planning.models import ApprovedWPPlan, WPPlanDraft, plan_id_for
 from agent.planning.projection import project, validate_draft
-from agent.planning.prompts import repair_prompt, turn_prompt, wp_brief
+from agent.prompt import PlannerPromptBuilder, PlannerPromptContext, PromptFactory, PromptRole
 from agent.planning.routing import PlannerRoutingService
 from agent.routing.config import RoutingConfig, load_routing_config
 from agent.routing.gateway import gateway_attempts, gateway_kwargs
 from agent.routing.review import model_identity
 from agent.routing.tool_metrics import instrument_handlers, read_only_handlers
 from agent.spec.models import WorkPackage
-from agent.workspace import plan_native, read_only_session
+from agent.task_contracts.policy import DISCOVERY_CAPABILITIES
+from agent.workspace import plan_native, project_inventory, read_only_session
 from conversation.presentation import progress_line
 from mcp_bridge.activity import describe_call
-from mcp_bridge.models import DoneEvent, ErrorEvent, TextEvent, ToolCallEvent
-from mcp_bridge.registry import ROLE_OPTIMIZER, ToolSpec
+from mcp_bridge.models import DoneEvent, ErrorEvent, ProgressEvent, TextEvent, ToolCallEvent
+from mcp_bridge.registry import KB_NAVIGATION_TOOLS, ROLE_OPTIMIZER, ToolSpec
+from providers import subagents
 
 log = logging.getLogger("codepartner.planning")
 
@@ -59,6 +62,7 @@ def _failure_kind(message: str, use_gateway: bool = False) -> str:
             "unauthorized", "invalid api key", "invalid_api_key", "permission denied",
             "login required", "please log in", "model not available",
             "model is unavailable", "model_not_found", "executable not found",
+            "scoped codex planner",
             "http 401", "status 401", "http 403", "status 403")):
         return "unavailable"
     if any(marker in value for marker in (
@@ -105,7 +109,7 @@ def describe_tool(name: str, arguments: dict, reads: frozenset[str],
 
 def narration_lines(text: str) -> list[str]:
     """Short prose lines from planner text; JSON (the final answer) is never echoed."""
-    if "{" in text and "plan_markdown" in text:
+    if "{" in text and '"tasks"' in text:
         return []
     lines = []
     for line in text.splitlines():
@@ -142,6 +146,15 @@ async def with_progress(call: Callable[[Progress], Awaitable["PlanningTurn"]]
             task.cancel()
 
 
+def _planner_subagents(config):
+    """A native planner locates code itself (KB first) and delegates reading the exact
+    ranges to a reader on the configured cheap model; it may explore as widely as the WP
+    needs."""
+    return subagents.request("planner", roles=(subagents.READER,),
+                             models=config.subagent_models(),
+                             max_turns=config.subagents.max_turns)
+
+
 class PlanningError(Exception):
     pass
 
@@ -173,6 +186,12 @@ def active_task_ids(package: WorkPackage) -> list[str]:
     return [task.id for task in package.tasks if task.status != "cancelled"]
 
 
+def write_task_ids(package: WorkPackage) -> list[str]:
+    """Active tasks that change files: the planner must give them exact edit ranges."""
+    return [task.id for task in package.tasks if task.status != "cancelled"
+            and str(task.preferred_capability or "").lower() not in DISCOVERY_CAPABILITIES]
+
+
 def _kb_offered(specs: list[ToolSpec]) -> bool:
     return any(spec.name.rsplit("__", 1)[-1].startswith("kb_") for spec in specs)
 
@@ -188,7 +207,7 @@ def _plan_json(text: str) -> dict | None:
             value, _ = decoder.raw_decode(text[index:])
         except json.JSONDecodeError:
             continue
-        if isinstance(value, dict) and "plan_markdown" in value:
+        if isinstance(value, dict) and "summary" in value and "tasks" in value:
             found = value
     return found
 
@@ -276,7 +295,7 @@ class WPPlannerService:
             raise PlanningError(f"{package.id} changed in OpenSpec after planning began; "
                                 "discuss the plan again before approving")
         draft = WPPlanDraft.from_dict(session["draft"], session["wp_id"], revision)
-        gaps = validate_draft(draft, active_task_ids(package))
+        gaps = validate_draft(draft, active_task_ids(package), write_task_ids(package))
         if gaps:
             raise PlanningError("the plan is incomplete: " + "; ".join(gaps))
         plan = project(
@@ -302,32 +321,44 @@ class WPPlannerService:
                     progress: Progress = _silent, kb_status: str = "") -> PlanningTurn:
         revision = session["revision"] + 1
         task_ids = active_task_ids(package)
-        brief = wp_brief(change, package, session["wp_complexity"])
-        prompt = turn_prompt(brief, session["discussion"], session["draft"], message,
-                             narrate=self.config.planner.narrate, kb_status=kb_status,
-                             discovery_guidance=(
-                                 self.config.planner.discovery.mode_for("planner") == "advise"),
-                             kb_tools=(_kb_offered(specs)
-                                       and self.config.planner.discovery.enabled),
-                             native=plan_native(self.config.models[
-                                 session["planner_model"]].provider,
-                                 controlled_reads=enforced_reads(self.config.discovery)).native)
+        brief = PlannerPromptBuilder.brief(change, package, session["wp_complexity"])
+        native_plan = plan_native(self.config.models[session["planner_model"]].provider)
+        hosted_reader = (native_plan.native
+                         and self.config.models[session["planner_model"]].provider == "codex"
+                         and getattr(self.config.subagents, "enforce_scope", True))
+        # The file list spares a native planner from probing paths with Glob.
+        inventory = (await asyncio.to_thread(project_inventory, native_plan.project.workspace)
+                     if native_plan.native else "")
+        builder = PromptFactory.create(PromptRole.PLANNER)
+        prompt = builder.with_context(PlannerPromptContext(
+            brief, session["discussion"], session["draft"], message,
+            narrate=self.config.planner.narrate, kb_status=kb_status,
+            discovery_guidance=self.config.planner.discovery.mode_for("planner") == "advise",
+            native=native_plan.native,
+            subagent_request=None if hosted_reader else _planner_subagents(self.config),
+            file_inventory=inventory,
+            workspace=native_plan.project.workspace if native_plan.native else "",
+            kb_tools=(frozenset(spec.name for spec in specs) | {"planner_declarations"}
+                      if hosted_reader and any(spec.name == "kb_query_graph" for spec in specs)
+                      else frozenset(spec.name for spec in specs)),
+            hosted_reader=hosted_reader)).build().text
         mode = self.config.planner.discovery.mode_for("planner")
         evidence = evidence_seed(brief + "\n" + message, kb_status) if mode != "off" else None
         conversation = [{"role": "user", "content": prompt}]
         reply = await self._call(session, revision, kind, message, conversation, specs, handlers,
                                  progress, evidence)
-        draft, gaps = self._parse(reply, session["wp_id"], revision, task_ids)
+        write_ids = write_task_ids(package)
+        draft, gaps = self._parse(reply, session["wp_id"], revision, task_ids, write_ids)
         if draft is None or gaps:
-            problems = gaps or ["the reply contained no plan JSON object with plan_markdown"]
+            problems = gaps or ["the reply contained no plan JSON object with summary and tasks"]
             conversation += [{"role": "assistant", "content": reply},
-                             {"role": "user", "content": repair_prompt(problems)}]
+                             {"role": "user", "content": builder.repair(problems)}]
             await progress(progress_line(
                 "note", "Completing the structured plan: " + "; ".join(problems)[:160]))
             repaired = await self._call(session, revision, "repair", None, conversation,
                                         specs, handlers, progress, evidence)
             repaired_draft, repaired_gaps = self._parse(
-                repaired, session["wp_id"], revision, task_ids)
+                repaired, session["wp_id"], revision, task_ids, write_ids)
             if repaired_draft is not None:
                 draft, gaps = repaired_draft, repaired_gaps
         if draft is None:
@@ -350,13 +381,13 @@ class WPPlannerService:
             return name
 
     @staticmethod
-    def _parse(reply: str, wp_id: str, revision: int, task_ids: list[str]
-               ) -> tuple[WPPlanDraft | None, list[str]]:
+    def _parse(reply: str, wp_id: str, revision: int, task_ids: list[str],
+               write_ids: list[str] | None = None) -> tuple[WPPlanDraft | None, list[str]]:
         payload = _plan_json(reply)
         if payload is None:
             return None, []
         draft = WPPlanDraft.from_dict(payload, wp_id, revision)
-        return draft, validate_draft(draft, task_ids)
+        return draft, validate_draft(draft, task_ids, write_ids)
 
     async def _call(self, session: dict, revision: int, kind: str, message: str | None,
                     conversation: list[dict], specs: list[ToolSpec], handlers: dict,
@@ -430,11 +461,10 @@ class WPPlannerService:
                 reported.add(refused)
                 await progress(progress_line("note", notes[refused]))
 
-        plan = plan_native(model.provider,
-                           controlled_reads=enforced_reads(self.config.discovery))
+        plan = plan_native(model.provider)
         if plan.mode == "native" and not plan.native:
             raise PlanningError(f"native execution is unavailable: {plan.reason}")
-        # Read-only native run: its own file tools, the KB on demand, no KB-first gates.
+        # Read-only native run: its own file tools and the KB, under the KB-first prompt rule.
         native = read_only_session(plan.project) if plan.native else None
         discovery = self.config.planner.discovery
         planner_mode = discovery.mode_for("planner")
@@ -448,35 +478,66 @@ class WPPlannerService:
                    else None)
         if tracker is not None:
             tracker.prompt(conversation)
-        # KB-first whenever Codebase Memory is offered, whatever the discovery mode.
         wrapped, metrics = instrument_handlers(
             readable, reads, searches, self.config.planner.max_tool_calls, on_call,
             max_reads=self.config.planner.max_file_reads, tracker=tracker)
-        policy = (KbFirstPolicy(
-            role="planner", tool_names=[spec.name for spec in specs],
-            seed=evidence, tracker=tracker,
-            outline_gate_lines=discovery.outline_gate_lines,
-            search_gate_max=getattr(discovery, "search_gate_max", 5),
-            mode=discovery.mode_for("planner"), tier=session["wp_complexity"],
-            small_file_bytes=discovery.small_file_bytes,
-            enforce_reads=enforced_reads(discovery))
-            if getattr(discovery, "enabled", True)
-            and native is None else None)
+        strict_codex = (native is not None and model.provider == "codex"
+                        and getattr(self.config.subagents, "enforce_scope", True))
+        offered_specs = specs
+        offered_handlers = wrapped
+        if strict_codex:
+            reader_model, reader_effort = self.config.subagent_models().get("codex", (None, None))
+            if not reader_model:
+                return "unavailable", "scoped Codex planner needs a configured Codex reader model"
+            # The planner gets declarations through planner_declarations instead.
+            safe = KB_NAVIGATION_TOOLS - {"kb_get_file_outline"}
+            offered_specs = [spec for spec in specs if spec.name in safe]
+            offered_handlers = {key: value for key, value in wrapped.items() if key in safe}
+
+            async def hosted_read(arguments: dict) -> str:
+                result = await read_brief(native.workspace, arguments,
+                                          self.provider_lookup("codex"), reader_model,
+                                          reader_effort, native.metrics)
+                await progress(progress_line(
+                    "note", "Reader request was not answered: " + result[len("Error: "):])
+                    if result.startswith("Error: ")
+                    else progress_line("tool", "Reader inspected requested ranges"))
+                return result
+
+            offered_specs.append(READER_SPEC)
+            offered_handlers[READER_SPEC.name] = hosted_read
+            if "kb_query_graph" in wrapped:
+                async def declarations(arguments: dict) -> str:
+                    try:
+                        query = declarations_query(arguments)
+                    except ValueError as exc:
+                        return f"Error: {exc}"
+                    return await wrapped["kb_query_graph"](query)
+
+                offered_specs.append(DECLARATIONS_SPEC)
+                offered_handlers[DECLARATIONS_SPEC.name] = declarations
         kwargs = {"model": model.cli_model, "role": ROLE_OPTIMIZER,
-                  "direct_tool_handlers": wrapped,
-                  "kb_first": policy, "native": native,
+                  "direct_tool_handlers": offered_handlers,
+                  "native": native,
+                  "subagents": (_planner_subagents(self.config)
+                                if native is not None and not strict_codex else None),
                   "run_metadata": {"planner": True, "planner_model": name,
-                                   # Planners are KB-first under every policy.
-                                   **native_gate_metadata(discovery, always=True),
+                                   "hosted_reader": strict_codex,
+                                   "enforce_scope": getattr(self.config.subagents,
+                                                            "enforce_scope", True),
                                    "planning_session_id": session["session_id"],
                                    "wp_id": session["wp_id"],
                                    "gateway_used": use_gateway}}
         if model.provider == "codex":
             kwargs["concrete_model"] = True
-            kwargs["reasoning_effort"] = effort
             kwargs["reviewer_mode"] = True
+        if effort:
+            kwargs["reasoning_effort"] = effort
         kwargs.update(gateway_kwargs(model.provider, self.config.agentgateway_url,
                                      use_gateway))
+        if model.provider == "claude" and self.config.planner.prompt_cache_ttl == "5m":
+            kwargs["execution_env"] = {**kwargs.get("execution_env", {}),
+                                       "FORCE_PROMPT_CACHING_5M": "1"}
         parts: list[str] = []
         errors: list[str] = []
         usage = None
@@ -486,7 +547,7 @@ class WPPlannerService:
         started = time.monotonic()
         try:
             async for event in self.provider_lookup(model.provider).tools(
-                    conversation, specs, **kwargs):
+                    conversation, offered_specs, **kwargs):
                 if isinstance(event, TextEvent):
                     parts.append(event.text)
                     if narrate and _failure_kind(event.text) not in {"quota", "unavailable"}:
@@ -494,6 +555,9 @@ class WPPlannerService:
                             await progress(progress_line("narration", line))
                 elif isinstance(event, ErrorEvent):
                     errors.append(event.message)
+                elif isinstance(event, ProgressEvent):
+                    # Native steps (reads, reader requests and briefs), already formatted.
+                    await progress(event.text)
                 elif isinstance(event, ToolCallEvent):
                     hard_failure = True
                     raise PlanningError("the planner requested an IDE tool that is not "
@@ -526,9 +590,7 @@ class WPPlannerService:
                              "gateway_used": use_gateway, "gateway_attempt": attempt,
                              "failure_kind": classification,
                              **({"cancelled": True} if cancelled else {}),
-                             **({"outline_gate": policy.outline.summary()} if policy else {}),
-                             **({"discovery": policy.summary()} if policy else
-                                {"discovery": tracker.summary()} if tracker else {})},
+                             **({"discovery": tracker.summary()} if tracker else {})},
             "latency_ms": int((time.monotonic() - started) * 1000),
             "error": failure,
         })

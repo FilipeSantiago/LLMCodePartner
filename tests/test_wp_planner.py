@@ -12,7 +12,7 @@ from unittest import mock
 from api import dialog_controller
 from agent.planning import service as planning_service
 from agent.planning.models import ApprovedWPPlan, WPPlanDraft, plan_id_for
-from agent.planning.prompts import wp_brief
+from agent.prompt import PlannerPromptBuilder
 from agent.planning.projection import project, validate_draft
 from agent.planning.render import coder_context
 from agent.planning.service import PlanningError, WPPlannerService, describe_tool
@@ -58,7 +58,7 @@ class KbToolFeedbackTests(unittest.TestCase):
                 name="Create loader", statement="The system SHALL create a loader by name.",
                 scenarios=[Scenario(name="Known loader", when="a name is registered",
                                     then="the matching loader is returned")])])]
-        brief = json.loads(wp_brief(change, package, "high"))
+        brief = json.loads(PlannerPromptBuilder.brief(change, package, "high"))
         self.assertEqual(brief["work_package"]["requirements"][0]["statement"],
                          "The system SHALL create a loader by name.")
         self.assertEqual(brief["work_package"]["requirements"][0]["scenarios"][0]["then"],
@@ -104,7 +104,9 @@ def plan_payload(task_ids=TASKS, summary="Add a loader factory.", **overrides):
                    "finding_ids": []},
         "tasks": {task_id: {"objective": f"Do {task_id}", "approach": "Extend the registry",
                             "relevant_files": [f"src/{task_id.lower()}.py"],
-                            "symbols": ["Registry.register"], "finding_ids": []}
+                            "symbols": ["Registry.register"], "finding_ids": [],
+                            "edits": [{"file": f"src/{task_id.lower()}.py", "start_line": 1,
+                                       "end_line": 5, "change": f"Implement {task_id}"}]}
                   for task_id in task_ids},
         "reviewer": {"objective": "Factory delivered",
                      "expected_behavior": ["Loaders are created by name"],
@@ -236,7 +238,7 @@ class PlannerServiceTests(unittest.IsolatedAsyncioTestCase):
         turn = await planner.start("conv", "WP4", "go", _specs(), {})
         self.assertEqual(turn.planner_model, "codex-sol-high")
         self.assertEqual([name for name, _, _ in calls], ["claude", "claude", "codex"])
-        self.assertNotIn("execution_env", calls[1][2])
+        self.assertNotIn("ANTHROPIC_BASE_URL", calls[1][2].get("execution_env", {}))
 
     async def test_gateway_401_retries_codex_direct_after_claude_quota(self):
         # Exercise the opt-in gateway mode even though the bundled
@@ -390,7 +392,7 @@ class PlannerServiceTests(unittest.IsolatedAsyncioTestCase):
 
             async def tools(self, conversation, specs, **kwargs):
                 self.calls.append(kwargs)
-                if kwargs.get("execution_env"):
+                if "ANTHROPIC_BASE_URL" in kwargs.get("execution_env", {}):
                     yield ErrorEvent("HTTP 502 bad gateway")
                     yield DoneEvent("endTurn", usage={"input_tokens": 10,
                                                        "total_cost_usd": 0.01})
@@ -403,8 +405,9 @@ class PlannerServiceTests(unittest.IsolatedAsyncioTestCase):
         turn = await self.planner(provider).start("conv", "WP4", "go", _specs(), {})
         self.assertEqual(turn.planner_model, "claude-opus")
         self.assertEqual(provider.calls[0]["execution_env"],
-                         {"ANTHROPIC_BASE_URL": self.config.agentgateway_url})
-        self.assertNotIn("execution_env", provider.calls[1])
+                         {"ANTHROPIC_BASE_URL": self.config.agentgateway_url,
+                          "FORCE_PROMPT_CACHING_5M": "1"})
+        self.assertEqual(provider.calls[1]["execution_env"], {"FORCE_PROMPT_CACHING_5M": "1"})
         attempts = await self.persistence.planning_turns(turn.session_id)
         self.assertEqual([row["tool_metrics"]["gateway_used"] for row in attempts],
                          [True, False])
@@ -421,6 +424,47 @@ class PlannerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider.calls[0]["reasoning_effort"], "high")
         self.assertTrue(provider.calls[0]["reviewer_mode"])
 
+    async def test_claude_planner_uses_5m_cache_and_configured_effort(self):
+        self.config = replace(self.config, planner=replace(
+            self.config.planner, reasoning_effort={"high": "medium"}))
+        provider = PlannerProvider(plan_payload())
+        await self.planner(provider).start("conv", "WP4", "go", _specs(), {})
+        self.assertEqual(provider.calls[0]["execution_env"]["FORCE_PROMPT_CACHING_5M"], "1")
+        self.assertEqual(provider.calls[0]["reasoning_effort"], "medium")
+
+    async def test_claude_planner_keeps_cli_cache_ttl_and_effort_when_configured(self):
+        self.config = replace(self.config, planner=replace(
+            self.config.planner, reasoning_effort={}, prompt_cache_ttl="1h"))
+        provider = PlannerProvider(plan_payload())
+        await self.planner(provider).start("conv", "WP4", "go", _specs(), {})
+        self.assertNotIn("FORCE_PROMPT_CACHING_5M", provider.calls[0].get("execution_env", {}))
+        self.assertNotIn("reasoning_effort", provider.calls[0])
+
+    def test_plan_without_markdown_is_rendered_from_structure(self):
+        payload = plan_payload()
+        del payload["plan_markdown"]
+        reply = "Done.\n```json\n" + json.dumps(payload, indent=2) + "\n```"
+        for text in (reply, json.dumps(payload, separators=(",", ":"))):
+            draft = WPPlanDraft.from_dict(planning_service._plan_json(text), "WP4", 1)
+            self.assertIn("**Objective:** One factory for every loader", draft.plan_markdown)
+            self.assertIn("- **WP4-T1** — Do WP4-T1", draft.plan_markdown)
+            self.assertIn("  - Approach: Extend the registry", draft.plan_markdown)
+            self.assertEqual(validate_draft(draft, list(TASKS)), [])
+        stored = WPPlanDraft.from_dict(plan_payload(), "WP4", 1)
+        self.assertTrue(stored.plan_markdown.startswith("1. Add `LoaderFactory`."))
+
+    def test_prompt_lists_project_files_and_asks_for_compact_json(self):
+        from agent.prompt.planner import SYSTEM
+        from tests.test_subagents import turn_prompt
+        prompt = turn_prompt("brief", [], None, "go", native=True,
+                             file_inventory="src/: a.py b.py")
+        self.assertIn("Project files (current; one directory per line):\nsrc/: a.py b.py",
+                      prompt)
+        self.assertNotIn("Project files", turn_prompt("brief", [], None, "go"))
+        self.assertIn("compact JSON object", SYSTEM)
+        self.assertIn("no-op tool calls", SYSTEM)
+        self.assertNotIn("plan_markdown", SYSTEM)
+
     async def test_planner_required_and_disabled_modes_do_not_retry(self):
         for mode in ("required", "disabled"):
             with self.subTest(mode=mode):
@@ -430,7 +474,9 @@ class PlannerServiceTests(unittest.IsolatedAsyncioTestCase):
                 provider = PlannerProvider(plan_payload())
                 await self.planner(provider).start(f"conv-{mode}", "WP4", "go", _specs(), {})
                 self.assertEqual(len(provider.calls), 1)
-                self.assertEqual("execution_env" in provider.calls[0], mode == "required")
+                self.assertEqual(
+                    "ANTHROPIC_BASE_URL" in provider.calls[0].get("execution_env", {}),
+                    mode == "required")
 
     async def test_start_routes_by_wp_complexity_and_keeps_structured_state(self):
         provider = PlannerProvider(plan_payload(), read=["src/registry.py", "src/trainer.py"])
@@ -572,23 +618,27 @@ class ArtifactTests(unittest.TestCase):
         return WPPlanDraft.from_dict(plan_payload(**overrides), "WP4", 1)
 
     def test_planner_prompt_keeps_discovery_tasks_read_only(self):
-        from agent.planning.prompts import SYSTEM
+        from agent.prompt.planner import SYSTEM
         self.assertIn("inspection", SYSTEM)
         self.assertIn("Never plan file writes for them", SYSTEM)
 
     def test_planner_prompt_is_kb_first_in_both_modes(self):
-        from agent.planning.knowledge_base import KB_READING_GUIDANCE, KB_SELECTIVE_GUIDANCE
-        from agent.planning.prompts import NATIVE_KB_GUIDANCE, NATIVE_SYSTEM, SYSTEM
+        from agent.prompt.coder import CoderPromptBuilder
+        KB_FIRST_RULE = CoderPromptBuilder().read_pipeline()
+        KB_SELECTIVE_GUIDANCE = KB_FIRST_RULE
+        from agent.prompt.planner import SYSTEM
+        NATIVE_SYSTEM = SYSTEM  # one planner system prompt for both execution modes
         from agent.task_contracts.policy import DISCOVERY_CAPABILITIES
         for prompt in (SYSTEM, NATIVE_SYSTEM):
             self.assertTrue(prompt.startswith("You are the Work Package planner."))
-            self.assertIn("**KB-first, source-second**", prompt)
+            self.assertIn("**KB-first, bulk, source-second**", prompt)
+            self.assertEqual(prompt.count("## Read pipeline"), 1)
             self.assertIn("## Investigation Stopping Condition", prompt)
             self.assertTrue(all(name in prompt for name in DISCOVERY_CAPABILITIES))
             self.assertIn('JSON shape:\n{\n  "summary"', prompt)
             self.assertNotIn(KB_SELECTIVE_GUIDANCE, prompt)
-        self.assertIn(KB_READING_GUIDANCE, SYSTEM)
-        self.assertIn(NATIVE_KB_GUIDANCE, NATIVE_SYSTEM)
+        self.assertNotIn(KB_FIRST_RULE, SYSTEM)
+        self.assertNotIn(KB_FIRST_RULE, NATIVE_SYSTEM)
         self.assertNotIn("approved plan context", NATIVE_SYSTEM)
 
     def test_validation_reports_dangling_ids_and_unknown_tasks(self):
@@ -612,8 +662,9 @@ class ArtifactTests(unittest.TestCase):
                        wp_fingerprint="f", wp_complexity="high", planner_model="claude-opus")
         context = coder_context(plan, "WP4-T1")
         self.assertIn("RELEVANT CONTEXT (WP4-T1;", context)
-        self.assertIn("REQUIRED CHANGES", context)
-        self.assertIn("Expected approach: Extend the registry", context)
+        self.assertIn("Approach: Extend the registry", context)
+        self.assertIn("EDIT (your files; planned lines widened by 10):\n"
+                      "- src/wp4-t1.py:1-15 (planned lines 1-5) — Implement WP4-T1", context)
         self.assertIn("src/legacy/", context)
         self.assertIn("src/wp4-t1.py", context)
         self.assertNotIn("src/wp4-t2.py", context)

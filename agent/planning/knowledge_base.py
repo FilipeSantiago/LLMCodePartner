@@ -17,65 +17,16 @@ from mcp_bridge.registry import ToolSpec
 
 log = logging.getLogger("codepartner.planning.kb")
 
-KB_READING_GUIDANCE = (
-    "Use Codebase Memory first for each file version; controlled reads require it: "
-    "use it to locate definitions, dependencies, and candidate files: "
-    "kb_search_graph for symbols, kb_trace_path for relationships, and kb_get_file_outline "
-    "for file structure. kb_get_code_snippet resolves a symbol's indexed location, then "
-    "Code Partner verifies the current IDE source. Graph results, outlines, "
-    "and line numbers are navigation hints, never source evidence. Before edits or review "
-    "verdicts, inspect exact current IDE source regions and expand only when needed. "
-    "The first read of a file returns its KB outline; choose explicit current-source "
-    "ranges of at most 120 lines. Repeating a broad read cannot reveal the whole file. "
-    "A bare "
-    "identifier text search may first return graph definitions under an explicit warning; "
-    "repeat the identical search for actual text matches. Searches for usages, imports, "
-    "tests, docs, literals, and configurations execute unchanged. If KB is unavailable "
-    "or has no outline, search inside the file first and then read bounded ranges. "
-    "Current files remain authoritative."
-)
-
-# Coder and reviewer guidance under `discovery.policy: selective` (the default):
-# the KB is an on-demand architectural source, not a mandatory first step.
-KB_SELECTIVE_GUIDANCE = (
-    "Context first: start from the task, its acceptance criteria and the approved plan "
-    "context. Then read current source directly with targeted reads; current files are "
-    "authoritative and override any index result. When Codebase Memory tools are offered, "
-    "use them only when architecture, cross-module dependencies or impact analysis would "
-    "change your approach (kb_search_graph, kb_trace_path, kb_get_file_outline); their "
-    "results are navigation hints, never source evidence."
-)
-
-
-# KB-first for agents that read the mounted project with their own file tools: the IDE
-# gates and their wording do not apply there.
-KB_NATIVE_GUIDANCE = (
-    "Use Codebase Memory first to locate architecture, definitions, dependencies and "
-    "candidate files: kb_search_graph for symbols, kb_trace_path for relationships, "
-    "kb_get_file_outline for file structure. Graph results, outlines and line numbers are "
-    "navigation hints, never source evidence; verify implementation details in the current "
-    "files with targeted reads. If KB is unavailable or stale, investigate the files "
-    "directly and record the limitation."
-)
-KB_NATIVE_EXECUTION_GUIDANCE = (
-    KB_NATIVE_GUIDANCE + " Answer architecture, dependency and call-site questions with "
-    "these tools before Grep/Glob or shell searches; read files to verify and edit."
-)
-
-
-def kb_guidance(policy: str | None, native: bool = False) -> str:
-    """Shared coder/reviewer KB guidance for the configured discovery policy."""
-    if policy != "kb_first":
-        return KB_SELECTIVE_GUIDANCE
-    return KB_NATIVE_EXECUTION_GUIDANCE if native else KB_READING_GUIDANCE
-
-
 _SOCKET = "/run/kb-bridge/mcp.sock"
 _URL = "http://kb-bridge/mcp"
 _TOOLS = frozenset((
     "get_architecture", "search_graph", "trace_path", "get_file_outline",
     "get_code_snippet", "index_status",
 ))
+# Offered when the KB server has them: `query_graph` answers many files in one call.
+_OPTIONAL_TOOLS = frozenset(("query_graph",))
+# Outline rows worth a coder's or planner's attention; files, modules and folders are not.
+_OUTLINE_SKIP = frozenset(("File", "Module", "Folder", "Package", "Project"))
 _BUDGETS = {"openspec": 12000, "implementation": 24000}
 # CamelCase with an inner capital and a lowercase letter, or snake_case with an underscore.
 _IDENTIFIER = re.compile(r"\b(?:[A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*"
@@ -183,8 +134,9 @@ class CodebaseMemoryClient:
             status = self._payload(await session.call_tool(
                 "index_status", {"project": project_id, "format": "json"}))
             status_text = json.dumps(status, ensure_ascii=False)[:1600]
+            offered = _TOOLS | (_OPTIONAL_TOOLS & discovered.keys())
             specs = []
-            for name in sorted(_TOOLS):
+            for name in sorted(offered):
                 tool = discovered[name]
                 schema = dict(tool.inputSchema)
                 properties = dict(schema.get("properties") or {})
@@ -209,7 +161,7 @@ class CodebaseMemoryClient:
                                      getattr(result, "structuredContent", None) or {})
 
         handlers = {"kb_" + name: (lambda args, name=name: call(name, args))
-                    for name in _TOOLS}
+                    for name in offered}
         log.info("kb_project_validated project=%s tool_count=%d", project_id, len(specs))
         return specs, handlers, status_text
 
@@ -268,8 +220,8 @@ class CodebaseMemoryClient:
             if architecture.isError:
                 raise KnowledgeBaseError("Codebase Memory architecture lookup failed")
             sections = ["KB project: " + project_id,
-                        "Index status: " + json.dumps(status, ensure_ascii=False),
-                        "Architecture: " + _result_text(architecture)]
+                        "Index status: " + _index_summary(status),
+                        "Architecture: " + _compact(_result_text(architecture), project_id)]
             for number, search in enumerate(searches, start=1):
                 if progress is not None:
                     await progress(f"Searching indexed components and dependencies "
@@ -282,11 +234,15 @@ class CodebaseMemoryClient:
                     if not graph.isError:
                         label = ("Symbols named in the request: " if "name_pattern" in search
                                  else "Keyword graph matches (secondary leads): ")
-                        sections.append(label + _result_text(graph))
-                        if ("name_pattern" in search and stage == "implementation"
-                                and "get_file_outline" in names):
-                            sections += await self._outlines(
-                                session, project_id, _symbol_files(graph), progress)
+                        sections.append(label + _compact(_result_text(graph), project_id))
+                        if "name_pattern" in search and stage == "implementation":
+                            files = _symbol_files(graph)
+                            if "query_graph" in names:
+                                sections += await self._bulk_outlines(
+                                    session, project_id, files, progress)
+                            elif "get_file_outline" in names:
+                                sections += await self._outlines(
+                                    session, project_id, files, progress)
                 except Exception as exc:
                     log.warning("kb_targeted_search_failed project=%s stage=%s error=%s",
                                 project_id, stage, exc)
@@ -303,6 +259,30 @@ class CodebaseMemoryClient:
             return prefix + body[:_BUDGETS[stage] - len(prefix) - len(suffix)] + suffix
 
     @staticmethod
+    async def _bulk_outlines(session, project_id: str, files: list[str],
+                             progress: KbProgress | None) -> list[str]:
+        """Outline every file holding the WP's named symbols in one `query_graph` call."""
+        if not files:
+            return []
+        if progress is not None:
+            await progress(f"Reading outlines of {len(files)} files named in the WP")
+        paths = ", ".join(json.dumps(path) for path in files)
+        query = (f"MATCH (n) WHERE n.file_path IN [{paths}] AND n.start_line IS NOT NULL "
+                 "RETURN n.file_path, labels(n), n.name, n.start_line, n.end_line "
+                 "ORDER BY n.file_path, n.start_line")
+        try:
+            result = await session.call_tool("query_graph", {
+                "project": project_id, "query": query, "format": "json", "max_rows": 400})
+            if result.isError:
+                raise KnowledgeBaseError(_result_text(result)[:300])
+            rows = json.loads(_result_text(result)).get("rows") or []
+        except Exception as exc:
+            log.warning("kb_bulk_outline_failed project=%s files=%d error=%s",
+                        project_id, len(files), exc)
+            return await CodebaseMemoryClient._outlines(session, project_id, files, progress)
+        return _outline_sections(rows)
+
+    @staticmethod
     async def _outlines(session, project_id: str, files: list[str],
                         progress: KbProgress | None) -> list[str]:
         """Outline the files holding the WP's named symbols, so the planner reads less."""
@@ -317,11 +297,31 @@ class CodebaseMemoryClient:
                     "get_file_outline", {"project": project_id, "file_path": path,
                                          "limit": 60, "format": "json"})
                 if not outline.isError:
-                    sections.append(f"File outline {path}: " + _result_text(outline))
+                    sections.append(f"File outline {path}: "
+                                    + _compact(_result_text(outline), project_id))
             except Exception as exc:
                 log.warning("kb_outline_failed project=%s file=%s error=%s",
                             project_id, path, exc)
         return sections
+
+
+def _outline_sections(rows: list) -> list[str]:
+    """One "File outline" line per file from `query_graph` rows of
+    (file_path, labels, name, start_line, end_line)."""
+    outlines: dict[str, list[str]] = {}
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 5:
+            continue
+        path, labels, name, start, end = row[:5]
+        try:
+            kinds = json.loads(labels) if isinstance(labels, str) else labels
+        except json.JSONDecodeError:
+            kinds = [labels]
+        if not isinstance(path, str) or set(kinds or ()) & _OUTLINE_SKIP:
+            continue
+        outlines.setdefault(path, []).append(f"{name} {start}-{end}")
+    return [f"File outline {path}: " + "; ".join(entries)
+            for path, entries in outlines.items()]
 
 
 def _symbol_files(result, limit: int = 6) -> list[str]:
@@ -336,6 +336,64 @@ def _symbol_files(result, limit: int = 6) -> list[str]:
     files = (group.get("file") for group in groups or () if isinstance(group, dict))
     return list(dict.fromkeys(path for path in files
                               if isinstance(path, str) and path))[:limit]
+
+
+# Paging, scoring and graph-wide counters: noise in a planner prompt.
+_NOISE_KEYS = frozenset({
+    "project", "total_nodes", "total_edges", "node_labels", "edge_types", "languages",
+    "boundaries", "qn_rule", "has_more", "next_offset", "total", "total_relation",
+    "search_mode", "returned", "count", "truncated", "truncation_reason"})
+_NOISE_COLUMNS = frozenset({"rank", "cohesion", "score"})
+
+
+def _index_summary(status: object) -> str:
+    """One line from index_status: state, freshness, size and any coverage gaps."""
+    if not isinstance(status, dict):
+        return str(status)
+    parts = [str(status.get(key)) for key in ("status",) if status.get(key)]
+    parts += [f"{key}={status[key]}" for key in ("indexed_at", "nodes") if status.get(key)]
+    for key in ("parse_partial", "parse_unusable", "skipped"):
+        count = (status.get(key) or {}).get("count") if isinstance(status.get(key), dict) else 0
+        if count:
+            parts.append(f"{key}={count} files")
+    return ", ".join(parts)
+
+
+def _compact(text: str, project_id: str) -> str:
+    """A KB JSON result without paging/scoring noise or the repeated project qn prefix."""
+    try:
+        payload = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return text.replace(project_id + ".", "")
+
+    def strip(value):
+        if isinstance(value, dict):
+            cols = value.get("cols")
+            drop = ({index for index, name in enumerate(cols) if name in _NOISE_COLUMNS}
+                    if isinstance(cols, list) else set())
+            out = {}
+            for key, item in value.items():
+                if key in _NOISE_KEYS:
+                    continue
+                if key == "cols" and drop:
+                    item = [name for index, name in enumerate(item) if index not in drop]
+                elif key == "rows" and drop and isinstance(item, list):
+                    item = [[cell for index, cell in enumerate(row) if index not in drop]
+                            if isinstance(row, list) else row for row in item]
+                out[key] = strip(item)
+            return out
+        if isinstance(value, list):
+            # Builtins (len, list.append) are hotspots of every Python project.
+            return [strip(item) for item in value
+                    if not (isinstance(item, list) and item and isinstance(item[0], str)
+                            and item[0].startswith("builtins."))]
+        if isinstance(value, str):
+            return value.replace(project_id + ".", "")
+        if isinstance(value, float):
+            return round(value, 2)
+        return value
+
+    return json.dumps(strip(payload), ensure_ascii=False, separators=(",", ":"))
 
 
 def _result_text(result) -> str:
@@ -458,8 +516,10 @@ def _timestamp(value) -> float | None:
 
 async def catch_up_index(persistence, project_id: str | None, config: dict | None,
                          ide_client, project_path: str | None,
-                         progress: KbProgress | None = None) -> str | None:
-    """Reindex before planning or coding when accepted edits are newer than the index.
+                         progress: KbProgress | None = None,
+                         force: bool = False) -> str | None:
+    """Reindex before planning or coding when accepted edits are newer than the index,
+    or always with `force` (planning starts from a fresh index).
 
     Covers refreshes that never ran; failures are logged and never block the caller.
     """
@@ -468,6 +528,12 @@ async def catch_up_index(persistence, project_id: str | None, config: dict | Non
     kb_project = config["project_id"]
     try:
         kb = CodebaseMemoryClient()
+        if force:
+            if progress is not None:
+                await progress("Refreshing the KB index before planning")
+            await _host_reindex(kb_project, ide_client, project_path, kb)
+            log.info("kb_planning_refresh_succeeded project=%s", kb_project)
+            return "KB index refreshed before planning."
         _, status = await kb.project_metadata(kb_project)
         since = _timestamp(status.get("indexed_at"))
         if since is None:
@@ -482,8 +548,9 @@ async def catch_up_index(persistence, project_id: str | None, config: dict | Non
         log.info("kb_catch_up_succeeded project=%s changed=%d", kb_project, len(changed))
         return f"KB index refreshed ({len(changed)} files changed since the last index)."
     except Exception as exc:
-        log.warning("kb_catch_up_failed project=%s error=%s", kb_project, exc)
-        return None
+        log.warning("kb_catch_up_failed project=%s force=%s error=%s", kb_project, force, exc)
+        return (f"KB refresh failed ({str(exc)[:160]}); planning on the current index."
+                if force else None)
 
 
 async def configured_planner_tools(config: dict | None):

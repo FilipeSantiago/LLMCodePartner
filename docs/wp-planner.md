@@ -64,11 +64,19 @@ See `docs/model-routing.md` for the floors and the role-relative check.
 | any other text | "Discuss more": next planner turn in the same session |
 | `approve`, `1`, `yes`, "looks good, go ahead" | Approve the current revision and start the job |
 | `discuss`, `2` | Asks what to change (no model call) |
+| `explain`, `3`, `details` | Shows the detailed plan: approach, decisions, inspected evidence and every edit and reference range (no model call) |
 | "Let's do WP5" | Supersedes the session and plans WP5 |
 | `never mind`, `stop planning`, `reject <token>` | Abandons planning |
 
-Every complete plan ends with the two actions **Approve and implement** and
-**Discuss more**. Nothing is coded before approval.
+The plan shown first is short: the summary, one line per task, and the affected files
+marked new or modified. Every complete plan ends with the actions **Approve and
+implement**, **Discuss more** and **Explain** (the detailed view, rendered from the
+stored draft). Nothing is coded before approval.
+
+Every new planning session first refreshes the Codebase Memory index
+(`catch_up_index(force=True)`), so KB outlines and line ranges match the current code;
+discuss turns reuse it. A failed refresh is shown as a progress line and planning
+continues on the current index.
 
 ## Live progress
 
@@ -94,14 +102,27 @@ All chat formatting goes through `conversation/presentation.py`, which planner, 
 
 ## The planner keeps structured state
 
-Every planner turn returns one JSON object (`agent/planning/prompts.py`). It holds the
-human-readable `plan_markdown` and the full structured state:
+Every planner turn returns one compact JSON object (`agent/prompt/planner.py`) holding
+the full structured state. The planner writes no prose plan: `plan_markdown` is rendered
+from `shared` and `tasks` (`plan_outline` in `agent/planning/models.py`), which keeps the
+output short. Drafts stored before this change keep their own `plan_markdown`.
+
+A native planner also gets the project's file list in its prompt, so it does not probe
+paths with Glob. Claude planner runs write a 5-minute prompt cache
+(`planner.prompt_cache_ttl`, default `5m`) instead of the CLI's 1-hour cache, and
+`planner.reasoning_effort` applies to Claude as well as Codex.
+
+The structured state:
 
 - `findings`: verified facts (with file evidence) or explicit assumptions, with
   stable ids, linked to tasks;
 - `shared`: the `WPSharedContext`, information several tasks need;
-- `tasks`: one `TaskContext` per OpenSpec task, holding objective, approach, files,
-  symbols, existing implementation, constraints, do-not-modify, and expected tests;
+- `tasks`: one `TaskContext` per OpenSpec task, holding objective, approach,
+  `edits` (each file and the exact current lines to change, with the symbol and a short
+  change; new files have no lines), `references` (the files and ranges the coder reads
+  for context, each with why), constraints, do-not-modify, and expected tests. Every
+  task that writes files must have edits; an edit may not target a do-not-modify path.
+  Plans from before edits and references keep their `relevant_files`;
 - `reviewer`: the `ReviewerContext`, holding expected behavior, task boundaries,
   risks, assumptions, and validation expectations.
 
@@ -133,9 +154,11 @@ claim time carries it.
   files and symbols to the contract scope. Planner facts become `known_context`.
   `do_not_modify` is advisory context, never `excluded_files`, because excluded
   files cannot even be read.
-- **Coder prompt:** `TaskExecutionService` adds an `APPROVED WP PLAN CONTEXT` block
-  and tells the coder to verify the listed files first and search more broadly only
-  when the context proves insufficient.
+- **Coder prompt:** `TaskExecutionService` adds an `APPROVED WP PLAN CONTEXT` block:
+  the objective, approach, `EDIT` lines (`file:start-end`, the planned lines widened by
+  `planner.edit_margin_lines`, default 10), `REFERENCES`, planner facts, constraints and
+  validation. The coder's scope is its edit files plus its references; going beyond it
+  requires a stated `SCOPE EXCEPTION: <question>` (see [prompts](prompts.md)).
 - **Reviewer:** after each task, CodePartner appends `wp_reviewer_context_events`
   (files changed, decisions, captured tests, retries, deviations from the planned
   files, unresolved gaps). The review receives the frozen `ReviewerContext` plus
@@ -160,40 +183,18 @@ planner-vs-downstream cost comparison.
 
 ### KB-first discovery
 
-The shared run-local policy serves the planner, and, when `discovery.policy` is
-`kb_first`, coders and reviewers too, through the normal request-scoped tool dispatch.
-In `kb_first`, all roles use controlled IDE tools rather than native file access.
-For each file, the first attempted read obtains a KB outline; subsequent reads
-must name a bounded line range. If the KB has no outline, a file-scoped search
-must precede the bounded read. The reviewer checks changed paths without sending
-full-file snapshots to the model.
-With the default `selective` policy, coders and reviewers use the KB on demand: no
-interception, no advisories, telemetry only. Generated KB lookups and IDE reads undergo
-the same registry, adapter, stop, journal, budget and reviewer-path checks as
-direct agent calls. Set top-level discovery.enabled to false to disable it.
-discovery.search_gate_max defaults to five. See
-[Codebase Memory](codebase-memory.md) for search interception, current-source
-verification and edit freshness.
+In `kb_first`, coder and reviewer prompts consult Codebase Memory before reading code.
+The planner has one read pipeline: consult KB, choose the minimum current source needed,
+and delegate source inspection to its `reader` subagent when offered. The parent plans
+from its cited brief. If KB is unavailable, it still delegates narrow inspection; if
+the reader is unavailable or fails, it may make bounded direct reads and records why.
+This is prompt guidance only; nothing intercepts native reads.
+With the `selective` policy, coders and reviewers use the KB on demand. Set top-level
+`discovery.enabled` to false to disable discovery telemetry and advisories. See
+[Codebase Memory](codebase-memory.md).
 
-Whenever Codebase Memory tools are offered to the planner, in any discovery mode:
-- The planner prompt carries a KB-first discovery order: prefetched context, then
-  `kb_search_graph` / `kb_trace_path`, then `kb_get_file_outline` before reading a
-  code file, then ranged `read_file` for the needed symbols. Text and regex search
-  are reserved for what the graph cannot answer. Current IDE source stays
-  authoritative; the KB is the map.
-- **Outline gate.** A broad read (from the start, no end line, no `limit` or one
-  above `discovery.outline_gate_lines`, default 120) of a code file that
-  has not yet been outlined, range-read or gated returns the file's KB outline
-  instead, with "Read not performed …". Repeating the same read returns the file.
-  - Served outlines count as KB calls, not reads, and are served even when the
-    read budget is exhausted.
-  - These pass straight through to the IDE: non-code files, files the index lacks
-    (e.g. `.venv`), files whose outline ends before `outline_gate_lines`, outline
-    errors, and full reads after the planner's own outline or ranged read.
-  - Each turn records `outline_gate: {served, passthrough: {repeat, after_outline,
-    small, not_indexed, non_code, error}}` in `tool_metrics`.
-- The read-budget refusal no longer points to Codebase Memory as an after-budget
-  fallback.
+The planner uses this read pipeline in every discovery mode. KB results locate source;
+the reader's inspection of current source is authoritative for implementation details.
 
 A stopped planning run is recorded too: its turn row has `error: "cancelled"`,
 `tool_metrics.cancelled: true`, and the metrics collected up to the stop.
@@ -203,8 +204,8 @@ A stopped planning run is recorded too: its turn row has `error: "cancelled"`,
 The top-level default is `mode: advise` for planner, coder and reviewer; soft
 thresholds never refuse a call. `mode: observe` records without advisory text.
 Set `enabled: false` to turn KB-first off for every role. Planner turns record
-`tool_metrics.discovery`; coder attempts record `metrics_json.kb_first`, and
-reviewer attempts record the same with plan and job identifiers. Actual
+`tool_metrics.discovery`; native attempts record `kb_calls` next to their reads in
+`metrics_json`. Actual
 provider usage remains separate from estimated added-context tokens.
 
 It records:

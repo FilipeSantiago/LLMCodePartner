@@ -7,11 +7,12 @@ import re
 import shlex
 from collections.abc import AsyncIterator
 from dataclasses import asdict, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from agent.planning.models import ApprovedWPPlan
-from agent.kb_first import KbFirstPolicy, evidence_seed
-from agent.planning.render import coder_context, reviewer_context
+from agent.planning.rebase import rebase_task, with_package_markers
+from agent.planning.render import (DEFAULT_MARGIN, coder_context, prior_task_context,
+                                    reviewer_context, task_files, task_read_only_files)
 from agent.routing.config import load_routing_config
 from agent.routing.gateway import brief_failure
 from conversation import presentation as ui
@@ -47,6 +48,38 @@ _REVIEWER_CONTEXT_END = "END CODEPARTNER REVIEWER REVISION CONTEXT"
 # attempt starts from the journaled project state, not from a chat-only answer.
 CODER_RECOVERY_STATUS = "awaiting_coder_recovery"
 _REQUIRES_TESTS = re.compile(r"\b(?:tests?|pytest|unit[- ]tests?)\b", re.IGNORECASE)
+_CONTEXT_HANDOFF_LIMITS = {"files": 12, "symbols": 10, "decisions": 4,
+                           "dependencies": 6, "verification": 4, "constraints": 4}
+
+
+def _compact_context_handoff(value: object, changed: list[str]) -> dict[str, list[str]]:
+    """Bound coder-provided navigation hints before persisting or prompting with them."""
+    source = value if isinstance(value, dict) else {}
+    result: dict[str, list[str]] = {}
+    for kind, limit in _CONTEXT_HANDOFF_LIMITS.items():
+        supplied = source.get(kind)
+        supplied = supplied if isinstance(supplied, list) else []
+        candidates = [*changed, *supplied] if kind == "files" else supplied
+        if not isinstance(candidates, list):
+            continue
+        items: list[str] = []
+        for item in candidates:
+            if not isinstance(item, str):
+                continue
+            text = " ".join(item.split())[:160]
+            if not text:
+                continue
+            if kind == "files":
+                path = PurePosixPath(text)
+                if path.is_absolute() or any(part in {"..", "."} for part in text.split("/")):
+                    continue
+            if text not in items:
+                items.append(text)
+            if len(items) >= limit:
+                break
+        if items:
+            result[kind] = items
+    return result
 
 
 def handoff_blocker(report: str, task_id: str) -> str | None:
@@ -105,6 +138,11 @@ class ImplementationService:
         # Reindexes first when accepted edits are newer than the KB index.
         self.kb_catch_up = kb_catch_up
 
+    def _margin(self) -> int:
+        """Lines added around each planner edit range in coder and reviewer context."""
+        planner = getattr(self.config, "planner", None)
+        return getattr(planner, "edit_margin_lines", DEFAULT_MARGIN)
+
     def _coder_line(self, model: str | None, fallbacks: tuple[str, ...] = ()) -> str:
         """Which model routing picked for the coder."""
         try:
@@ -114,12 +152,62 @@ class ImplementationService:
         return ui.block(f"_coder: {label}"
                         + (f" (fallbacks: {', '.join(fallbacks)})" if fallbacks else "") + "_")
 
+    async def _fitted_plan(self, plan: ApprovedWPPlan, job_id: str,
+                           task_ids: list[str] | None) -> ApprovedWPPlan:
+        """`plan` with the given tasks (all when None) fitted to the current files: their
+        ranges moved past what earlier tasks changed, and package markers added."""
+        project = native_project()
+        preimages = getattr(self.persistence, "rollback_preimages", None)
+        if project is None or preimages is None:
+            return plan
+        root = Path(project.workspace)
+        # Each file's first preimage in this job is the source the plan was made against.
+        before = {path: value["before_content"]
+                  for path, value in (await preimages(job_id)).items()
+                  if value.get("before_content") is not None}
+        current = {}
+        for path in before:
+            try:
+                current[path] = (root / path).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+        planned = {edit.file for context in plan.tasks.values() for edit in context.edits}
+        tasks = {task_id: with_package_markers(rebase_task(context, before, current),
+                                               planned, root)
+                 if task_ids is None or task_id in task_ids else context
+                 for task_id, context in plan.tasks.items()}
+        return replace(plan, tasks=tasks)
+
     async def _approved_plan(self, job_id: str) -> ApprovedWPPlan | None:
         """The approved WP plan this job executes, if it came from the planner."""
         lookup = getattr(self.persistence, "job_plan_id", None)
         plan_id = await lookup(job_id) if lookup else None
         value = await self.persistence.approved_plan(plan_id) if plan_id else None
         return ApprovedWPPlan.from_dict(value) if value else None
+
+    async def _unplanned_prior_context(self, item: ImplementationJobTask, task: Task,
+                                       contract) -> str:
+        """Use saved reports from earlier tasks of this package when no plan exists."""
+        _, package = await self._package_for_task(item.task_id)
+        events: list[dict] = []
+        for row in await self._package_rows(item.job_id, package.id):
+            if row.position >= item.position or row.status not in {"implemented", "completed"}:
+                continue
+            report = await self.persistence.coder_report_for(item.job_id, row.position)
+            handoff = _handoff(report or "")
+            if not handoff:
+                continue
+            changed = [entry.get("path") for entry in handoff.get("changed_files") or []
+                       if isinstance(entry, dict) and isinstance(entry.get("path"), str)]
+            compact = _compact_context_handoff(handoff.get("context_handoff"), changed)
+            if not compact:
+                continue
+            events.append({"task_id": row.task_id, "kind": "task_handoff",
+                           "summary": "Structured task context", "payload": compact})
+            events.append({"task_id": row.task_id, "kind": "decisions",
+                           "summary": str(handoff.get("summary") or "")[:350]})
+        return prior_task_context(events, item.task_id, task.depends_on,
+                                  tuple(getattr(contract, "primary_files", ()) or ()))
 
     async def _record_plan_events(self, plan: ApprovedWPPlan, item: ImplementationJobTask,
                                   task_id: str, report: str, failure: str | None,
@@ -133,6 +221,9 @@ class ImplementationService:
             events.append(("decisions", str(handoff["summary"])[:3000], None))
         changed = [entry.get("path") for entry in handoff.get("changed_files") or []
                    if isinstance(entry, dict) and isinstance(entry.get("path"), str)]
+        compact = _compact_context_handoff(handoff.get("context_handoff"), changed)
+        if compact:
+            events.append(("task_handoff", "Structured task context", compact))
         if changed:
             events.append(("changed_files", ", ".join(changed), changed))
             context = plan.tasks.get(task_id)
@@ -522,6 +613,8 @@ class ImplementationService:
                         exclude_models: frozenset[str] = frozenset()) -> AsyncIterator[Event]:
         change, task = await self.artifacts.task_by_id(item.task_id)
         plan = await self._approved_plan(item.job_id)
+        if plan is not None and task.id in plan.tasks:
+            plan = await self._fitted_plan(plan, item.job_id, [task.id])
         prior_events = [event for event in await self.persistence.reviewer_context_events(
                             plan.plan_id, item.job_id)
                         if event["position"] < item.position] if plan else []
@@ -534,8 +627,10 @@ class ImplementationService:
         if contract.excluded_files:
             specs = [spec for spec in specs if not spec.name.startswith("kb_")]
             direct_tool_handlers = {name: handler for name, handler in
-                                    direct_tool_handlers.items()
-                                    if not name.startswith("kb_")}
+                                      direct_tool_handlers.items()
+                                      if not name.startswith("kb_")}
+        unplanned_context = (await self._unplanned_prior_context(item, task, contract)
+                             if plan is None else "")
         await self.persistence.update_implementation_task(item.job_id, item.position, "running")
         yield TextEvent(ui.heading(
             "🛠", f"{task.id} · {task.title}",
@@ -559,44 +654,27 @@ class ImplementationService:
             declared_artifacts("\n".join((
                 task.title, task.description, task.context,
             ))))
-        project_id = (await self.persistence.implementation_job_project_id(item.job_id)
-                      if hasattr(self.persistence, "implementation_job_project_id") else None)
-        async def recent_mutations(since):
-            return (await self.persistence.recent_mutations(project_id, since)
-                    if project_id else [])
-        discovery = getattr(self.config, "discovery", None)
-        policy = (KbFirstPolicy(
-            role="coder", tool_names=[spec.name for spec in specs],
-            outline_gate_lines=discovery.outline_gate_lines,
-            search_gate_max=discovery.search_gate_max,
-            excluded_files=contract.excluded_files,
-            recent_mutations=recent_mutations,
-            direct_paths=(*plan.shared.relevant_files,
-                          *(plan.tasks[task.id].relevant_files
-                            if task.id in plan.tasks else ())) if plan else (),
-            seed=evidence_seed("\n".join((task.title, task.description,
-                                         task.context, task.acceptance_criteria
-                                         if isinstance(task.acceptance_criteria, str)
-                                         else " ".join(task.acceptance_criteria or ())))),
-            mode=discovery.mode_for("coder"), tier=task.complexity,
-            advisory_thresholds=discovery.thresholds_for("coder", task.complexity),
-            small_file_bytes=discovery.small_file_bytes,
-            gates=discovery.gated("coder"),
-            enforce_reads=bool(discovery.policy == "kb_first"))
-            if (discovery is not None and discovery.enabled) else None)
         async for event in self.task_execution.execute(
                 task, change.id, messages, specs, on_decision=record_decision,
                 execution_instruction=instruction,
                 direct_tool_handlers=tracked_handlers, exclude_models=exclude_models,
-                **({"kb_first": policy} if policy else {}),
                 contract=contract, owner_metadata={
                     "implementation_job_id": item.job_id,
                     "implementation_position": item.position,
                     "implementation_task_id": task.id,
                     **({"plan_id": plan.plan_id} if plan else {}),
-                }, **({"plan_context": coder_context(
-                       plan, task.id, prior_events, task.description)}
-                   if plan else {})):
+                    **({"edit_ranges": [
+                        {"file": edit.file,
+                         "start_line": max(1, edit.start_line - self._margin()),
+                         "end_line": edit.end_line + self._margin()}
+                        for edit in plan.tasks[task.id].edits
+                        if edit.start_line is not None and edit.end_line is not None]}
+                       if plan and task.id in plan.tasks else {}),
+                  }, **({"plan_context": coder_context(
+                         plan, task.id, prior_events, task.description, self._margin()),
+                         "exploration_scope": tuple(task_files(plan, task.id)),
+                         "exploration_read_only": tuple(task_read_only_files(plan, task.id))}
+                     if plan else {"handoff_context": unplanned_context})):
             if routed is not None and not announced:
                 announced = True
                 yield TextEvent(self._coder_line(
@@ -918,16 +996,26 @@ class ImplementationService:
             # Keep authoritative metadata out of task text: OpenSpec context is
             # untrusted and can mention files, but cannot fabricate journal records.
             object.__setattr__(review_task, "_review_journal_manifest", journal_manifest)
+            preimages = getattr(self.persistence, "rollback_preimages", None)
+            if preimages is not None:
+                # The reviewer sees each change as a diff against its first preimage.
+                object.__setattr__(review_task, "_review_preimages", await preimages(
+                    job_id, [row.position for row in package_rows]))
             plan = await self._approved_plan(job_id)
             if plan is not None:
                 reviewed = None if wp_boundary else [item.task_id]
+                plan = await self._fitted_plan(plan, job_id, reviewed)
                 events = await self.persistence.reviewer_context_events(plan.plan_id, job_id)
                 planned_files = [*plan.reviewer.relevant_files, *plan.shared.relevant_files,
                                  *(path for task_id, context in plan.tasks.items()
                                    if reviewed is None or task_id in reviewed
-                                   for path in context.relevant_files)]
+                                   for path in (*context.relevant_files, *context.edit_files(),
+                                                *context.reference_files()))]
                 object.__setattr__(review_task, "_planner_review_context",
-                                   reviewer_context(plan, events, reviewed))
+                                   reviewer_context(plan, events, reviewed, self._margin()))
+                object.__setattr__(review_task, "_planner_edit_ranges", tuple(
+                    edit for task_id, context in plan.tasks.items()
+                    if reviewed is None or task_id in reviewed for edit in context.edits))
                 object.__setattr__(review_task, "_planner_relevant_files",
                                    tuple(dict.fromkeys(planned_files)))
             if isinstance(self.reviewer, ReviewService):

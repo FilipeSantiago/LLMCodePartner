@@ -859,17 +859,39 @@ class RoutingPersistence:
 
     async def record_rollback_file(self, job_id: str, position: int, path: str,
                                    before_exists: bool,
-                                   expected_hash: str | None = None) -> None:
-        """Journal that a task touched `path` (no preimage is stored)."""
+                                   expected_hash: str | None = None,
+                                   before_content: str | None = None) -> None:
+        """Journal that a task touched `path`, with its content before the first touch
+        when known (the reviewer diffs against it; nothing is restored from it)."""
         await asyncio.to_thread(self._record_rollback_file, job_id, position, path,
-                                before_exists, expected_hash)
+                                before_exists, expected_hash, before_content)
 
-    def _record_rollback_file(self, job_id, position, path, before_exists, expected_hash):
+    def _record_rollback_file(self, job_id, position, path, before_exists, expected_hash,
+                              before_content=None):
         with self._database() as db:
             db.execute("""INSERT OR IGNORE INTO implementation_rollback_files
-              (job_id, position, path, before_exists, expected_hash)
-              VALUES (?, ?, ?, ?, ?)""", (
-                job_id, position, path, int(before_exists), expected_hash))
+              (job_id, position, path, before_exists, expected_hash, before_content)
+              VALUES (?, ?, ?, ?, ?, ?)""", (
+                job_id, position, path, int(before_exists), expected_hash, before_content))
+
+    async def rollback_preimages(self, job_id: str,
+                                 positions: list[int] | None = None) -> dict[str, dict]:
+        """Each touched path's state before its first touch in `positions` (all of the
+        job's when None): {path: {"before_exists", "before_content"}}."""
+        return await asyncio.to_thread(self._rollback_preimages, job_id, positions)
+
+    def _rollback_preimages(self, job_id, positions):
+        with self._database() as db:
+            rows = db.execute("""SELECT position, path, before_exists, before_content
+              FROM implementation_rollback_files WHERE job_id=?
+              ORDER BY position, rowid""", (job_id,)).fetchall()
+        preimages: dict[str, dict] = {}
+        for position, path, before_exists, before_content in rows:
+            if positions is not None and position not in positions:
+                continue
+            preimages.setdefault(path, {"before_exists": bool(before_exists),
+                                        "before_content": before_content})
+        return preimages
 
     async def update_rollback_hash(self, job_id: str, position: int, path: str,
                                    expected_hash: str | None) -> None:

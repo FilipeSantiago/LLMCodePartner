@@ -95,13 +95,18 @@ class Run:
     # Populated only for coding runs. Trusted OpenSpec artifact reads bypass this
     # presentation layer so rollback snapshots remain complete.
     tool_interface: Any | None = None
-    # Optional per-run KB-first discovery policy. None preserves the original route.
-    kb_first: Any | None = None
     # Optional native filesystem execution (`agent.workspace.NativeRun`). None keeps
     # every source operation on the IDE bridge.
     native: Any | None = None
+    # Optional `providers.subagents.Request` for a native run. None offers no subagents.
+    subagents: Any | None = None
+    # OpenTelemetry span state (`telemetry.tracing.RunTrace`); None when tracing is off.
+    # Kept out of `metadata`, which is persisted.
+    trace: Any | None = None
 
     async def put(self, event: Any) -> None:
+        if self.trace is not None and isinstance(event, ErrorEvent):
+            self.trace.errors += 1
         await self.queue.put(event)
 
     async def next_event(self) -> Any:

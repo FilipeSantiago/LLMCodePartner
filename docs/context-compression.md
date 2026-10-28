@@ -25,7 +25,7 @@ interface.
 
 | Result | Treatment |
 |---|---|
-| File reads, edits | Never compressed. Tracked for staleness. |
+| File reads, edits | Never compressed. In compact mode a path-only `codepartner_read_file` call previews up to 200 lines; `full_file=true` requests the whole file. A large identical repeat read in the same run returns a reference to the original observation; refresh forces a new read. |
 | Failed tools, denied calls | Never compressed. |
 | Error output (traceback, `FAILED`, `ValueError:`, `error[E…]:`, non-zero exit) | `conservative` only, which removes ANSI codes and nothing else |
 | JSON | Accepted only if it parses to the same value as the original |
@@ -58,6 +58,15 @@ compressed=balanced bytes=54491→37683 sha256=1f0c…; original: codepartner_ge
 
 When a later large result has the same content as an earlier one that is still
 current, it is replaced by `IDENTICAL RESULT … obs-N`.
+Large exact repeat file reads use `IDENTICAL READ RESULT … obs-N` in the same run.
+The first requested range is returned exactly; a path-only read returns up to
+200 lines, clearly marks partial output, and never invents a total line count.
+The original IDE output for that request is retrievable, but may itself be only
+a window; request further ranges or `full_file=true` for more source. An edit or
+`refresh=true` invalidates the repeat reference and marks
+the earlier observation stale. The ACI attempt records `read_reference_hits`,
+`read_reference_bytes_saved`, and `compress_attempts` alongside the existing
+compression outcome counters.
 
 ## Compressor isolation
 
@@ -77,7 +86,13 @@ truncates.
 | Files | Read-only rootfs; no project, home or `.env` mounts; reads limited to `/opt/compress-bridge` | Reads limited to `infra/compress-bridge` |
 | Processes | Node `--permission` denies child processes, workers and addons | Same |
 | Secrets | No `env_file`; empty environment | Empty environment except `PATH` |
-| Privileges | uid 10001, `cap_drop: ALL`, `no-new-privileges`, socket mode 0770 | Code Partner's user |
+| Privileges | uid/gid 10001, `cap_drop: ALL`, `no-new-privileges`, socket mode 0770 | Code Partner's user |
+
+The optional Compose overlay adds GID 10001 as a supplemental group to Code
+Partner. This allows a Code Partner UID/GID such as 1000:1000 to connect to the
+sidecar's 0770 socket without broadening its permissions. Recreate the Code Partner
+container after changing the overlay; an already running process keeps its old
+supplemental groups.
 
 ## Configuration
 
@@ -133,6 +148,10 @@ unaffected.
 
 `telemetry_aci_attempts.metrics_json` records, for each attempt:
 
+- `first_source_read_bytes`, `bounded_preview_reads`, `bounded_preview_bytes`,
+  `preview_followup_reads`, `preview_observation_expansions`,
+  `preview_observation_bytes`, `explicit_full_file_reads`, `explicit_full_file_bytes`,
+  `explicit_range_reads`, and `explicit_range_bytes`
 - `compression_mode`
 - `compress_applied`, `compress_fallbacks`, `compress_guard_rejections`
 - `compress_bytes_before` and `compress_bytes_after`

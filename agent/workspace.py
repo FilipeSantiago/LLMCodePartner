@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import shutil
 import subprocess
 from contextvars import ContextVar
@@ -193,6 +194,9 @@ class NativeRun:
     """
     workspace: str
     read_only: bool = False
+    # The project's root on the host, where Codebase Memory indexed it; KB paths are
+    # translated between it and `workspace` (see `to_workspace`/`to_host`).
+    host_path: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     notes: tuple[str, ...] = ()
     start: Callable[[], Awaitable[None]] | None = None
@@ -216,14 +220,50 @@ class NativeRun:
         except Exception:
             log.exception("could not record native command evidence: %s", command[:200])
 
-    def record_write(self, path: object) -> None:
+    def relative(self, path: object) -> str | None:
+        """The project-relative form of a path the agent named (relative, workspace or
+        host absolute), or None when it is empty or outside the project."""
         if not isinstance(path, str) or not path:
-            return
+            return None
+        path = to_workspace(path, self)
         if os.path.isabs(path):
             path = os.path.relpath(os.path.normpath(path), self.workspace)
         path = os.path.normpath(path)
-        if path != "." and not path.startswith(".."):
+        return None if path == "." or path.startswith("..") else path
+
+    def record_write(self, path: object) -> None:
+        path = self.relative(path)
+        if path is not None:
             self.written.add(path)
+
+
+def _swap_root(text: str, old: str | None, new: str | None) -> str:
+    """Replace the root `old` with `new` wherever it starts a path: followed by `/` or
+    ending the path, so a sibling such as `<old>2/` is left alone."""
+    if not old or not new or old == new or old not in text:
+        return text
+    old, new = old.rstrip("/"), new.rstrip("/")
+    return re.sub(re.escape(old) + r"(?=/|$|[\s\"'`,:;)\]}])", lambda _: new, text)
+
+
+def to_workspace(text: str, native: NativeRun | None) -> str:
+    """Translate host paths (as Codebase Memory reports them) to the run's workspace."""
+    if native is None:
+        return text
+    return _swap_root(text, native.host_path, native.workspace)
+
+
+def to_host(value: Any, native: NativeRun | None) -> Any:
+    """Translate workspace paths in tool arguments (recursively) to host paths."""
+    if native is None or not native.host_path:
+        return value
+    if isinstance(value, str):
+        return _swap_root(value, native.workspace, native.host_path)
+    if isinstance(value, dict):
+        return {key: to_host(item, native) for key, item in value.items()}
+    if isinstance(value, list):
+        return [to_host(item, native) for item in value]
+    return value
 
 
 # Evidence tool name for commands the native CLIs (or Code Partner) ran in a workspace.
@@ -263,7 +303,8 @@ def read_only_session(project: RegisteredProject) -> NativeRun:
     """
     from agent.routing import rollback
     env, notes = toolchain(project)
-    native = NativeRun(workspace=project.workspace, read_only=True, env=env, notes=notes)
+    native = NativeRun(workspace=project.workspace, read_only=True, host_path=project.host_path,
+                       env=env, notes=notes)
     state: dict = {}
 
     async def start() -> None:
@@ -326,17 +367,45 @@ def is_git_worktree(path: str | Path) -> bool:
             and os.path.realpath(result.stdout.strip()) == os.path.realpath(path))
 
 
+def disk_files(root: str) -> list[str]:
+    """Tracked and untracked, non-ignored project files of a native workspace."""
+    result = subprocess.run(["git", "-C", root, "ls-files", "-z", "-c", "-o",
+                             "--exclude-standard"], capture_output=True, timeout=60)
+    return [os.fsdecode(item) for item in result.stdout.split(b"\0") if item]
+
+
+def project_inventory(root: str, limit_chars: int = 8000) -> str:
+    """The project's file list, one directory per line ("dir/: a.py b.py"), so a
+    planner can see what exists without probing paths. Empty when git fails."""
+    try:
+        files = sorted(disk_files(root))
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    groups: dict[str, list[str]] = {}
+    for path in files:
+        folder, _, name = path.rpartition("/")
+        groups.setdefault(folder, []).append(name)
+    lines: list[str] = []
+    used = 0
+    for index, (folder, names) in enumerate(groups.items()):
+        line = f"{folder or '.'}/: " + " ".join(names)
+        if used + len(line) + 1 > limit_chars:
+            rest = sum(len(items) for items in list(groups.values())[index:])
+            lines.append(f"(+{rest} more files in {len(groups) - index} directories)")
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines)
+
+
 def plan_native(provider: str | None, excluded_files=(),
-                project_id: str | None = None,
-                controlled_reads: bool = False) -> NativePlan:
+                project_id: str | None = None) -> NativePlan:
     """Decide whether one attempt runs natively. Excluded files do not prevent it:
     changes to them are detected and fail the attempt afterwards.
 
     `auto` falls back to the IDE path with a reason; an explicit `native` mode
     returns the reason so the caller can fail instead of silently falling back.
     """
-    if controlled_reads:
-        return NativePlan("ide", reason="KB-enforced agent reads require controlled tools")
     project_id = project_id if project_id is not None else active_project_id()
     override = os.getenv("CODEPARTNER_EXECUTION_MODE", "").strip().lower()
     if override and override not in MODES:

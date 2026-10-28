@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from agent.routing.config import RoutingConfig, RoutingConfigError
 from agent.routing.gateway import gateway_attempts
 from agent.routing.health import ExecutorHealth
+from telemetry import tracing
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,15 @@ class PlannerRoutingService:
     def route(self, wp_complexity: str, exclude: frozenset[str] = frozenset()
               ) -> PlannerDecision:
         """Deterministic first healthy candidate; no semantic router for planning."""
+        with tracing.routing_span("planner", wp_complexity, exclude) as span:
+            decision = self._route(wp_complexity, exclude)
+            tracing.record_routing(
+                span, source="planner-tier", provider=decision.provider, model=decision.model,
+                candidates=decision.candidates, fallbacks=decision.fallbacks,
+                reasoning_effort=decision.reasoning_effort)
+        return decision
+
+    def _route(self, wp_complexity: str, exclude: frozenset[str]) -> PlannerDecision:
         planner = self.config.planner
         candidates = planner.candidates_for(wp_complexity)
         remaining = tuple(name for name in candidates if name not in exclude) or candidates

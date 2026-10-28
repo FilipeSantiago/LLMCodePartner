@@ -88,28 +88,33 @@ source evidence and may become stale after edits. Graph results may lag current
 edits, so coders verify implementation details with IntelliJ MCP source reads
 and reviewers base decisions on current source and captured execution evidence.
 Small, recently modified, and non-code files may still need broader reads.
-**Discovery policy.** `discovery.policy` in `config/model-routing.yaml` decides
-which roles get the KB-first gates described below:
-- **`selective`.** Only the WP planner gets the gates. Coders and
-  reviewers start from the task, the approved plan context and current source.
-  They query the KB on demand for architecture, dependency or impact questions.
-  Their KB calls are still recorded, but nothing is intercepted and no advisories
-  are added.
-- **`kb_first` (configured).** All three roles use controlled IDE tools, even when
-  native execution is configured. The first read of each file obtains its KB outline
-  without returning source content. Subsequent reads require a line range of at most
-  `discovery.outline_gate_lines` lines. When an outline is unavailable, a successful
-  file-scoped search is required before a bounded read. This applies to code, tests,
-  documentation, configuration, and notebooks. The planner always follows these rules.
-  Coders and reviewers use the KB to locate code, not to stand in for files the KB
-  cannot know. Their first read of such a file returns current source without an
-  outline, and later reads need a line range. These files are plan files (the approved
-  plan's shared and task `relevant_files`), files changed in the run or the job,
-  files changed since the index (`recent_mutations`), and code files whose outline is
-  empty. An empty outline's read carries a stale-index note. After an edit or a
-  terminal command, files already located are read directly instead of being outlined
-  again. `read_enforcement` counts `direct_plan`, `direct_changed` and
-  `direct_stale_index`.
+**Bulk queries.** When the KB server has `query_graph`, it is offered to the planner as
+`kb_query_graph`, and the WP prefetch outlines every file holding a named symbol in one
+`query_graph` call (falling back to one `get_file_outline` per file). The prompts tell
+every agent to batch lookups: one `search_graph` with a `name_pattern` alternation or a
+`semantic_query` array, one `query_graph` for several files, never one call per file.
+
+**Refresh before planning.** Every new planning session reindexes the project first,
+whether or not recorded edits are newer than the index; coding keeps the conditional
+catch-up.
+
+**Discovery policy.** `discovery.policy` in `config/model-routing.yaml` decides the KB
+rule for coders and reviewers (`PromptBuilder.read_pipeline` in `agent/prompt/base.py`;
+see [prompts](prompts.md)):
+- **`kb_first` (configured).** Coder and reviewer prompts, including their subagents,
+  get the read pipeline: before the first read of each code file they consult Codebase
+  Memory, then read only the relevant current-source ranges. The planner has a separate
+  single read pipeline: query KB, choose minimal files and ranges, delegate source
+  inspection to its reader when offered, and plan from the cited brief. Direct bounded
+  planner reads are the disclosed fallback when the reader is unavailable or fails.
+- **`selective`.** Coders and reviewers start from the task, the approved plan context
+  and current source, and query the KB on demand. The planner keeps its read pipeline.
+
+This is a prompt rule only. Nothing intercepts, replaces or refuses a read or a search,
+so native execution and subagents work under either policy. Compliance is measured, not
+enforced: native runs record `kb_calls` next to their reads in `native_tool_metrics`, and
+the planner's advise-mode `discovery` telemetry still records retrieval levels and may
+append a one-line advisory to a result.
 
 **Index catch-up.** Before WP planning and at the start of each implementation job,
 Code Partner compares the KB `indexed_at` with the project's applied or verified
@@ -119,46 +124,10 @@ logged (`kb_catch_up_failed`) and never blocks the run.
 
 KB results never override current files.
 
-**Native agents** (docs/native-execution.md) remain available under `selective` or
-when discovery is disabled. Their searches use their own tools, which the IDE gates
-never see:
-- Under `selective`, coder and reviewer prompts give KB-on-demand guidance. The
-  planner remains KB-first for discovery questions, while source reads are not
-  strictly mediated in this mode.
-- Native **Claude** planner runs also get a one-time nudge (`providers/kb_gate.py`,
-  a Claude Code `PreToolUse` hook):
-  - until the agent's first `kb_*` call, a broad identifier-only search is not run;
-    instead the agent is told to call `kb_search_graph`/`kb_trace_path`. Such a search
-    means a Grep over the project or a directory, or a simple `grep -r`/`rg`/`git grep`
-    command;
-  - the first repository-wide Glob gets the same treatment, pointing to
-    `kb_get_architecture`;
-  - repeating the identical call runs it;
-  - at most `discovery.search_gate_max` calls are advised per run;
-  - searches inside a single file, literal, import and usage searches, tests/docs/config
-    paths, pipelines, reads and edits always run.
-- Native **Codex** runs search through their shell, which CodePartner cannot intercept,
-  so they get the guidance only.
-- Native metrics record `kb_calls` and, for Claude, `kb_gate: {advised, repeated_anyway,
-  kb_used}` in `native_tool_metrics`.
-
-When the gates apply to a role and KB tools are offered, the following happens. A bare
-definition-style repository text search first shows indexed graph definitions
-under a conspicuous "TEXT SEARCH NOT EXECUTED" header; repeating the identical
-search executes it unchanged. Usage, import, literal, test, documentation and
-configuration searches are not intercepted. A broad read of a large indexed
-code file first returns its outline; repeating the read returns IDE source.
-Both results are navigation hints. Changed reviewer files, files edited in the
-current run and known post-index mutations bypass the outline gate.
-
-The kb_get_code_snippet tool resolves a symbol's indexed path and line range;
-Code Partner reads that range through the current IDE and verifies the
-declaration and Python enclosing scope before returning source. If the location
-is stale, it searches the current file for a unique verified relocation. It
-never mounts the repository into the KB bridge. For KB-assisted coder edits,
-the replaced region must first have been read through the IDE; a verified
-snippet read counts. Reviewer evidence and inspected-file counts use only
-current IDE reads, not KB outlines or graph results.
+`kb_get_code_snippet` returns the indexed source of a symbol. Like every KB result it
+may lag current edits, so agents verify the lines they rely on in the current files
+before editing or deciding. Reviewer evidence and inspected-file counts use only
+current file reads, not KB outlines or graph results.
 
 The WP planner also records discovery telemetry per turn: retrieval level,
 direct or escalated full reads, the evidence strength of each read path, and
@@ -175,3 +144,7 @@ To disable the feature, set `KB_ENABLED=false`, omit the Compose override, and
 remove the project `knowledge_base` mapping. If KB is unavailable, planners use
 their existing IntelliJ MCP exploration path. An explicitly configured KB
 project absent from `list_projects` is reported as a configuration error.
+
+The KB bridge uses the read-only `analysis` tool profile so planners can use
+`query_graph` for multiple file declarations in one request. Startup verifies
+required tools; the planner names only the KB tools actually offered.

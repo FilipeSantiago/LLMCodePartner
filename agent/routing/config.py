@@ -50,16 +50,14 @@ class DiscoveryConfig:
     """Shared KB-first discovery settings; thresholds are advisory only."""
     # off: no advisories; observe: record only; advise: soft-threshold advisories.
     mode: str = "advise"
-    # selective: KB-first gates and advisories apply to planners only; coders and
-    # reviewers use KB tools on demand. kb_first: gates for every role (previous default).
+    # The KB rule in the agent prompts (`agent.prompt.PromptBuilder.read_pipeline`):
+    # kb_first: every role MUST consult Codebase Memory before the first read of each code
+    # file. selective: coders and reviewers use KB tools on demand; planners stay KB-first.
+    # A prompt rule only: nothing intercepts reads, and native execution is unaffected.
     policy: str = "selective"
     enabled: bool = True
-    search_gate_max: int = 5
     # A whole read whose returned response is smaller than this counts as targeted (L2).
     small_file_bytes: int = 6000
-    # Broad reads of indexed code files reaching this line are answered with the KB
-    # outline first whenever KB tools are offered (agent.kb_first.OutlineGate).
-    outline_gate_lines: int = 120
     thresholds: dict[str, dict[str, int]] = field(default_factory=lambda: {
         tier: dict(zip(DISCOVERY_LIMITS, values))
         for tier, values in _DEFAULT_DISCOVERY_LIMITS.items()})
@@ -67,8 +65,7 @@ class DiscoveryConfig:
     role_thresholds: dict[str, dict[str, dict[str, int]]] = field(default_factory=dict)
 
     def gated(self, role: str) -> bool:
-        """Whether KB-first gates (search interception, outline gate, edit checks)
-        apply to this role."""
+        """Whether this role is KB-first, so its discovery advisories apply."""
         return self.policy == "kb_first" or role == "planner"
 
     def mode_for(self, role: str) -> str:
@@ -100,12 +97,26 @@ class PlannerConfig:
     # The planner writes one short "what and why" line before each tool call.
     narrate: bool = True
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
+    # Claude planner prompt-cache TTL: a planning turn's calls are seconds apart, so
+    # 5m writes (1.25x input) suffice where the CLI default 1h costs 2x.
+    prompt_cache_ttl: str = "5m"
+    # Lines added above and below each planner edit range in coder and reviewer context.
+    edit_margin_lines: int = 10
 
     def candidates_for(self, complexity: str) -> tuple[str, ...]:
         try:
             return self.tiers[complexity]
         except KeyError as exc:
             raise RoutingConfigError(f"no planner tier for WP complexity {complexity!r}") from exc
+
+
+@dataclass(frozen=True)
+class SubagentConfig:
+    """Native reader/checks subagents (providers/subagents.py): one cheap model per
+    provider, named by its `models` entry so its cli_model and effort are reused."""
+    reader_models: dict[str, str] = field(default_factory=dict)
+    max_turns: int = 20
+    enforce_scope: bool = True
 
 
 @dataclass(frozen=True)
@@ -120,12 +131,23 @@ class RoutingConfig:
     role_floors: dict[str, int] = field(default_factory=dict)
     planner: PlannerConfig | None = None
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
+    subagents: SubagentConfig = field(default_factory=SubagentConfig)
+    # Claude coder prompt-cache TTL (`execution.prompt_cache_ttl`); see PlannerConfig.
+    execution_cache_ttl: str = "5m"
 
     def candidates_for(self, complexity: str) -> tuple[str, ...]:
         try:
             return self.tiers[complexity]
         except KeyError as exc:
             raise RoutingConfigError(f"no routing tier for complexity {complexity!r}") from exc
+
+    def subagent_models(self) -> dict[str, tuple[str | None, str | None]]:
+        """provider -> (cli model, reasoning effort) of the configured reader model."""
+        resolved = {}
+        for provider, name in self.subagents.reader_models.items():
+            model = self.models[name]
+            resolved[provider] = (model.cli_model, model.reasoning_effort)
+        return resolved
 
 
 def load_routing_config(path: Path | str | None = None) -> RoutingConfig:
@@ -210,17 +232,25 @@ def load_routing_config(path: Path | str | None = None) -> RoutingConfig:
         (raw.get("planner") or {}).get("discovery")))
     if planner is not None and "discovery" in raw:
         planner = replace(planner, discovery=discovery)
+    execution = raw.get("execution") or {}
+    if not isinstance(execution, dict):
+        raise RoutingConfigError("execution must be a mapping")
+    execution_cache_ttl = execution.get("prompt_cache_ttl", "5m")
+    if execution_cache_ttl not in {"5m", "1h"}:
+        raise RoutingConfigError("execution prompt_cache_ttl must be 5m or 1h")
     return RoutingConfig(
         models=models,
         tiers=tiers,
         role_floors=role_floors,
         planner=planner,
         discovery=discovery,
+        subagents=_subagent_config(raw.get("subagents"), models),
         reviewers=dict(reviewers),
         semantic_router_url=str(os.getenv("SEMANTIC_ROUTER_URL") or runtime.get("semantic_router_url") or "http://semantic-router:8080").rstrip("/"),
         agentgateway_url=str(os.getenv("AGENTGATEWAY_URL") or runtime.get("agentgateway_url") or "http://agentgateway:4000").rstrip("/"),
         router_timeout_seconds=float(runtime.get("router_timeout_seconds", 10)),
         failure_threshold=int((raw.get("health") or {}).get("failure_threshold", 2)),
+        execution_cache_ttl=execution_cache_ttl,
     )
 
 
@@ -289,8 +319,36 @@ def _planner_config(raw: object, models: dict[str, ModelRef],
     narrate = raw.get("narrate", True)
     if not isinstance(narrate, bool):
         raise RoutingConfigError("planner narrate must be true or false")
+    cache_ttl = raw.get("prompt_cache_ttl", "5m")
+    if cache_ttl not in {"5m", "1h"}:
+        raise RoutingConfigError("planner prompt_cache_ttl must be 5m or 1h")
+    margin = raw.get("edit_margin_lines", 10)
+    if isinstance(margin, bool) or not isinstance(margin, int) or margin < 0:
+        raise RoutingConfigError("planner edit_margin_lines must be a non-negative integer")
     return PlannerConfig(tiers, dict(efforts), max_tool_calls, max_file_reads, narrate,
-                         _discovery_config(raw.get("discovery")))
+                         _discovery_config(raw.get("discovery")), cache_ttl, margin)
+
+
+def _subagent_config(raw: object, models: dict[str, ModelRef]) -> SubagentConfig:
+    if raw is None:
+        return SubagentConfig()
+    if not isinstance(raw, dict):
+        raise RoutingConfigError("subagents must be a mapping")
+    readers = raw.get("reader_model") or {}
+    if not isinstance(readers, dict):
+        raise RoutingConfigError("subagents.reader_model must map a provider to a model")
+    for provider, name in readers.items():
+        model = models.get(name)
+        if model is None or model.provider != provider:
+            raise RoutingConfigError(
+                f"subagents.reader_model.{provider} must name a {provider} model")
+    turns = raw.get("max_turns", SubagentConfig.max_turns)
+    if not _positive(turns):
+        raise RoutingConfigError("subagents.max_turns must be a positive integer")
+    enforce_scope = raw.get("enforce_scope", True)
+    if not isinstance(enforce_scope, bool):
+        raise RoutingConfigError("subagents.enforce_scope must be true or false")
+    return SubagentConfig(dict(readers), turns, enforce_scope)
 
 
 def _positive(value: object) -> bool:
@@ -309,9 +367,6 @@ def _discovery_config(raw: object) -> DiscoveryConfig:
     small = raw.get("small_file_bytes", default.small_file_bytes)
     if not _positive(small):
         raise RoutingConfigError("planner discovery small_file_bytes must be a positive integer")
-    gate_lines = raw.get("outline_gate_lines", default.outline_gate_lines)
-    if not _positive(gate_lines):
-        raise RoutingConfigError("planner discovery outline_gate_lines must be a positive integer")
     raw_thresholds = raw.get("thresholds") or {}
     if not isinstance(raw_thresholds, dict) or set(raw_thresholds) - set(PLANNER_TIERS):
         raise RoutingConfigError(f"planner discovery thresholds must be keyed by {PLANNER_TIERS}")
@@ -327,11 +382,8 @@ def _discovery_config(raw: object) -> DiscoveryConfig:
                 f"planner discovery thresholds.{tier} values must be positive integers")
         thresholds[tier] = merged
     enabled = raw.get("enabled", default.enabled)
-    search_gate_max = raw.get("search_gate_max", default.search_gate_max)
     if not isinstance(enabled, bool):
         raise RoutingConfigError("discovery enabled must be boolean")
-    if not _positive(search_gate_max):
-        raise RoutingConfigError("discovery search_gate_max must be a positive integer")
     roles = raw.get("roles") or {}
     if not isinstance(roles, dict) or set(roles) - set(ROLES):
         raise RoutingConfigError("discovery roles must be planner, coder and reviewer")
@@ -356,5 +408,5 @@ def _discovery_config(raw: object) -> DiscoveryConfig:
     policy = raw.get("policy", default.policy)
     if policy not in KB_POLICIES:
         raise RoutingConfigError(f"discovery policy must be one of {KB_POLICIES}")
-    return DiscoveryConfig(mode, policy, enabled, search_gate_max, small, gate_lines,
-                           thresholds, role_modes, role_thresholds)
+    return DiscoveryConfig(mode, policy, enabled, small, thresholds, role_modes,
+                           role_thresholds)

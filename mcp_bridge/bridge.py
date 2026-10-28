@@ -4,11 +4,13 @@ import os
 import shlex
 from uuid import uuid4
 
+from agent.workspace import to_host, to_workspace
 from mcp_bridge.activity import describe_call
 from mcp_bridge.models import MutationEvent, ProgressEvent, Run, ToolCallEvent
 from mcp_bridge.agent_tools import tool_failed
 from mcp_bridge.registry import is_mutating_tool, operations_for
 from logger.diagnostic import debug
+from telemetry import tracing
 
 log = logging.getLogger("codepartner.bridge")
 
@@ -57,9 +59,7 @@ async def call_tool(run: Run, name: str, arguments: dict) -> str:
     `asyncio.TimeoutError` if the client doesn't answer within `TOOL_TIMEOUT`.
     """
     async def dispatch(tool_name: str, tool_args: dict) -> str:
-        from agent.kb_first import _GENERATED
-        if (run.tool_interface is None or
-                _GENERATED.get() and tool_name.rsplit("__", 1)[-1].startswith("kb_")):
+        if run.tool_interface is None:
             return await _call_backend(run, tool_name, tool_args)
         result = await run.tool_interface.execute(
             tool_name, tool_args,
@@ -68,28 +68,49 @@ async def call_tool(run: Run, name: str, arguments: dict) -> str:
         run.tool_interface.record_delivered_result(tool_name, tool_args, result)
         return result
 
-    if run.kb_first is not None:
-        return await run.kb_first.call(name, arguments, dispatch, run=run)
     return await dispatch(name, arguments)
 
 
 async def _call_backend(run: Run, name: str, arguments: dict) -> str:
+    # Tracing observes the outcome only: the result and any exception pass through
+    # unchanged. The span is parented on this Run, whatever task delivers the call.
+    tool = tracing.start_tool(run, name, arguments)
+    try:
+        if _is_kb(name):
+            # Codebase Memory indexed the project on the host; a native agent sees it
+            # at its workspace path, so translate paths both ways.
+            result = to_workspace(await _dispatch_backend(
+                run, name, to_host(arguments, run.native), tool), run.native)
+        else:
+            result = await _dispatch_backend(run, name, arguments, tool)
+    except BaseException as exc:
+        tracing.finish_tool(tool, name, error=exc)
+        raise
+    tracing.finish_tool(tool, name, result=result)
+    return result
+
+
+def _is_kb(name: str) -> bool:
+    return name.rsplit("__", 1)[-1].startswith("kb_")
+
+
+async def _dispatch_backend(run: Run, name: str, arguments: dict, tool) -> str:
     if run.metadata.get("stop_requested"):
+        tracing.tool_route(tool, "refused", refusal="stopped")
         return "Error: this job is being stopped; no further tool calls are allowed."
     if run.tool_interface is not None:
         run.tool_interface.metrics["backend_calls"] += 1
-    if getattr(run.kb_first, "enforce_reads", False):
-        blocked = _controlled_tool_refusal(name, arguments)
-        if blocked:
-            return blocked
     # Every route, including direct standalone tools, goes through the per-run
     # catalog adapter.  A provider cannot bypass dispatcher/schema restrictions.
     try:
         name, arguments = run.registry.prepare_advertised_call(name, arguments)
     except (LookupError, ValueError) as exc:
+        tracing.tool_route(tool, "refused", refusal="invalid_call")
         return f"Error: invalid MCP tool call: {exc}"
     handler = run.direct_tool_handlers.get(name)
     effective_name = _effective_mutation_name(name, arguments)
+    tracing.tool_route(tool, "direct" if handler is not None else "ide_bridge",
+                       mutating=bool(effective_name))
     if handler is not None and effective_name:
         # A stop must wait for this write to finish; see `has_inflight_mutation`.
         run.metadata["inflight_direct_mutations"] = (
@@ -107,32 +128,6 @@ async def _call_backend(run: Run, name: str, arguments: dict) -> str:
     if run.tool_interface is not None:
         run.tool_interface.metrics["backend_output_bytes"] += len(result.encode())
     return result
-
-
-def _controlled_tool_refusal(name: str, arguments: dict) -> str | None:
-    """Keep source-bearing and shell transports behind the controlled read policy."""
-    from agent.routing.evidence import safe_agent_verification
-    bare = name.rsplit("__", 1)[-1]
-    inner = arguments
-    if bare == "execute_tool":
-        command = arguments.get("command")
-        try:
-            tokens = shlex.split(command) if isinstance(command, str) else []
-        except ValueError:
-            tokens = []
-        if not tokens:
-            return "Error: invalid controlled tool command"
-        bare = tokens[0]
-        inner = {key[2:]: value for key, value in zip(tokens[1::2], tokens[2::2])
-                 if key.startswith("--")}
-    if bare in {"get_git_diff_all", "open_commit", "read_notebook"}:
-        return ("Error: this tool can return unrestricted file content; use KB and "
-                "the bounded project file reader instead")
-    if bare == "execute_terminal_command":
-        if not safe_agent_verification(inner.get("command")):
-            return ("Error: arbitrary terminal commands are unavailable under "
-                    "KB-enforced reading; only bounded test/check commands are allowed")
-    return None
 
 
 async def _call_direct(run: Run, handler, name: str, arguments: dict,

@@ -15,6 +15,7 @@ from mcp_bridge import bridge
 from mcp_bridge.models import DoneEvent, ErrorEvent, MutationEvent, ProgressEvent, Run
 from mcp_bridge.registry import ToolRegistry, ToolSpec
 from logger.diagnostic import debug
+from telemetry import tracing
 
 log = logging.getLogger("codepartner.bridge.run")
 
@@ -70,6 +71,7 @@ async def _finish_native(run: Run) -> bool:
 async def _run(run: Run, prompt: str, system: str | None,
                specs: list[ToolSpec], strategy: Strategy) -> None:
     terminal = "endTurn"
+    outcome, failure = "completed", None
     try:
         if run.metadata.get("reviewer"):
             # Reviewer prompts contain IDE MCP file snapshots. Keep diagnostic
@@ -87,61 +89,71 @@ async def _run(run: Run, prompt: str, system: str | None,
             await run.native.start()
         terminal = await strategy(run, prompt, system, specs)
     except asyncio.CancelledError:
+        outcome = "cancelled"
         await _finish_native(run)
         bridge.discard(run)
         raise
     except Exception as exc:  # surface provider/model failures into the stream
+        outcome, failure = "failed", exc
         log.exception("run strategy failed run_id=%s", run.run_id)
         await run.put(ErrorEvent(str(exc)))
     finally:
-        if not await _finish_native(run):
-            terminal = "failed"
-        debug(log, "run.strategy_finished", trace_id=run.metadata.get("trace_id"),
-              run_id=run.run_id, terminal=terminal)
-        if run.native is not None and run.metadata.get("implementation_job_id"):
-            try:
-                from telemetry.storage import TelemetryStorage
-                TelemetryStorage().record_aci_attempt(
-                    run.run_id, run.metadata,
-                    {"execution_mode": "native",
-                     **run.metadata.get("native_tool_metrics", {"tool_calls": 0}),
-                     **({"kb_first": run.kb_first.summary()} if run.kb_first else {})},
-                    run.usage)
-            except Exception:
-                log.exception("could not record native metrics run_id=%s", run.run_id)
-        if run.tool_interface is not None:
-            try:
-                from telemetry.storage import TelemetryStorage
-                storage = TelemetryStorage()
-                storage.record_aci_attempt(
-                    run.run_id, run.metadata,
-                    {**run.tool_interface.summary(),
-                     **({"kb_first": run.kb_first.summary()} if run.kb_first else {})},
-                    run.usage)
-                compression = run.tool_interface.compression
-                if compression is not None and run.tool_interface.provenance:
-                    storage.record_context_observations(
-                        run.run_id, run.metadata, run.tool_interface.provenance,
-                        {key: text for key, text in run.tool_interface.observations.items()
-                         if key in run.tool_interface.persistable_keys()}
-                        if compression.config.persist else None,
-                        retention_days=compression.config.persist_days)
-            except Exception:
-                log.exception("could not record ACI metrics run_id=%s", run.run_id)
-        await run.put(DoneEvent(terminal, usage=run.usage, model_usage=run.model_usage))
-        bridge.discard(run)
+        try:
+            if not await _finish_native(run):
+                terminal = "failed"
+            debug(log, "run.strategy_finished", trace_id=run.metadata.get("trace_id"),
+                  run_id=run.run_id, terminal=terminal)
+            if run.native is not None and run.metadata.get("implementation_job_id"):
+                try:
+                    from telemetry.storage import TelemetryStorage
+                    TelemetryStorage().record_aci_attempt(
+                        run.run_id, run.metadata,
+                        {"execution_mode": "native",
+                         "exploration_mode": run.metadata.get("exploration_mode", "off"),
+                         **(run.metadata.get("native_tool_metrics")
+                            or run.native.metrics or {"tool_calls": 0})},
+                        run.usage)
+                except Exception:
+                    log.exception("could not record native metrics run_id=%s", run.run_id)
+            if run.tool_interface is not None:
+                try:
+                    from telemetry.storage import TelemetryStorage
+                    storage = TelemetryStorage()
+                    storage.record_aci_attempt(
+                        run.run_id, run.metadata,
+                        run.tool_interface.summary(),
+                        run.usage)
+                    compression = run.tool_interface.compression
+                    if compression is not None and run.tool_interface.provenance:
+                        storage.record_context_observations(
+                            run.run_id, run.metadata, run.tool_interface.provenance,
+                            {key: text for key, text in run.tool_interface.observations.items()
+                             if key in run.tool_interface.persistable_keys()}
+                            if compression.config.persist else None,
+                            retention_days=compression.config.persist_days)
+                except Exception:
+                    log.exception("could not record ACI metrics run_id=%s", run.run_id)
+            await run.put(DoneEvent(terminal, usage=run.usage, model_usage=run.model_usage))
+            bridge.discard(run)
+        finally:
+            tracing.finish_run(run, terminal, outcome, failure)
 
 
 def start_run(prompt: str, system: str | None, specs: list[ToolSpec],
               strategy: Strategy, allowed: frozenset[str] | None = None,
               allowed_operations: frozenset[str] | None = None,
               direct_tool_handlers: dict[str, Callable[[dict], Awaitable[str]]] | None = None,
-              agent_tool_interface: bool = False) -> Run:
+              agent_tool_interface: bool = False, *, trace_kind: str = "execution",
+              trace_provider: str | None = None, trace_model: str | None = None,
+              trace_reasoning_effort: str | None = None) -> Run:
     """Begin a bridged execution: register the tools this run's role allows and run
     the injected provider strategy in the background.
 
     `allowed` is the caller's role allowlist (`registry.allowed_for`); None = the full
     ceiling. It is baked into the Run, so later resumes stay inside the same role.
+
+    `trace_*` describe the Run for tracing only: providers pass `trace_kind="llm"`
+    and their provider/model; orchestration Runs keep the default.
     """
     run = Run(registry=ToolRegistry(allowed, allowed_operations))
     run.direct_tool_handlers = dict(direct_tool_handlers or {})
@@ -177,7 +189,10 @@ def start_run(prompt: str, system: str | None, specs: list[ToolSpec],
           allowed_operations=sorted(allowed_operations) if allowed_operations else None,
           advertised_tools=[vars(spec) for spec in specs], registered_tools=[vars(spec) for spec in registered],
           direct_tool_names=sorted(run.direct_tool_handlers))
-    run.task = asyncio.create_task(_run(run, prompt, system, run.registry.tools(), strategy))
+    run.trace = tracing.start_run(run, trace_kind, provider=trace_provider, model=trace_model,
+                                  reasoning_effort=trace_reasoning_effort)
+    with tracing.task_context(run.trace):
+        run.task = asyncio.create_task(_run(run, prompt, system, run.registry.tools(), strategy))
     _live_runs[run.run_id] = run
     run.task.add_done_callback(lambda _task: _live_runs.pop(run.run_id, None))
     return run

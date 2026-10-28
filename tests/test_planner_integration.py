@@ -10,12 +10,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from agent.planning.knowledge_base import KB_READING_GUIDANCE, KB_SELECTIVE_GUIDANCE
 from agent.planning.models import ApprovedWPPlan, WPPlanDraft
 from agent.planning.projection import project, validate_draft
-from agent.planning.prompts import SYSTEM
+from agent.prompt.coder import CoderPromptBuilder
+from agent.prompt.planner import SYSTEM
 from agent.planning.render import coder_context, reviewer_context
-from agent.routing.implementation import ImplementationService
+from agent.routing.implementation import ImplementationService, _compact_context_handoff
 from agent.routing.persistence import RoutingPersistence
 from agent.routing.review import ReviewDecision, ReviewService
 from agent.routing.task_execution import TaskExecutionService
@@ -26,6 +26,9 @@ from mcp_bridge.registry import ToolSpec
 from tests.test_routing import _Artifacts, task
 from tests.test_wp_planner import plan_payload
 from tests import ide_mode
+
+KB_FIRST_RULE = CoderPromptBuilder().read_pipeline()
+KB_SELECTIVE_GUIDANCE = KB_FIRST_RULE
 
 
 def setUpModule():
@@ -78,8 +81,32 @@ class WorkPackageComplexitySpecTests(unittest.TestCase):
 
 
 class DiscoveryHandoffTests(unittest.TestCase):
+    def test_structured_handoff_is_bounded_and_rejects_unsafe_paths(self):
+        compact = _compact_context_handoff({
+            "files": ["../outside.py", "/absolute.py", "src/api.py"],
+            "symbols": [f"src/api.py::symbol_{i}" for i in range(20)],
+            "decisions": ["Keep API stable"],
+        }, ["src/changed.py"])
+        self.assertEqual(compact["files"], ["src/changed.py", "src/api.py"])
+        self.assertEqual(len(compact["symbols"]), 10)
+
+    def test_unrelated_prior_task_is_not_prompted(self):
+        draft = WPPlanDraft.from_dict(plan_payload(task_ids=WP1_TASKS), "WP1", 1)
+        plan = project(draft, plan_id="plan_x_r1", session_id="x", change_id="CHG1",
+                       wp_fingerprint="f", wp_complexity="medium",
+                       planner_model="claude-sonnet")
+        context = coder_context(plan, "WP1-T2", [{
+            "task_id": "WP1-T1", "kind": "task_handoff", "summary": "Earlier result",
+            "payload": {"files": ["src/unrelated.py"], "symbols": ["Unrelated"]},
+        }])
+        self.assertNotIn("EARLIER TASK RESULTS", context)
+
+
     def test_plan_projects_compact_discovery_to_the_right_agents(self):
+        # Plans from before edit ranges hand discovery leads to coders and reviewers.
         payload = plan_payload(task_ids=WP1_TASKS)
+        for context in payload["tasks"].values():
+            context.pop("edits")
         payload["discovery"] = [
             {"file": "src/registry.py", "reason": "Defines the loader registry",
              "relevant_symbols": [{"name": "Registry.register", "start_line": 12,
@@ -103,24 +130,32 @@ class DiscoveryHandoffTests(unittest.TestCase):
         self.assertIn("navigation only", review)
 
     def test_coder_context_carries_earlier_task_results(self):
-        draft = WPPlanDraft.from_dict(plan_payload(task_ids=WP1_TASKS), "WP1", 1)
+        payload = plan_payload(task_ids=WP1_TASKS)
+        payload["tasks"]["WP1-T2"]["depends_on"] = ["WP1-T1"]
+        draft = WPPlanDraft.from_dict(payload, "WP1", 1)
         plan = project(draft, plan_id="plan_x_r1", session_id="x", change_id="CHG1",
                        wp_fingerprint="f", wp_complexity="medium",
                        planner_model="claude-sonnet")
         events = [
             {"position": 0, "task_id": "WP1-T1", "kind": "decisions", "summary": "first try"},
-            {"position": 0, "task_id": "WP1-T1", "kind": "tests", "summary": "1 failed"},
+            {"position": 0, "task_id": "WP1-T1", "kind": "tests", "summary": "1 passed"},
             {"position": 0, "task_id": "WP1-T1", "kind": "decisions",
              "summary": "Inventory: Registry.register is reusable"},
             {"position": 0, "task_id": "WP1-T1", "kind": "changed_files",
              "summary": "src/registry.py"},
+            {"position": 0, "task_id": "WP1-T1", "kind": "task_handoff",
+             "payload": {"files": ["src/registry.py"],
+                         "symbols": ["src/registry.py::Registry.register"],
+                         "verification": ["registry test passed"]}},
         ]
         context = coder_context(plan, "WP1-T2", events)
         self.assertIn("EARLIER TASK RESULTS", context)
         self.assertIn("Result: Inventory: Registry.register is reusable", context)
+        self.assertIn("Interfaces: src/registry.py::Registry.register", context)
+        self.assertIn("Verification: registry test passed", context)
         self.assertIn("Changed files: src/registry.py", context)
         self.assertNotIn("first try", context)
-        self.assertNotIn("1 failed", context)
+        self.assertIn("Captured verification: 1 passed", context)
         self.assertNotIn("EARLIER TASK RESULTS", coder_context(plan, "WP1-T1", events))
         self.assertNotIn("EARLIER TASK RESULTS", coder_context(plan, "WP1-T2"))
 
@@ -159,14 +194,15 @@ class DiscoveryHandoffTests(unittest.TestCase):
         self.assertIn("Objective: Do WP1-T2", coder_context(plan, "WP1-T2", events))
 
     def test_execution_prompts_share_rules_and_handoff(self):
-        from agent.routing.task_execution import EXPLORATION_RULES
+        from agent.prompt.coder import EXPLORATION_RULES
         for native in (False, True):
             prompt = TaskExecutionService._execution_messages(
                 task(), [], "", native=native)[0]["content"]
             self.assertIn(EXPLORATION_RULES, prompt)
             self.assertIn('"execution_dispute":null', prompt)
             self.assertIn("Never read the whole repository", prompt)
-            self.assertIn("never limit necessary work", prompt)
+            self.assertIn("only for a concrete question they leave open", prompt)
+            self.assertNotIn("never limit necessary work", prompt)
         contract = SimpleNamespace(revision=2, goal=task().description,
                                    primary_files=("src/a.py",))
         prompt = TaskExecutionService._execution_messages(
@@ -190,17 +226,75 @@ class DiscoveryHandoffTests(unittest.TestCase):
         self.assertEqual(validate_draft(draft, list(WP1_TASKS)), [])
 
     def test_shared_guidance_reaches_planner_and_coder(self):
-        self.assertIn(KB_READING_GUIDANCE, SYSTEM)
-        self.assertIn("Before edits or review verdicts, inspect exact current IDE source", KB_READING_GUIDANCE)
+        self.assertEqual(SYSTEM.count("## Read pipeline"), 1)
+        self.assertNotIn(KB_FIRST_RULE, SYSTEM)
+        self.assertIn("current-source evidence", KB_FIRST_RULE)
         # The default selective policy keeps KB-first guidance for planners only.
         prompt = TaskExecutionService._execution_messages(task(), [], "")[0]["content"]
         self.assertIn(KB_SELECTIVE_GUIDANCE, prompt)
-        self.assertNotIn(KB_READING_GUIDANCE, prompt)
+        self.assertIn(KB_FIRST_RULE, prompt)
         self.assertNotIn("KB search and outline seeds", prompt)
         prompt = TaskExecutionService._execution_messages(
             task(), [], "", kb_policy="kb_first")[0]["content"]
-        self.assertIn(KB_READING_GUIDANCE, prompt)
+        self.assertIn(KB_FIRST_RULE, prompt)
         self.assertIn("KB search and outline seeds", prompt)
+
+
+class PersistedContextHandoffTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unplanned_job_uses_saved_report_from_same_package(self):
+        service = ImplementationService.__new__(ImplementationService)
+        service._package_for_task = mock.AsyncMock(
+            return_value=(None, SimpleNamespace(id="WP1")))
+        service._package_rows = mock.AsyncMock(return_value=[
+            SimpleNamespace(job_id="job", position=0, task_id="WP1-T1",
+                            status="completed")])
+        report = json.dumps({"summary": "Registry updated", "changed_files": [
+            {"path": "src/registry.py"}], "context_handoff": {
+                "symbols": ["src/registry.py::Registry.register"]}})
+        service.persistence = SimpleNamespace(coder_report_for=mock.AsyncMock(
+            return_value=report))
+        later = replace(task(), id="WP1-T2", depends_on=["WP1-T1"])
+        context = await service._unplanned_prior_context(
+            SimpleNamespace(job_id="job", position=1, task_id=later.id), later,
+            SimpleNamespace(primary_files=()))
+        self.assertIn("src/registry.py::Registry.register", context)
+        prompt = TaskExecutionService._execution_messages(
+            later, [], handoff_context=context)[0]["content"]
+        self.assertIn("src/registry.py::Registry.register", prompt)
+        self.assertNotIn("A planner already investigated", prompt)
+
+    async def test_completed_task_handoff_reaches_dependent_task(self):
+        payload = plan_payload(task_ids=WP1_TASKS)
+        payload["tasks"]["WP1-T2"]["depends_on"] = ["WP1-T1"]
+        plan = project(WPPlanDraft.from_dict(payload, "WP1", 1),
+                       plan_id="plan_x_r1", session_id="x", change_id="CHG1",
+                       wp_fingerprint="f", wp_complexity="medium",
+                       planner_model="claude-sonnet")
+        events = []
+
+        class Persistence:
+            async def verification_evidence(self, job_id, position):
+                return []
+
+            async def record_reviewer_context_event(self, plan_id, job_id, position,
+                                                    task_id, kind, summary, value):
+                events.append({"position": position, "task_id": task_id, "kind": kind,
+                               "summary": summary, "payload": value})
+
+        service = ImplementationService.__new__(ImplementationService)
+        service.persistence = Persistence()
+        report = json.dumps({"schema_version": 1, "task_id": "WP1-T1",
+                             "summary": "Registry updated", "changed_files": [
+                                 {"path": "src/registry.py", "change": "modified"}],
+                             "context_handoff": {
+                                 "symbols": ["src/registry.py::Registry.register"],
+                                 "decisions": ["Keep the trainer API stable"]}})
+        await service._record_plan_events(
+            plan, SimpleNamespace(job_id="job", position=0), "WP1-T1", report,
+            None, 1, False)
+        context = coder_context(plan, "WP1-T2", events)
+        self.assertIn("src/registry.py::Registry.register", context)
+        self.assertIn("Keep the trainer API stable", context)
 
 
 class _CapturingReviewer:
@@ -291,8 +385,9 @@ class ReviewerPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Approved WP plan context", provider.prompt)
         self.assertIn("Objective: one factory", provider.prompt)
         # The configured kb_first policy gives IDE-path reviewers the KB-first guidance.
-        self.assertIn(KB_READING_GUIDANCE, provider.prompt)
-        self.assertNotIn(KB_SELECTIVE_GUIDANCE, provider.prompt)
+        from agent.prompt.reviewer import ReviewerPromptBuilder
+        self.assertIn(ReviewerPromptBuilder().read_pipeline(), provider.prompt)
+        self.assertNotIn(KB_FIRST_RULE, provider.prompt)
         self.assertIn("not correctness evidence", provider.prompt)
 
     async def test_planner_only_file_is_not_eagerly_read_when_change_is_known(self):

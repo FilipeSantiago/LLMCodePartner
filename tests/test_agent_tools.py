@@ -98,6 +98,25 @@ class AgentToolInterfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("READ COMPLETE", result)
         self.assertEqual(len(self.calls), 1)
 
+    async def test_large_repeated_read_uses_retrievable_reference(self):
+        args = {"path": "src/app.py", "full_file": True}
+        first = await self.interface.execute("codepartner_read_file", args, self.backend)
+        second = await self.interface.execute("codepartner_read_file", args, self.backend)
+        self.assertIn("IDENTICAL READ RESULT", second)
+        self.assertLess(len(second), len(first))
+        key = next(iter(self.interface.read_observations.values()))
+        original = await self.interface.execute("codepartner_get_observation",
+                                                {"observation_id": key}, self.backend)
+        self.assertIn("src/app.py — lines 1–437 of 437", original)
+        self.assertIn("  437 | line 437", original)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.interface.metrics["read_reference_hits"], 1)
+        await self.interface.execute("codepartner_read_file", {**args, "refresh": True},
+                                     self.backend)
+        self.assertIn("STALE", await self.interface.execute(
+            "codepartner_get_observation", {"observation_id": key}, self.backend))
+        self.assertEqual(len(self.calls), 2)
+
     async def test_read_metrics_count_delivered_ranges_and_repeats(self):
         self.run.tool_interface = self.interface
         self.run.direct_tool_handlers = {
@@ -111,14 +130,90 @@ class AgentToolInterfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["repeated_source_reads"], 1)
         self.assertGreater(summary["source_response_bytes"], 0)
 
-    async def test_path_only_read_returns_full_file(self):
+    async def test_path_only_read_returns_bounded_preview(self):
         self.run.tool_interface = self.interface
         self.run.direct_tool_handlers = {"read_file": lambda arguments: self.backend("read_file", arguments)}
         result = await bridge.call_tool(
             self.run, "codepartner_read_file", {"path": "src/app.py"})
+        self.assertIn("lines 1–200 of 437", result)
+        self.assertIn("truncated=true", result)
+        self.assertIn("Remaining: 201–437", result)
+        self.assertNotIn("  437 | line 437", result)
+        self.assertEqual(self.interface.metrics["lines_returned"], 200)
+        summary = self.interface.summary()
+        self.assertEqual(summary["bounded_preview_reads"], 1)
+        self.assertGreater(summary["bounded_preview_bytes"], 0)
+        self.assertEqual(summary["first_source_read_bytes"], summary["bounded_preview_bytes"])
+
+    async def test_explicit_full_read_after_preview(self):
+        self.run.tool_interface = self.interface
+        self.run.direct_tool_handlers = {"read_file": lambda arguments: self.backend("read_file", arguments)}
+        await bridge.call_tool(self.run, "codepartner_read_file", {"path": "src/app.py"})
+        result = await bridge.call_tool(self.run, "codepartner_read_file",
+                                        {"path": "src/app.py", "full_file": True})
         self.assertIn("lines 1–437 of 437", result)
         self.assertIn("  437 | line 437", result)
-        self.assertEqual(self.interface.metrics["lines_returned"], 437)
+        summary = self.interface.summary()
+        self.assertEqual(summary["explicit_full_file_reads"], 1)
+        self.assertEqual(summary["preview_followup_reads"], 1)
+        self.assertEqual(len(self.calls), 2)
+
+    async def test_complete_short_path_only_read(self):
+        async def backend(name, arguments):
+            return "\n".join(f"L{i}: line {i}" for i in range(1, 40))
+        self.run.tool_interface = self.interface
+        self.run.direct_tool_handlers = {"read_file": lambda arguments: backend("read_file", arguments)}
+        result = await bridge.call_tool(self.run, "codepartner_read_file", {"path": "short.py"})
+        self.assertIn("lines 1–39 of 39", result)
+        self.assertIn("truncated=false", result)
+        self.assertEqual(self.interface.summary()["path_only_complete_reads"], 1)
+
+    async def test_preview_does_not_invent_total_or_hide_retrieval(self):
+        async def backend(name, arguments):
+            self.calls.append((name, arguments))
+            start, limit = arguments["offset"], arguments["limit"]
+            return "\n".join(f"L{i}: line {i}" for i in range(start, start + limit))
+        first = await self.interface.execute(
+            "codepartner_read_file", {"path": "big.py"}, backend)
+        self.assertIn("lines 1–200 of unknown", first)
+        self.assertIn("Remaining: 201 onward", first)
+        self.assertNotIn("  201 | line 201", first)
+        self.assertIn("Original IDE output for this read", first)
+        observation = self.interface._reload({"observation_id": "obs-1"})
+        self.assertIn("L201: line 201", observation)
+        self.assertNotIn("L403: line 403", observation)
+        self.assertEqual(self.interface.summary()["preview_observation_expansions"], 1)
+        self.assertGreater(self.interface.summary()["preview_observation_bytes"], 0)
+        next_lines = await self.interface.execute(
+            "codepartner_read_file", {"path": "big.py", "start_line": 201,
+                                      "end_line": 220}, backend)
+        self.assertIn("lines 201–220 of unknown", next_lines)
+        self.assertIn("  220 | line 220", next_lines)
+        self.assertEqual(len(self.calls), 2)
+
+    async def test_preview_refresh_marks_prior_observation_stale(self):
+        args = {"path": "src/app.py"}
+        await self.interface.execute("codepartner_read_file", args, self.backend)
+        key = "obs-1"
+        await self.interface.execute("codepartner_read_file", {**args, "refresh": True},
+                                     self.backend)
+        self.assertIn("STALE", self.interface._reload({"observation_id": key}))
+        self.assertEqual(len(self.calls), 2)
+
+    async def test_noncompact_read_file_keeps_raw_behavior(self):
+        self.interface.compact = False
+        result = await self.interface.execute(
+            "read_file", {"file_path": "src/app.py", "offset": 1, "limit": 500},
+            self.backend)
+        self.assertIn("L437: line 437", result)
+        self.assertNotIn("READ COMPLETE", result)
+
+    async def test_full_file_cannot_be_combined_with_range(self):
+        result = await self.interface.execute(
+            "codepartner_read_file", {"path": "src/app.py", "full_file": True,
+                                      "start_line": 2}, self.backend)
+        self.assertIn("READ ERROR", result)
+        self.assertEqual(self.calls, [])
 
     async def test_refresh_forces_new_read(self):
         args = {"path": "src/app.py"}
@@ -127,7 +222,8 @@ class AgentToolInterfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), 2)
 
     async def test_full_read_cache_serves_range(self):
-        await self.interface.execute("codepartner_read_file", {"path": "src/app.py"}, self.backend)
+        await self.interface.execute("codepartner_read_file", {
+            "path": "src/app.py", "full_file": True}, self.backend)
         result = await self.interface.execute("codepartner_read_file", {
             "path": "src/app.py", "start_line": 200, "end_line": 201}, self.backend)
         self.assertIn("lines 200–201 of 437", result)
@@ -138,7 +234,8 @@ class AgentToolInterfaceTests(unittest.IsolatedAsyncioTestCase):
             self.calls.append((name, arguments))
             offset, limit = arguments["offset"], arguments["limit"]
             return "\n".join(f"L{i}: line {i}" for i in range(offset, min(offset + limit, 6201)))
-        result = await self.interface.execute("codepartner_read_file", {"path": "big.txt"}, backend)
+        result = await self.interface.execute("codepartner_read_file", {
+            "path": "big.txt", "full_file": True}, backend)
         self.assertIn("lines 1–6200 of 6200", result)
         self.assertIn(" 6200 | line 6200", result)
         self.assertEqual([call[1]["offset"] for call in self.calls], [1, 5001])
@@ -154,7 +251,8 @@ class AgentToolInterfaceTests(unittest.IsolatedAsyncioTestCase):
             return ("\n".join(f"L{i}: line {i}" for i in remaining[:half])
                     + f"\n…{len(remaining) - 2 * half} lines truncated…\n"
                     + "\n".join(f"L{i}: line {i}" for i in remaining[-half:]))
-        result = await self.interface.execute("codepartner_read_file", {"path": "big.txt"}, backend)
+        result = await self.interface.execute("codepartner_read_file", {
+            "path": "big.txt", "full_file": True}, backend)
         self.assertIn("lines 1–8000 of 8000", result)
         self.assertIn(" 8000 | line 8000", result)
         self.assertEqual([call[1]["offset"] for call in self.calls], [1, 2501, 5001])
@@ -164,7 +262,8 @@ class AgentToolInterfaceTests(unittest.IsolatedAsyncioTestCase):
             if arguments["offset"] > 1:
                 return "Error: request denied"
             return "\n".join(f"L{i}: line {i}" for i in range(1, 5001))
-        result = await self.interface.execute("codepartner_read_file", {"path": "big.txt"}, backend)
+        result = await self.interface.execute("codepartner_read_file", {
+            "path": "big.txt", "full_file": True}, backend)
         self.assertIn("READ FAILED", result)
         self.assertNotIn("READ COMPLETE", result)
 
@@ -383,6 +482,36 @@ class ObservationParsingTests(unittest.TestCase):
             self.assertEqual(json.loads(row[1])["input_tokens"], 1200)
             comparison = TelemetryAggregation(storage).aci_comparison(["WP1-T1"])
             self.assertEqual(comparison["WP1-T1"]["compact"]["input_tokens"], 1200)
+
+
+class KnowledgeBasePathTests(unittest.IsolatedAsyncioTestCase):
+    """KB results cite the host checkout; a native agent must get workspace paths."""
+
+    async def test_kb_paths_are_translated_both_ways(self):
+        from agent.workspace import NativeRun
+        run = Run()
+        run.registry.register([_spec("kb_get_file_outline", {"file_path": {}}),
+                               _spec("get_file_problems", {"filePath": {}})])
+        run.native = NativeRun(workspace="/workspace/demo", host_path="/home/u/Demo")
+        seen = {}
+
+        def handler(name):
+            async def call(arguments):
+                seen[name] = arguments
+                return f"{arguments}: defined in /home/u/Demo/pkg/a.py:3"
+            return call
+
+        run.direct_tool_handlers = {name: handler(name)
+                                    for name in ("kb_get_file_outline", "get_file_problems")}
+        result = await bridge.call_tool(run, "kb_get_file_outline",
+                                        {"file_path": "/workspace/demo/pkg/a.py"})
+        self.assertEqual(seen["kb_get_file_outline"], {"file_path": "/home/u/Demo/pkg/a.py"})
+        self.assertIn("defined in /workspace/demo/pkg/a.py:3", result)
+        self.assertNotIn("/home/u/Demo", result)
+        # Other tools (the IDE's own MCP) work on host paths and stay untouched.
+        other = await bridge.call_tool(run, "get_file_problems",
+                                       {"filePath": "/home/u/Demo/pkg/a.py"})
+        self.assertIn("defined in /home/u/Demo/pkg/a.py:3", other)
 
 
 if __name__ == "__main__":

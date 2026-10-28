@@ -54,7 +54,7 @@ def read_only_handlers(specs: list[ToolSpec], handlers: dict
 def instrument_handlers(handlers: dict, reads: frozenset[str], searches: frozenset[str],
                         max_calls: int | None = None,
                         on_call=None, max_reads: int | None = None,
-                        tracker=None, gate=None) -> tuple[dict, ToolMetrics]:
+                        tracker=None) -> tuple[dict, ToolMetrics]:
     """Wrap direct handlers to count calls; past a budget, refuse instead of calling.
 
     Codebase Memory (`kb_`) calls are graph lookups and do not consume `max_calls`;
@@ -62,18 +62,11 @@ def instrument_handlers(handlers: dict, reads: frozenset[str], searches: frozens
     awaited before each call for progress display, with `refused` set to None, "calls"
     or "reads". An optional `tracker` (planner discovery telemetry) observes each
     response; only in advise mode may it append a one-line advisory to a result.
-    An optional `gate` (planner `OutlineGate`) may answer a broad read of a large code
-    file with its Codebase Memory outline; that counts as a KB call, not a read, and is
-    checked before the read budget.
     """
     metrics = ToolMetrics()
 
     def wrap(name, handler):
         async def call(arguments):
-            if gate is not None and name in reads:
-                gated = await gate.check(arguments)
-                if gated is not None:
-                    return await outline_instead(*gated)
             kb = name.startswith("kb_")
             refused = ("calls" if not kb and max_calls is not None
                        and metrics.calls >= max_calls else
@@ -108,8 +101,6 @@ def instrument_handlers(handlers: dict, reads: frozenset[str], searches: frozens
                 result = await handler(arguments)
                 repeated_before = metrics.source.repeated_source_reads
                 metrics.source.observe(name, arguments, result, read=name in reads)
-                if gate is not None:
-                    gate.note(name, arguments, read=name in reads)
                 if tracker is not None:
                     advisory = tracker.observe(
                         name, arguments, result, read=name in reads,
@@ -121,17 +112,5 @@ def instrument_handlers(handlers: dict, reads: frozenset[str], searches: frozens
                 metrics.failures += 1
                 raise
         return call
-
-    async def outline_instead(path: str, outline: str) -> str:
-        arguments = {"file_path": path}
-        if on_call is not None:
-            await on_call("kb_get_file_outline", arguments, None)
-        metrics.kb_calls += 1
-        metrics.source.observe("kb_get_file_outline", arguments, outline, read=False)
-        if tracker is not None:
-            advisory = tracker.observe("kb_get_file_outline", arguments, outline, read=False)
-            if advisory:
-                outline = outline + "\n\n" + advisory
-        return outline
 
     return {name: wrap(name, handler) for name, handler in handlers.items()}, metrics

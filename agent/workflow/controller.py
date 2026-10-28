@@ -58,6 +58,10 @@ PLAN_APPROVAL = re.compile(
     r"|go ahead|ship it|let'?s (?:implement|do|build) it)[.!]*\s*",
     re.IGNORECASE)
 PLAN_DISCUSS = re.compile(r"\s*discuss(?: more)?[.!]*\s*", re.IGNORECASE)
+# The detailed view of the plan under discussion; rendered without a planner call.
+PLAN_EXPLAIN = re.compile(
+    r"\s*(?:explain(?: (?:the|this) plan)?|(?:show |more )?details|explain more)[.!?]*\s*",
+    re.IGNORECASE)
 PLAN_ABANDON = re.compile(
     r"\s*(?:stop|abandon|drop|cancel|never ?mind)(?: (?:the )?(?:plan|planning))?[.!]*\s*",
     re.IGNORECASE)
@@ -382,7 +386,7 @@ class ConversationWorkflow:
         return result
 
     def planning_route(self, text: str, snapshot: ConversationSnapshot) -> str | None:
-        """While a WP is being planned: "approve", "discuss", "abandon", or None.
+        """While a WP is being planned: "approve", "discuss", "explain", "abandon", or None.
 
         None means the turn is not about the current plan (it names another WP),
         so ordinary routing applies and may start planning that WP instead.
@@ -396,6 +400,8 @@ class ConversationWorkflow:
             return None  # an ordinary rejection of the pending approval closes planning
         if PLAN_ABANDON.fullmatch(text):
             return "abandon"
+        if PLAN_EXPLAIN.fullmatch(text):
+            return "explain"
         named = selectors_in_text(text)
         if any(selector.split("-", 1)[0] != context.planning_wp_id for selector in named):
             return None

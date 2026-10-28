@@ -100,15 +100,6 @@ class PlannerConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(RoutingConfigError, "discovery"):
                 _load(lambda raw, bad=bad: raw["discovery"].update(bad))
 
-    def test_outline_gate_lines_default_and_validation(self):
-        self.assertEqual(_load().planner.discovery.outline_gate_lines, 120)
-        self.assertEqual(_load(lambda raw: raw["discovery"].update(
-            outline_gate_lines=200)).planner.discovery.outline_gate_lines, 200)
-        for bad in (0, True, "120"):
-            with self.assertRaisesRegex(RoutingConfigError, "outline_gate_lines"):
-                _load(lambda raw, bad=bad: raw["discovery"].update(
-                    outline_gate_lines=bad))
-
     def test_advise_mode_is_default(self):
         self.assertEqual(_load(lambda raw: raw["discovery"].update(mode="advise")
                                ).planner.discovery.mode, "advise")

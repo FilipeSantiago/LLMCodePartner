@@ -8,7 +8,8 @@ from unittest.mock import patch
 
 from agent.planning.knowledge_base import (CodebaseMemoryClient, KnowledgeBaseError,
                                            configured_execution_tools, planning_context,
-                                           catch_up_index, refresh_accepted_wp)
+                                           catch_up_index, refresh_accepted_wp,
+                                           _compact, _index_summary)
 from agent.routing.tool_metrics import read_only_handlers
 from agent.spec.command import SpecResult
 from agent.task_contracts.contractor import TaskContractor
@@ -401,3 +402,28 @@ class KnowledgeBaseTest(unittest.IsolatedAsyncioTestCase):
         attached = object()
         run.metadata["implementation_service"] = attached
         self.assertIs(dialog_controller._resume_service(run, session, []), attached)
+
+
+class CompactContextTests(unittest.TestCase):
+    def test_kb_results_drop_paging_scores_builtins_and_project_prefix(self):
+        search = {"cols": ["qn", "label", "file", "lines", "rank"],
+                  "rows": [["proj.pkg.mod.run", "Function", "pkg/mod.py", "3-9", -12.86706]],
+                  "total": 26, "has_more": True, "next_offset": 12, "search_mode": "bm25"}
+        self.assertEqual(json.loads(_compact(json.dumps(search), "proj")), {
+            "cols": ["qn", "label", "file", "lines"],
+            "rows": [["pkg.mod.run", "Function", "pkg/mod.py", "3-9"]]})
+        architecture = {"project": "proj", "total_nodes": 9, "node_labels": {"rows": []},
+                        "hotspots": {"cols": ["qn", "fan_in"],
+                                     "rows": [["builtins.len", 33], ["proj.pkg.load", 5]]}}
+        self.assertEqual(json.loads(_compact(json.dumps(architecture), "proj")),
+                         {"hotspots": {"cols": ["qn", "fan_in"], "rows": [["pkg.load", 5]]}})
+        self.assertEqual(_compact("not json proj.pkg", "proj"), "not json pkg")
+
+    def test_index_status_is_one_line(self):
+        status = {"project": "proj", "status": "ready", "nodes": 860, "edges": 4047,
+                  "indexed_at": "2026-10-26T21:41:22Z", "root_path": "/repo",
+                  "parse_partial": {"files": ["a.py"], "count": 1, "truncated": False},
+                  "skipped": {"files": [], "count": 0}, "watch": {"watched": False}}
+        self.assertEqual(_index_summary(status),
+                         "ready, indexed_at=2026-10-26T21:41:22Z, nodes=860, "
+                         "parse_partial=1 files")

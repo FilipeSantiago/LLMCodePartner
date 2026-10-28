@@ -38,8 +38,8 @@ class CodexCLIExecutor:
              concrete_model=True,
              reasoning_effort=model.reasoning_effort,
              direct_tool_handlers=context.direct_tool_handlers,
-             kb_first=context.kb_first,
              native=context.native,
+             subagents=context.subagents,
              preapprove_ide_tools=bool(context.owner_metadata.get("implementation_job_id")),
         ):
             yield event

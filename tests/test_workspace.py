@@ -18,7 +18,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 from agent import workspace
-from agent.kb_first import KbFirstPolicy
 from agent.routing.config import load_routing_config
 from agent.routing.executors.registry import ExecutorRegistry
 from agent.routing.persistence import RoutingPersistence
@@ -224,6 +223,24 @@ class NativePlanTests(_Fixture):
         self.assertTrue(any("host" in note for note in notes))
 
 
+class InventoryTests(unittest.TestCase):
+    def test_inventory_groups_by_directory_and_truncates(self):
+        with tempfile.TemporaryDirectory() as root:
+            subprocess.run(["git", "init", "-q", root], check=True)
+            for path in ("main.py", "src/a.py", "src/b.py", "tests/test_a.py", ".gitignore"):
+                Path(root, path).parent.mkdir(parents=True, exist_ok=True)
+                Path(root, path).write_text("ignored.py\n" if path == ".gitignore" else "")
+            Path(root, "ignored.py").write_text("")
+            inventory = workspace.project_inventory(root)
+            self.assertEqual(inventory.splitlines(), [
+                "./: .gitignore main.py", "src/: a.py b.py", "tests/: test_a.py"])
+            short = workspace.project_inventory(root, limit_chars=40)
+            self.assertEqual(short.splitlines(), [
+                "./: .gitignore main.py", "src/: a.py b.py",
+                "(+1 more files in 1 directories)"])
+        self.assertEqual(workspace.project_inventory("/nonexistent/project"), "")
+
+
 class _Executor:
     def __init__(self):
         self.contexts = []
@@ -261,7 +278,9 @@ class TaskExecutionNativeTests(_Fixture):
         self.assertIn("project's working directory", prompt)
         self.assertNotIn("codepartner_read_file", prompt)
 
-    def test_kb_first_forces_controlled_ide_execution(self):
+    def test_kb_first_runs_natively_with_the_prompt_rule(self):
+        from agent.prompt.coder import CoderPromptBuilder
+        KB_FIRST_RULE = CoderPromptBuilder().read_pipeline()
         import asyncio
         self.project("demo")
         workspace.activate("demo")
@@ -277,9 +296,9 @@ class TaskExecutionNativeTests(_Fixture):
                     "implementation_job_id": "job", "implementation_position": 0})]
         asyncio.run(collect())
         context = executor.contexts[0]
-        self.assertIsNone(context.native)
-        self.assertTrue(context.kb_first.enforce_reads)
-        self.assertEqual(context.owner_metadata["execution_mode"], "ide")
+        self.assertIsNotNone(context.native)
+        self.assertEqual(context.owner_metadata["execution_mode"], "native")
+        self.assertIn(KB_FIRST_RULE, context.messages[-1]["content"])
 
     def test_auto_without_project_runs_ide_path(self):
         import asyncio
@@ -311,7 +330,6 @@ class TaskExecutionNativeTests(_Fixture):
         workspace.activate("demo")
         executor, _ = asyncio.run(self._execute(owner={}))
         self.assertTrue(executor.contexts[0].native.read_only)
-        self.assertIsNone(executor.contexts[0].kb_first)
 
     def test_explicit_native_unavailable_is_an_error(self):
         import asyncio
@@ -364,6 +382,7 @@ class ProviderFlagTests(unittest.TestCase):
         self.assertIn("mcp__jetbrains__get_file_problems", options.allowed_tools)
         self.assertIn("WebFetch", options.disallowed_tools)
         self.assertEqual(options.env["A"], "1")
+        self.assertTrue(options.strict_mcp_config)  # no claude.ai connectors or user MCP
         run.native = workspace.NativeRun(workspace="/workspace/demo", read_only=True)
         with mock.patch.object(claude, "_query_messages", fake_query):
             asyncio.run(claude.ClaudeProvider()._run_strategy(run, "p", None, []))
@@ -376,6 +395,49 @@ class ProviderFlagTests(unittest.TestCase):
         self.assertEqual([spec.name for spec in native_bridged_specs(specs)],
                          ["get_file_problems", "rename_refactoring", "execute_tool",
                           "kb_search_graph"])
+
+
+class PathTranslationTests(unittest.TestCase):
+    """Codebase Memory indexes the host checkout; native agents see the workspace."""
+
+    def setUp(self):
+        self.native = workspace.NativeRun(workspace="/workspace/demo",
+                                          host_path="/home/u/Demo")
+
+    def test_host_paths_become_workspace_paths_on_a_boundary_only(self):
+        text = ('{"file": "/home/u/Demo/pkg/a.py", "root": "/home/u/Demo", '
+                '"other": "/home/u/Demo2/b.py"} at /home/u/Demo/c.py:12')
+        self.assertEqual(workspace.to_workspace(text, self.native),
+                         '{"file": "/workspace/demo/pkg/a.py", "root": "/workspace/demo", '
+                         '"other": "/home/u/Demo2/b.py"} at /workspace/demo/c.py:12')
+
+    def test_arguments_go_back_to_host_paths(self):
+        arguments = {"file_path": "/workspace/demo/pkg/a.py", "path": "pkg/a.py",
+                     "paths": ["/workspace/demo/x.py", "/workspace/demo2/y.py"], "limit": 5}
+        self.assertEqual(workspace.to_host(arguments, self.native),
+                         {"file_path": "/home/u/Demo/pkg/a.py", "path": "pkg/a.py",
+                          "paths": ["/home/u/Demo/x.py", "/workspace/demo2/y.py"], "limit": 5})
+
+    def test_no_translation_without_a_host_path(self):
+        plain = workspace.NativeRun(workspace="/workspace/demo")
+        self.assertEqual(workspace.to_workspace("/home/u/Demo/a.py", plain), "/home/u/Demo/a.py")
+        self.assertEqual(workspace.to_host({"p": "/workspace/demo/a.py"}, plain),
+                         {"p": "/workspace/demo/a.py"})
+        self.assertEqual(workspace.to_workspace("/home/u/Demo/a.py", None), "/home/u/Demo/a.py")
+
+    def test_relative_collapses_every_path_form(self):
+        for path in ("pkg/a.py", "./pkg/a.py", "/workspace/demo/pkg/a.py",
+                     "/home/u/Demo/pkg/a.py"):
+            self.assertEqual(self.native.relative(path), "pkg/a.py")
+        self.assertIsNone(self.native.relative("/etc/passwd"))
+        self.assertIsNone(self.native.relative("/workspace/demo"))
+        self.native.record_write("/home/u/Demo/pkg/b.py")
+        self.assertEqual(self.native.written, {"pkg/b.py"})
+
+    def test_sessions_carry_the_registered_host_path(self):
+        project = workspace.RegisteredProject("demo", "/workspace/demo", "/home/u/Demo")
+        with mock.patch.object(workspace, "toolchain", return_value=({}, ())):
+            self.assertEqual(workspace.read_only_session(project).host_path, "/home/u/Demo")
 
 
 class GitBaselineRollbackTests(unittest.IsolatedAsyncioTestCase):
@@ -551,36 +613,12 @@ class ReadOnlySessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.repo / "src" / "keep.py").read_text(), "echo > file\n")
 
 
-class SelectiveKbPolicyTests(unittest.IsolatedAsyncioTestCase):
-    async def test_ungated_policy_never_intercepts(self):
-        calls = []
-
-        async def dispatch(name, args):
-            calls.append(name)
-            if name == "kb_search_graph":
-                return json.dumps({"groups": [{"file": "src/loader.py", "rows": [["Loader"]]}]})
-            return "source"
-
-        run = SimpleNamespace(registry=SimpleNamespace(names=lambda: (
-            "kb_search_graph", "search_text", "kb_get_file_outline", "read_file")))
-        policy = KbFirstPolicy(role="coder", gates=False)
-        self.assertEqual(await policy.call("search_text", {"q": "Loader"}, dispatch, run=run),
-                         "source")
-        self.assertEqual(await policy.call("read_file", {"file_path": "src/loader.py"},
-                                           dispatch, run=run), "source")
-        self.assertEqual(calls, ["search_text", "read_file"])
-        self.assertFalse(policy.fork().gates)
-        gated = KbFirstPolicy(role="planner")
-        result = await gated.call("search_text", {"q": "Loader"}, dispatch, run=run)
-        self.assertIn("TEXT SEARCH NOT EXECUTED", result)
-
-
 if __name__ == "__main__":
     unittest.main()
 
 
 class NativePlannerTests(_Fixture):
-    def test_kb_first_planner_uses_controlled_reader_even_when_native_is_available(self):
+    def test_kb_first_planner_runs_read_only_native(self):
         from agent.planning.service import WPPlannerService
         from tests.test_turn_routing import _specs
         from tests.test_wp_planner import PlanArtifacts, PlannerProvider, plan_payload
@@ -592,11 +630,11 @@ class NativePlannerTests(_Fixture):
             config=load_routing_config(), provider_lookup=lambda _name: provider)
         asyncio.run(planner.start("conv", "WP4", "Let's do WP4", _specs(), {}))
         call = provider.calls[0]
-        self.assertIsNone(call["native"])
-        self.assertTrue(call["kb_first"].enforce_reads)
+        self.assertTrue(call["native"].read_only)
+        self.assertNotIn("kb_first", call)
 
-    def test_bound_planner_runs_read_only_native_without_kb_first(self):
-        from agent.planning.prompts import NATIVE_SYSTEM
+    def test_bound_selective_planner_runs_read_only_native(self):
+        from agent.prompt.planner import SYSTEM as NATIVE_SYSTEM
         from agent.planning.service import WPPlannerService
         from tests.test_turn_routing import _specs
         from tests.test_wp_planner import PlanArtifacts, PlannerProvider, plan_payload
@@ -613,7 +651,6 @@ class NativePlannerTests(_Fixture):
         call = provider.calls[0]
         self.assertTrue(call["native"].read_only)
         self.assertEqual(call["native"].workspace, str(path))
-        self.assertIsNone(call["kb_first"])
         prompt = call["conversation"][0]["content"]
         self.assertTrue(prompt.startswith(NATIVE_SYSTEM))
         self.assertNotIn("IDE", NATIVE_SYSTEM)
@@ -677,7 +714,6 @@ class NativeReviewerTests(_Fixture):
         self.assertEqual(decision.verdict, "done")
         call = provider.calls[0]
         self.assertTrue(call["native"].read_only)
-        self.assertIsNone(call["kb_first"])
         self.assertIn("print('v2')", call["prompt"])
         self.assertIn("Filesystem-verified artifact snapshot", call["prompt"])
         self.assertNotIn("request-scoped IDE MCP", call["prompt"])
