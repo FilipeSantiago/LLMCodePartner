@@ -1,6 +1,7 @@
 """Sequential, durable execution and outcome review of OpenSpec tasks."""
 
 import asyncio
+import difflib
 import json
 import logging
 import re
@@ -82,6 +83,54 @@ def _compact_context_handoff(value: object, changed: list[str]) -> dict[str, lis
         if items:
             result[kind] = items
     return result
+
+
+_IDENTIFIER = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+
+
+def _identifiers(text: str) -> set[str]:
+    """Code-like names in prose: snake_case, CamelCase or dotted parts, not plain words."""
+    return {name for name in _IDENTIFIER.findall(text) if len(name) >= 4 and (
+        "_" in name.strip("_") or any(char.isupper() for char in name[1:]))}
+
+
+def _added_lines(before: str, after: str) -> str:
+    """The lines of `after` that `before` does not have, in order."""
+    after_lines = after.splitlines()
+    return "\n".join(line for tag, _i1, _i2, j1, j2 in difflib.SequenceMatcher(
+        None, before.splitlines(), after_lines, autojunk=False).get_opcodes()
+        if tag != "equal" for line in after_lines[j1:j2])
+
+
+def _read_text(root: Path, path: str) -> str | None:
+    try:
+        return (root / path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def merged_manifest(manifests: list[list[dict]]) -> list[dict]:
+    """Several tasks' review manifests (in task order) as one: a path keeps its state
+    before the first task that touched it and its state after the last one."""
+    merged: dict[str, dict] = {}
+    for manifest in manifests:
+        for entry in manifest:
+            first = merged.get(entry["path"])
+            if first is None:
+                merged[entry["path"]] = dict(entry)
+                continue
+            before, after = first["before_exists"], entry["after_exists"]
+            merged[entry["path"]] = {
+                **first, **{key: value for key, value in entry.items()
+                            if key not in {"before_exists", "change", "operations"}},
+                "before_exists": before, "after_exists": after,
+                "change": ("created" if not before and after else
+                           "deleted" if before and not after else
+                           "modified" if before and after else "absent_after_mutation"),
+                "operations": list(dict.fromkeys((*first["operations"],
+                                                  *entry["operations"]))),
+            }
+    return list(merged.values())
 
 
 def handoff_blocker(report: str, task_id: str) -> str | None:
@@ -260,6 +309,56 @@ class ImplementationService:
             commands.append("pytest " + " ".join(shlex.quote(path) for path in paths))
         return tuple([await self._project_test_command(None, command, project)
                       for command in dict.fromkeys(commands)])
+
+    async def _finding_owners(self, job_id: str, rows: list[ImplementationJobTask],
+                              findings: tuple[ReviewFinding, ...],
+                              fallback: ImplementationJobTask
+                              ) -> dict[ReviewFinding, ImplementationJobTask]:
+        """The task that owns each finding: the one whose changes (or, for a file no
+        task changed, whose planned edits) cover the finding's paths. When several tasks
+        changed a path, the code identifiers the finding names decide: each belongs to the
+        last task whose added lines contain it. Unresolved findings go to `fallback`."""
+        if len(rows) < 2:
+            return {finding: fallback for finding in findings}
+        project = native_project()
+        root = Path(project.workspace) if project is not None else None
+        changed: dict[int, dict[str, str]] = {}  # position -> path -> added lines
+        for row in rows:
+            preimages = await self.persistence.rollback_preimages(job_id, [row.position])
+            journal = RollbackJournal(self.persistence, job_id, row.position, [], {})
+            added: dict[str, str] = {}
+            for path in await journal.changed_paths():
+                current = _read_text(root, path) if root is not None else None
+                before = (preimages.get(path) or {}).get("before_content")
+                added[path] = (current or "") if before is None else _added_lines(
+                    before, current or "")
+            changed[row.position] = added
+        plan = await self._approved_plan(job_id)
+        planned = {row.position: set(plan.tasks[row.task_id].edit_files())
+                   for row in rows if plan is not None and row.task_id in plan.tasks}
+        owners: dict[ReviewFinding, ImplementationJobTask] = {}
+        for finding in findings:
+            paths = set(finding.artifact_paths)
+            candidates = [row for row in rows if paths & set(changed[row.position])]
+            if not candidates:
+                candidates = [row for row in rows if paths & planned.get(row.position, set())]
+            if len(candidates) > 1:
+                names = _identifiers(" ".join((finding.problem, finding.suggested_task,
+                                               *finding.approval_criteria)))
+                votes: dict[int, int] = {}
+                for name in names:
+                    holders = [row.position for row in candidates
+                               if any(name in changed[row.position].get(path, "")
+                                      for path in paths)]
+                    if holders:
+                        votes[max(holders)] = votes.get(max(holders), 0) + 1
+                if votes:
+                    best = max(votes.values())
+                    candidates = [row for row in candidates
+                                  if votes.get(row.position) == best]
+            owners[finding] = max(candidates, key=lambda row: row.position) \
+                if candidates else fallback
+        return owners
 
     async def _approved_plan(self, job_id: str) -> ApprovedWPPlan | None:
         """The approved WP plan this job executes, if it came from the planner."""
@@ -1044,7 +1143,13 @@ class ImplementationService:
                     f"journal ({details}); the reviewer is told."))
                 report = (f"{report}\n\nCodePartner journal warning: these changes could "
                           f"not be fully verified in the change journal: {details}.")
-            journal_manifest = await journal.review_manifest()
+            # A work-package review judges every task's changes, so its journal is the
+            # union of the package's; a task review, that task's own.
+            journal_manifest = (merged_manifest([
+                await RollbackJournal(self.persistence, job_id, row.position, specs,
+                                      direct_tool_handlers).review_manifest()
+                for row in package_rows]) if wp_boundary
+                else await journal.review_manifest())
             changed_paths = [entry["path"] for entry in journal_manifest]
             if wp_boundary and _requires_test_run(package):
                 async for event in self._ensure_required_test_run(
@@ -1323,17 +1428,36 @@ class ImplementationService:
                 finding for finding in decision.findings
                 if finding.owner == "coder")
             feedback = decision.feedback or decision.rationale
-            if not await self.persistence.consume_revision(job_id, position):
+            # A work-package review is attached to its last task, but each finding goes
+            # to the task that wrote the code it names; the earliest such task is revised
+            # first, and the review then runs again.
+            owners = await self._finding_owners(job_id, package_rows, implementation_findings,
+                                                item)
+            target = min(owners.values(), key=lambda row: row.position) if owners else item
+            target_findings = tuple(finding for finding, row in owners.items()
+                                    if row.position == target.position) \
+                if owners else implementation_findings
+            if not await self.persistence.consume_revision(job_id, target.position):
                 await self.persistence.update_implementation_task(
                     job_id, position, "awaiting_user_decision", error=feedback)
                 yield TextEvent(self._resolution_options(task.id, verdict, job_id))
                 return
-            attempts, budget = await self.persistence.revision_state(job_id, position)
-            yield TextEvent(ui.block(f"🔁 Revising {task.id}: attempt {attempts}/{budget}."))
+            attempts, budget = await self.persistence.revision_state(job_id, target.position)
+            later = sorted({row.task_id for row in owners.values()
+                            if row.position != target.position})
+            yield TextEvent(ui.block(
+                f"🔁 Revising {target.task_id}: attempt {attempts}/{budget}"
+                + (f" ({len(target_findings)} finding(s) in its code"
+                   + (f"; {', '.join(later)} after the next review" if later else "") + ")"
+                   if target.position != position or later else "") + "."))
+            if target.position != position:
+                # The review is claimed again from the revised task once it finishes.
+                await self.persistence.update_implementation_task(
+                    job_id, position, "implemented")
             revised_instruction = "\n".join(filter(None, [
-                instruction, self._revision_context(task.id, implementation_findings)
+                instruction, self._revision_context(target.task_id, target_findings)
             ]))
-            async for event in self._run_item(item, messages, specs,
+            async for event in self._run_item(target, messages, specs,
                                               revised_instruction, direct_tool_handlers):
                 yield event
             return

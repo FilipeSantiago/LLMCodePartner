@@ -675,11 +675,14 @@ class NativePlannerTests(_Fixture):
 class NativeReviewerTests(_Fixture):
     """The review service reads the mounted project; the model pass is read-only native."""
 
-    def _review(self, provider, manifest, report="Changed `src/app.py`."):
+    def _review(self, provider, manifest, report="Changed `src/app.py`.", tool_free=False):
         from agent.routing.review import ReviewService
         from tests.test_routing import task as make_task
         queued = replace(make_task(), context="")
         object.__setattr__(queued, "_review_journal_manifest", manifest)
+        if tool_free:
+            object.__setattr__(queued, "_review_tool_free", True)
+            object.__setattr__(queued, "_review_reference_source", "### ref.py\n1| x")
         with mock.patch("agent.routing.review.providers.get", return_value=provider):
             config = load_routing_config()
             config = replace(config, discovery=replace(config.discovery, policy="selective"))
@@ -717,6 +720,45 @@ class NativeReviewerTests(_Fixture):
         self.assertIn("print('v2')", call["prompt"])
         self.assertIn("Filesystem-verified artifact snapshot", call["prompt"])
         self.assertNotIn("request-scoped IDE MCP", call["prompt"])
+
+    def test_inline_review_is_tool_free_only_with_the_whole_evidence(self):
+        path = self.project("demo")
+        workspace.activate("demo")
+        (path / "src" / "app.py").write_text("print('v2')\n")
+        manifest = [{"path": "src/app.py", "change": "modified", "before_exists": True,
+                     "after_exists": True, "operations": ["replace"],
+                     "postimage_verified": True}]
+        verdict = {"verdict": "done", "rationale": "ok", "evidence": ["app prints v2"],
+                   "inspected_paths": ["src/app.py"], "findings": []}
+        provider = self._provider(verdict)
+        self._review(provider, manifest, tool_free=True)
+        call = provider.calls[0]
+        self.assertIsNone(call["native"])
+        self.assertIn("You have no tools", call["prompt"])
+        self.assertIn("1| x", call["prompt"])
+        # A file the coder names but did not journal is cut to the snapshot budget:
+        # the reviewer then keeps its read-only tools.
+        (path / "src" / "big.py").write_text("x = 1\n" * 5000)
+        provider = self._provider(verdict)
+        self._review(provider, manifest, report="Changed `src/app.py` and `src/big.py`.",
+                     tool_free=True)
+        call = provider.calls[0]
+        self.assertTrue(call["native"].read_only)
+        self.assertNotIn("You have no tools", call["prompt"])
+
+    def test_lockfiles_are_summarized_in_the_snapshot(self):
+        path = self.project("demo")
+        workspace.activate("demo")
+        (path / "uv.lock").write_text("pkg = 1\n" * 3000)
+        provider = self._provider({"verdict": "done", "rationale": "ok", "evidence": ["x"],
+                                   "inspected_paths": ["uv.lock"], "findings": []})
+        self._review(provider, [{"path": "uv.lock", "change": "created",
+                                 "before_exists": False, "after_exists": True,
+                                 "operations": ["create"], "postimage_verified": True}],
+                     report="Updated `uv.lock`.")
+        prompt = provider.calls[0]["prompt"]
+        self.assertIn("dependency lockfile, 3000 lines; content omitted", prompt)
+        self.assertNotIn("pkg = 1", prompt)
 
     def test_absolute_workspace_paths_in_the_report_are_project_files(self):
         path = self.project("demo")

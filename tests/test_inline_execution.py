@@ -546,6 +546,104 @@ class TaskExecutionRoutingTests(unittest.TestCase):
         self.assertEqual(texts[-1], "agentic session\n")
 
 
+class FindingOwnerTests(unittest.IsolatedAsyncioTestCase):
+    """A work-package review's findings go to the task that wrote the code they name."""
+
+    async def asyncSetUp(self):
+        from agent.routing.models import ImplementationJobTask
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.store = RoutingPersistence(self.root / "routing.sqlite3")
+        base = "def run_experiment(config):\n    return config\n"
+        after_t2 = base + "\n\ndef evaluate_generated_dataset(dataset):\n    return {}\n"
+        after_t3 = after_t2 + ("\n\ndef select_and_render_piano_roll(dataset, seed):\n"
+                               "    return dataset[seed]\n")
+        (self.root / "experiment_pipeline.py").write_text(after_t3)
+        (self.root / "tests").mkdir()
+        (self.root / "tests/test_generation.py").write_text("def test_remi():\n    pass\n")
+        # The journal: each task's preimage of what it changed.
+        for position, path, before in ((1, "experiment_pipeline.py", base),
+                                       (2, "experiment_pipeline.py", after_t2),
+                                       (3, "tests/test_generation.py", None)):
+            await self.store.record_rollback_file("job", position, path, before is not None,
+                                                  "hash", before)
+        self.rows = [ImplementationJobTask("job", position, "c", f"WP2-T{position + 1}")
+                     for position in range(4)]
+        self.service = ImplementationService.__new__(ImplementationService)
+        self.service.persistence = self.store
+
+        async def no_plan(_job_id):
+            return None
+
+        self.service._approved_plan = no_plan
+
+    async def asyncTearDown(self):
+        self.directory.cleanup()
+
+    @staticmethod
+    def finding(problem, *paths):
+        from agent.routing.review import ReviewFinding
+        return ReviewFinding("implementation", problem, "fix it", ("fixed",), paths)
+
+    async def owners(self, *findings):
+        from unittest import mock
+        with mock.patch("agent.routing.implementation.native_project",
+                        return_value=RegisteredProject("demo", str(self.root))):
+            owners = await self.service._finding_owners("job", self.rows, findings,
+                                                        self.rows[-1])
+        return [owners[finding].task_id for finding in findings]
+
+    async def test_each_finding_goes_to_the_task_that_wrote_its_code(self):
+        self.assertEqual(await self.owners(
+            self.finding("select_and_render_piano_roll ignores non-evaluable pieces",
+                         "experiment_pipeline.py"),
+            self.finding("evaluate_generated_dataset drops distribution metrics",
+                         "experiment_pipeline.py"),
+            self.finding("only remi is covered", "tests/test_generation.py"),
+        ), ["WP2-T3", "WP2-T2", "WP2-T4"])
+
+    async def test_unknown_paths_fall_back_to_the_reviewed_task(self):
+        self.assertEqual(await self.owners(self.finding("missing docs", "README.md")),
+                         ["WP2-T4"])
+
+    async def test_a_file_no_task_changed_goes_to_its_planned_owner(self):
+        async def plan(_job_id):
+            return SimpleNamespace(tasks={"WP2-T1": TaskContext(
+                "WP2-T1", "o", edits=[EditRange("generation/factory.py", "create it")])})
+
+        self.service._approved_plan = plan
+        self.assertEqual(await self.owners(
+            self.finding("factory missing", "generation/factory.py")), ["WP2-T1"])
+
+
+class ReviewEvidenceTests(unittest.TestCase):
+    def test_package_manifests_merge_first_before_and_last_after(self):
+        from agent.routing.implementation import merged_manifest
+        merged = merged_manifest([
+            [{"path": "a.py", "change": "created", "before_exists": False,
+              "after_exists": True, "operations": ["file_create"]}],
+            [{"path": "a.py", "change": "modified", "before_exists": True,
+              "after_exists": True, "operations": ["file_replace"]},
+             {"path": "b.py", "change": "modified", "before_exists": True,
+              "after_exists": True, "operations": ["file_replace"]}],
+        ])
+        self.assertEqual(merged[0]["change"], "created")
+        self.assertEqual(merged[0]["operations"], ["file_create", "file_replace"])
+        self.assertEqual([entry["path"] for entry in merged], ["a.py", "b.py"])
+
+    def test_lockfiles_are_summarized_not_shown(self):
+        from agent.routing.review import _lockfile_view
+        view = _lockfile_view("a\nb\nc\n", {"before_exists": True, "before_content": "a\n"})
+        self.assertIn("2 lines added or removed", view)
+        self.assertNotIn("b\nc", view)
+
+    def test_identifiers_ignore_plain_words(self):
+        from agent.routing.implementation import _identifiers
+        self.assertEqual(_identifiers("The select_and_render_piano_roll test of "
+                                      "PianoRollVideoArtifact is missing a check"),
+                         {"select_and_render_piano_roll", "PianoRollVideoArtifact"})
+
+
 class ToolFreeSurfaceTests(unittest.TestCase):
     def test_executors_give_a_tool_free_call_no_coder_tools(self):
         from agent.routing.executors.claude import ClaudeCLIExecutor

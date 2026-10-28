@@ -94,6 +94,23 @@ lines, new files in full) and the current source of the reviewed tasks' referenc
 asks for every finding in one decision. A question the evidence cannot settle becomes a
 verification finding owned by `evidence_service`.
 
+The review falls back to a read-only session with tools whenever any part of its
+snapshot was truncated: a cut-off file is not the whole evidence. A work-package review
+journals every task of the package (not only the last one), so every changed file reaches
+the reviewer as a complete diff. Dependency lockfiles (`uv.lock`, `package-lock.json`,
+...) are summarized in one line instead of filling the snapshot budget.
+
+## Revisions go to the task that wrote the code
+
+A work-package review is attached to the package's last task, but a `needs_work`
+finding is revised by the task that owns it: the task whose journaled changes cover the
+finding's paths (or, for a file no task changed, whose planned edits name it). When
+several tasks changed the same file, the code identifiers the finding names
+(`select_and_render_piano_roll`) decide: each belongs to the last task whose added lines
+contain it. The earliest owning task is revised first with only its own findings; the
+package review then runs again from that task, and any remaining findings are routed
+the same way. Each task's revision budget is its own.
+
 ## Measuring it
 
 Each inline attempt records a telemetry row (`execution_mode: inline`) with `llm_calls`,
