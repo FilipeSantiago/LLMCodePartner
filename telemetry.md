@@ -6,8 +6,11 @@ owns measurement schemas and writes. Telemetry is failure-isolated: a telemetry 
 failure is logged and must never fail a coding task.
 
 By default, telemetry and routing audit records use the SQLite database at
-`~/.codepartner/routing.sqlite3`. Set `ROUTING_DB_PATH` to choose another file. No
-telemetry uploader or remote export is implemented.
+`~/.codepartner/routing.sqlite3`. Set `ROUTING_DB_PATH` to choose another file. These
+tables are never uploaded. Separately, optional OpenTelemetry tracing
+(`OTEL_ENABLED=true`) exports execution traces to a self-hosted Langfuse; it adds to
+this local telemetry and does not replace it (see
+[docs/observability.md](docs/observability.md)).
 
 ## Dedicated telemetry package
 

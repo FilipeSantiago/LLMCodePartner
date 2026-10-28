@@ -1,0 +1,206 @@
+# Observability stack: OpenTelemetry Collector + self-hosted Langfuse v4.
+#
+# Independent of Code Partner's own stack (compose.yaml): start, stop, and
+# upgrade it separately. Code Partner keeps working when this stack is down.
+#
+#   python scripts/observability_init.py          # once: writes observability/.env
+#   docker compose -f compose.observability.yaml --env-file observability/.env up -d
+#   docker compose -f compose.observability.yaml --env-file observability/.env down
+#
+# Adapted from Langfuse's official docker-compose.yml (v4). Differences: exact
+# image versions, a private bridge network, no host ports for databases, cache,
+# object storage or worker, Langfuse product telemetry off, and the collector.
+# See docs/observability.md.
+name: codepartner-observability
+
+x-langfuse-env: &langfuse-env
+  NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+  DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?run scripts/observability_init.py}@postgres:5432/${POSTGRES_DB:-postgres}
+  SALT: ${SALT:?run scripts/observability_init.py}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?run scripts/observability_init.py}
+  TELEMETRY_ENABLED: "false"
+  LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+  CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?run scripts/observability_init.py}
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?run scripts/observability_init.py}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  # Media uploads are not used by Code Partner (no prompts or files are exported),
+  # so MinIO stays internal-only.
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?run scripts/observability_init.py}
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: ${REDIS_AUTH:?run scripts/observability_init.py}
+  REDIS_TLS_ENABLED: "false"
+
+x-langfuse-depends-on: &langfuse-depends-on
+  postgres:
+    condition: service_healthy
+  minio:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  clickhouse:
+    condition: service_healthy
+
+services:
+  otel-collector:
+    # Core distribution: otlp receiver, otlphttp exporter, batch, memory_limiter,
+    # attributes and health_check are all included; contrib is not needed.
+    image: ${OTEL_COLLECTOR_IMAGE:-otel/opentelemetry-collector:0.162.0}
+    command: ["--config=/etc/otelcol/config.yaml"]
+    environment:
+      LANGFUSE_OTLP_ENDPOINT: ${LANGFUSE_OTLP_ENDPOINT:-http://langfuse-web:3000/api/public/otel/v1/traces}
+      LANGFUSE_OTLP_AUTH: ${LANGFUSE_OTLP_AUTH:?run scripts/observability_init.py}
+    volumes:
+      - ./observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      # Loopback only. Code Partner runs with host networking and reaches these
+      # as otel-collector:4318 through its extra_hosts entry.
+      - 127.0.0.1:${OTEL_COLLECTOR_HTTP_PORT:-4318}:4318
+      - 127.0.0.1:${OTEL_COLLECTOR_GRPC_PORT:-4317}:4317
+      - 127.0.0.1:${OTEL_COLLECTOR_HEALTH_PORT:-13133}:13133
+    networks: [observability]
+    restart: unless-stopped
+    healthcheck:
+      # The image is distroless (no shell or HTTP client). Re-validating the
+      # mounted configuration is the supported in-container probe; liveness is
+      # the health_check extension on 127.0.0.1:13133.
+      test: ["CMD", "/otelcol", "validate", "--config=/etc/otelcol/config.yaml"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    depends_on:
+      # Not service_healthy: the collector queues and retries while Langfuse starts.
+      langfuse-web:
+        condition: service_started
+
+  langfuse-worker:
+    image: ${LANGFUSE_WORKER_IMAGE:-langfuse/langfuse-worker:4.50.0}
+    restart: unless-stopped
+    depends_on: *langfuse-depends-on
+    environment:
+      <<: *langfuse-env
+    networks: [observability]
+
+  langfuse-web:
+    image: ${LANGFUSE_WEB_IMAGE:-langfuse/langfuse:4.50.0}
+    restart: unless-stopped
+    depends_on: *langfuse-depends-on
+    ports:
+      - 127.0.0.1:${LANGFUSE_PORT:-3000}:3000
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?run scripts/observability_init.py}
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
+    networks: [observability]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://$$(hostname):3000/api/public/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 10
+
+  clickhouse:
+    image: ${CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:25.12.11.4}
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?run scripts/observability_init.py}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    networks: [observability]
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  minio:
+    image: ${MINIO_IMAGE:-cgr.dev/chainguard/minio@sha256:32c504bea4574d8f29d719b37bc0dad920ecf3e22b81dc5cea0bb105af2ce10f}
+    restart: unless-stopped
+    entrypoint: sh
+    # Create the 'langfuse' bucket before starting the service (as upstream).
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?run scripts/observability_init.py}
+    volumes:
+      - langfuse_minio_data:/data
+    networks: [observability]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4.10}
+    restart: unless-stopped
+    command: >
+      --requirepass ${REDIS_AUTH:?run scripts/observability_init.py}
+      --maxmemory-policy noeviction
+    volumes:
+      - langfuse_redis_data:/data
+    networks: [observability]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17.10}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/observability_init.py}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    networks: [observability]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+networks:
+  observability:
+    name: codepartner-observability
+
+volumes:
+  langfuse_postgres_data:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:
+  langfuse_redis_data:

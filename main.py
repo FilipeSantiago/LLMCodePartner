@@ -13,8 +13,11 @@ from hypercorn.config import Config
 from api import dialog_controller, model_controller
 from logger.configuration import configure_logging
 from mcp_bridge import mcp_http
+from telemetry.tracing import configure_tracing, shutdown_tracing
 
 configure_logging()
+# Optional OpenTelemetry export (OTEL_ENABLED); see docs/observability.md.
+configure_tracing()
 
 app = FastAPI(title="LLMCodePartner")
 
@@ -28,4 +31,8 @@ app.mount("/mcp", mcp_http.asgi_app)
 if __name__ == "__main__":
     config = Config()
     config.bind = ["0.0.0.0:7777"]
-    asyncio.run(serve(app, config))
+    try:
+        asyncio.run(serve(app, config))
+    finally:
+        # Bounded: never delays process exit beyond OTEL_SHUTDOWN_TIMEOUT_SECONDS.
+        shutdown_tracing()

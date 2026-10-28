@@ -64,6 +64,9 @@ services:
     extra_hosts:
       - semantic-router:127.0.0.1
       - agentgateway:127.0.0.1
+      # Optional observability stack (compose.observability.yaml) publishes OTLP
+      # on loopback; tracing stays off unless OTEL_ENABLED=true.
+      - otel-collector:127.0.0.1
     volumes:
       - agent-home:/home/codepartner
       # Live, read-only config: projects.yaml edits apply without a rebuild.

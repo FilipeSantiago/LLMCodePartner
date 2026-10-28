@@ -145,6 +145,10 @@ into the image. `.dockerignore` excludes the local `.env` file.
   context-compress filter pipeline in an isolated sidecar (`compose.compress.yaml`)
   and are accepted only if no identifier, error line or JSON value is lost; the
   original stays retrievable. See [docs/context-compression.md](docs/context-compression.md).
+- Tracing (opt-in): `.env` `OTEL_ENABLED=true` exports one OpenTelemetry trace per
+  execution (routing, Claude/Codex runs, MCP tool calls; no prompts or source) to a
+  separate OTel Collector + self-hosted Langfuse stack (`compose.observability.yaml`).
+  See [docs/observability.md](docs/observability.md).
 - LLM provider: `.env` `LLM_PROVIDER=claude|codex|ollama` (see Providers).
 - Coder provider: `.env` `CODER_PROVIDER=claude|codex` — who executes the accepted
   prompt in the pipeline, independent of `LLM_PROVIDER`.
