@@ -1,0 +1,4 @@
+Your plan JSON is incomplete or invalid:
+- tasks is missing WP1-T2
+- summary is empty
+Return the complete corrected JSON object only, with no other text.

@@ -1,0 +1,14 @@
+[
+  {
+    "role": "system",
+    "content": "SYSTEM PREFIX"
+  },
+  {
+    "role": "assistant",
+    "content": "dropped"
+  },
+  {
+    "role": "user",
+    "content": "transport command\nWorking directory: /workspace/project; use paths under it.\nProject files (for locating paths only; not a reading list):\nsrc/\ntests/"
+  }
+]

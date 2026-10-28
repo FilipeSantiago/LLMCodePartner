@@ -1,0 +1,6 @@
+DELEGATION RULES: Read missing journaled-file regions only. Send all references and other source content to the reader in one request per objective.
+Journaled files (direct ranged reads only):
+- src/a.py
+References (reader only):
+OUT OF SCOPE: For a concrete review question the snapshot leaves open, first write `SCOPE EXCEPTION: <question>`, then ask the reader. Never read those files yourself.
+Do not use shell commands, content searches or KB source tools to print project file contents. Path discovery may return paths only.
