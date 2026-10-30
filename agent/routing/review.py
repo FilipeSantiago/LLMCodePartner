@@ -21,7 +21,6 @@ from agent.spec.models import ModelIdentity, OpenSpecChange, Task
 from agent.workspace import disk_files, plan_native, read_only_session
 from mcp_bridge.models import DoneEvent, ErrorEvent, ProgressEvent, TextEvent, ToolCallEvent
 from mcp_bridge.registry import (DOMAIN_NOTEBOOK, DOMAIN_SOURCE, OP_FILE_READ,
-                                 OP_FILE_SEARCH,
                                  ROLE_OPTIMIZER, ToolRegistry, ToolSpec, allowed_for)
 from mcp_bridge.read_metrics import SourceReadStats
 from providers import subagents
@@ -48,10 +47,7 @@ _MAX_SNAPSHOT_CHARS = 48000
 _MAX_REPORT_CHARS = 12000
 _MAX_FINDINGS = 12
 _MAX_CRITERIA_PER_FINDING = 8
-_READ_PAGE_LINES = 500
-_MAX_READ_PAGES = 40
 _MAX_REQUIRED_EVIDENCE_CHARS = 512000
-_TRUNCATED_READ = re.compile(r"(?:^|\n)…\d+ lines truncated…(?:\n|$)")
 _AUXILIARY_PATH = re.compile(
     r"(?:^|/)(?:scratch|tmp|temp|debug|adhoc|ad_hoc)(?:[_./-]|$)",
     re.IGNORECASE,
@@ -349,32 +345,6 @@ def _reconcile_journal_candidates(candidates: list[ArtifactCandidate],
     return list(merged.values())
 
 
-def _search_result_paths(result: object) -> list[str]:
-    """Extract safe project-relative file paths from an IDE search response."""
-    value = result
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError:
-            return []
-    if not isinstance(value, dict):
-        return []
-    structured = value.get("structuredContent")
-    if isinstance(structured, dict):
-        value = structured
-    items = value.get("items")
-    if not isinstance(items, list):
-        return []
-    paths = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        path = item.get("filePath") or item.get("path")
-        if _project_relative_path(path) is not None and path not in paths:
-            paths.append(path)
-    return paths
-
-
 def _artifact_category(path: str) -> str:
     lower = path.lower()
     name = PurePosixPath(lower).name
@@ -563,18 +533,6 @@ def _review_journal(value: object) -> list[dict]:
 
 def _content_text(result) -> str:
     return result if isinstance(result, str) else json.dumps(result)
-
-
-def _normalized_read(result: object) -> tuple[str, bool, bool, int]:
-    raw = _content_text(result)
-    try:
-        text, _ = BridgeMcpFileClient._text_from_tool_response(raw)
-    except Exception:
-        text = raw
-    truncated = bool(_TRUNCATED_READ.search(text))
-    text = _TRUNCATED_READ.sub("\n", text)
-    text, numbered, _ = BridgeMcpFileClient._strip_numbered_lines(text)
-    return text, numbered, truncated, len(text.splitlines())
 
 
 def _disk_read(root: str, path: str) -> tuple[str | None, str | None, bool]:
@@ -778,16 +736,14 @@ class ReviewService:
                         domain)}
         handlers = direct_tool_handlers or {}
         readable &= handlers.keys()
-        # Native: the service reads the mounted project itself and the model pass runs
-        # as a read-only native session; IDE reads are the `execution: ide` path only.
+        # The service reads the mounted project itself and the model pass runs as a
+        # read-only native session.
         native_plan = plan_native(self.config.models[reviewer_name].provider)
-        if native_plan.mode == "native" and not native_plan.native:
+        if not native_plan.native:
             raise ReviewUnavailableError(
                 f"native execution is unavailable: {native_plan.reason}", reviewer_name)
-        native_root = native_plan.project.workspace if native_plan.native else None
+        native_root = native_plan.project.workspace
         native_seen: set[str] = set()
-        if not readable and native_root is None:
-            raise ReviewError("no request-scoped IDE MCP content-read tool is available for review")
         inspected: set[str] = set()
         source_stats = SourceReadStats()
         model_reads: list[tuple[str, str, str]] = []
@@ -918,119 +874,26 @@ class ReviewService:
         optional_failures: list[str] = []
         unresolved: list[dict[str, object]] = []
         resolved_paths: dict[str, str] = {}
-        search_specs = [spec for spec in registry.candidates(
-            OP_FILE_SEARCH, DOMAIN_SOURCE) if spec.name in handlers]
 
         async def read_artifact(path: str) \
                 -> tuple[str | None, str | None, list[str], bool]:
-            if native_root is not None:
-                if progress:
-                    await progress(f"Reading {path}")
-                content, error, missing = await asyncio.to_thread(_disk_read, native_root, path)
-                if content is None:
-                    return None, None, [error], missing
-                inspected.add(path)
-                return content, "filesystem", [], False
-            notebook = path.lower().endswith(".ipynb")
-            attempts: list[tuple[ToolSpec, str]] = []
-            if notebook:
-                attempts.extend((spec, "notebook") for spec in registry.candidates(
-                    "notebook_content_read", DOMAIN_NOTEBOOK) if spec.name in review_handlers)
-            attempts.extend((spec, "source_fallback" if notebook else "source")
-                            for spec in registry.candidates(OP_FILE_READ, DOMAIN_SOURCE)
-                            if spec.name in review_handlers)
-            # Prefer the native readers, and never invoke the same advertised tool twice.
-            attempts.sort(key=lambda item: item[0].name.rsplit("__", 1)[-1]
-                          not in {"read_file", "read_notebook"})
-            deduplicated: list[tuple[ToolSpec, str]] = []
-            seen_tools: set[str] = set()
-            for spec, mode in attempts:
-                if spec.name not in seen_tools:
-                    deduplicated.append((spec, mode))
-                    seen_tools.add(spec.name)
-            attempt_errors: list[str] = []
-            missing_outcomes: list[bool] = []
-            for selected, mode in deduplicated:
-                try:
-                    pages: list[str] = []
-                    properties = (selected.schema.get("properties", {})
-                                  if isinstance(selected.schema, dict) else {})
-                    supports_offset = "offset" in properties
-                    for page in range(1 if mode == "notebook" else _MAX_READ_PAGES):
-                        supplied = ({"file_path": path} if mode == "notebook" else {
-                            "file_path": path,
-                            "limit": _READ_PAGE_LINES,
-                        })
-                        # JetBrains read_file offsets are positive and 1-based.  Omitting the
-                        # first-page offset also works with readers that reject zero outright.
-                        if page:
-                            if not supports_offset:
-                                attempt_errors.append(
-                                    "IDE MCP reader returned a full page but does not advertise "
-                                    "pagination support")
-                                pages = []
-                                break
-                            supplied["offset"] = page * _READ_PAGE_LINES + 1
-                        arguments = registry.prepare_advertised_call(
-                            selected.name, supplied)[1]
-                        result = await review_handlers[selected.name](arguments)
-                        if not _read_succeeded(result):
-                            detail = _content_text(result).strip()[:200]
-                            missing_outcomes.append(bool(_NOT_FOUND.search(detail)))
-                            attempt_errors.append("IDE MCP returned no file content")
-                            pages = []
-                            break
-                        content, numbered, truncated, line_count = _normalized_read(result)
-                        if pages and content == pages[-1]:
-                            attempt_errors.append(
-                                "IDE MCP reader did not honor pagination offset")
-                            pages = []
-                            break
-                        pages.append(content)
-                        if (mode == "notebook"
-                                or (not truncated
-                                    and (not numbered or line_count < _READ_PAGE_LINES))):
-                            return "\n".join(pages), mode, attempt_errors, False
-                    if pages:
-                        attempt_errors.append(
-                            f"IDE MCP read exceeded {_MAX_READ_PAGES} pages")
-                except Exception as exc:
-                    detail = " ".join(str(exc).split())[:200]
-                    missing_outcomes.append(bool(_NOT_FOUND.search(detail)))
-                    attempt_errors.append(type(exc).__name__
-                                          + (f": {detail}" if detail else ""))
-            exclusively_missing = (bool(missing_outcomes)
-                                   and all(missing_outcomes))
-            return None, None, attempt_errors, exclusively_missing
+            if progress:
+                await progress(f"Reading {path}")
+            content, error, missing = await asyncio.to_thread(_disk_read, native_root, path)
+            if content is None:
+                return None, None, [error], missing
+            inspected.add(path)
+            return content, "filesystem", [], False
 
         async def resolve_supplemental_path(claimed_path: str) \
                 -> tuple[list[str], str | None]:
-            if native_root is not None:
-                basename = PurePosixPath(claimed_path).name
-                try:
-                    files = await asyncio.to_thread(disk_files, native_root)
-                except Exception as exc:
-                    return [], f"{type(exc).__name__}: {exc}"
-                return [path for path in files if PurePosixPath(path).name == basename
-                        and _project_relative_path(path) is not None][:20], None
-            if not search_specs:
-                return [], "no compatible IDE project file-search tool"
-            selected = sorted(
-                search_specs,
-                key=lambda spec: spec.name.rsplit("__", 1)[-1] != "search_file",
-            )[0]
             basename = PurePosixPath(claimed_path).name
             try:
-                arguments = registry.prepare_advertised_call(selected.name, {
-                    "q": f"**/{basename}", "limit": 20,
-                })[1]
-                result = await handlers[selected.name](arguments)
+                files = await asyncio.to_thread(disk_files, native_root)
             except Exception as exc:
-                detail = " ".join(str(exc).split())[:200]
-                return [], type(exc).__name__ + (f": {detail}" if detail else "")
-            matches = [path for path in _search_result_paths(result)
-                       if PurePosixPath(path).name == basename]
-            return matches, None
+                return [], f"{type(exc).__name__}: {exc}"
+            return [path for path in files if PurePosixPath(path).name == basename
+                    and _project_relative_path(path) is not None][:20], None
 
         for path in selected_paths:
             candidate = candidate_by_path[path]
@@ -1046,9 +909,9 @@ class ReviewService:
                         "sources": list(candidate.sources),
                     })
                     continue
-                detail = ("journal records a deleted/absent postimage, but the IDE still reads it"
+                detail = ("journal records a deleted/absent postimage, but the file still exists"
                           if content is not None else
-                          "journaled absence could not be verified through the IDE: "
+                          "journaled absence could not be verified on disk: "
                           + (attempt_errors[-1] if attempt_errors else "reader unavailable"))
                 required_failures.append(f"`{path}` (journaled absence): {detail}")
                 required_failure_paths.append(path)
@@ -1093,7 +956,7 @@ class ReviewService:
                 read_outcomes.append(outcome)
                 continue
             detail = attempt_errors[-1] if attempt_errors \
-                else "no compatible IDE MCP read tool"
+                else "file could not be read"
             if path not in mutation_paths:
                 # Task text and coder claims are discovery hints. An ambiguous, missing,
                 # or unreadable hint goes to the reviewer to resolve from context; a
@@ -1191,9 +1054,9 @@ class ReviewService:
                        "modified: " + "; ".join(required_failures[:3]))
             raise ReviewError(problem, findings=(ReviewFinding(
                 "verification", problem,
-                "Check that the listed files still exist and are readable through the IDE MCP "
-                "read tool, then use `retry review`; do not rerun the coder merely to restate a path.",
-                ("Every journaled file is readable through the request-scoped IDE MCP.",
+                "Check that the listed files still exist and are readable in the mounted "
+                "project, then use `retry review`; do not rerun the coder merely to restate a path.",
+                ("Every journaled file is readable in the mounted project.",
                  "Complete content for every journaled file is available to the reviewer."),
                 tuple(required_failure_paths[:3]),
                 "evidence_service", "internal_evidence_error",
@@ -1203,7 +1066,7 @@ class ReviewService:
         report_truncated = len(report) > len(bounded_report)
         verified_assumptions = [
             {**item, "verification": (
-                "journal and IDE" if item["basis"] == "journal_match" else "IDE")}
+                "journal and filesystem" if item["basis"] == "journal_match" else "filesystem")}
             for item in path_assumptions
             if any(outcome["path"] == item["path"]
                    and outcome["status"] in {"read", "verified_absent"}
@@ -1233,7 +1096,7 @@ class ReviewService:
                            if tool_free else frozenset())
         inspected.update(reference_paths)
         messages = [PromptFactory.create(PromptRole.REVIEWER).with_context(ReviewerPromptContext(
-            task, change.title, native=native_root is not None, reader_offered=reader_offered,
+            task, change.title, reader_offered=reader_offered,
             workspace=native_root or "",
             subagent_request=(self._reviewer_subagents(mutation_paths)
                               if reader_offered else None),

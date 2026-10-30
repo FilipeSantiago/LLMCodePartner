@@ -8,7 +8,6 @@ with a native tool loop. This module imports no LLM SDK.
 """
 import asyncio
 import logging
-import os
 from collections.abc import Awaitable, Callable
 
 from mcp_bridge import bridge
@@ -115,24 +114,6 @@ async def _run(run: Run, prompt: str, system: str | None,
                         run.usage)
                 except Exception:
                     log.exception("could not record native metrics run_id=%s", run.run_id)
-            if run.tool_interface is not None:
-                try:
-                    from telemetry.storage import TelemetryStorage
-                    storage = TelemetryStorage()
-                    storage.record_aci_attempt(
-                        run.run_id, run.metadata,
-                        run.tool_interface.summary(),
-                        run.usage)
-                    compression = run.tool_interface.compression
-                    if compression is not None and run.tool_interface.provenance:
-                        storage.record_context_observations(
-                            run.run_id, run.metadata, run.tool_interface.provenance,
-                            {key: text for key, text in run.tool_interface.observations.items()
-                             if key in run.tool_interface.persistable_keys()}
-                            if compression.config.persist else None,
-                            retention_days=compression.config.persist_days)
-                except Exception:
-                    log.exception("could not record ACI metrics run_id=%s", run.run_id)
             await run.put(DoneEvent(terminal, usage=run.usage, model_usage=run.model_usage))
             bridge.discard(run)
         finally:
@@ -143,7 +124,7 @@ def start_run(prompt: str, system: str | None, specs: list[ToolSpec],
               strategy: Strategy, allowed: frozenset[str] | None = None,
               allowed_operations: frozenset[str] | None = None,
               direct_tool_handlers: dict[str, Callable[[dict], Awaitable[str]]] | None = None,
-              agent_tool_interface: bool = False, *, trace_kind: str = "execution",
+              *, trace_kind: str = "execution",
               trace_provider: str | None = None, trace_model: str | None = None,
               trace_reasoning_effort: str | None = None) -> Run:
     """Begin a bridged execution: register the tools this run's role allows and run
@@ -157,32 +138,6 @@ def start_run(prompt: str, system: str | None, specs: list[ToolSpec],
     """
     run = Run(registry=ToolRegistry(allowed, allowed_operations))
     run.direct_tool_handlers = dict(direct_tool_handlers or {})
-    if agent_tool_interface:
-        from mcp_bridge.agent_tools import AgentToolInterface, tool_specs
-        from mcp_bridge.compression import shared_service
-        compact = os.getenv("CODEPARTNER_ACI_ENABLED", "true").lower() != "false"
-        # Compression shapes compact observations only; the baseline stays raw.
-        run.tool_interface = AgentToolInterface(
-            run, compact=compact, compression=shared_service() if compact else None)
-        if compact:
-            shaped = []
-            for spec in specs:
-                bare = spec.name.rsplit("__", 1)[-1]
-                if bare == "get_git_diff_all":
-                    continue
-                if bare == "read_file" and isinstance(spec.schema, dict):
-                    schema = dict(spec.schema)
-                    original_props = schema.get("properties")
-                    props = dict(original_props) if isinstance(original_props, dict) else {}
-                    limit = props.get("limit")
-                    props["limit"] = {**(limit if isinstance(limit, dict) else {}),
-                                      "default": 100, "maximum": 200}
-                    schema["properties"] = props
-                    spec = ToolSpec(spec.name,
-                                    "Read a project file in a contiguous window. Default 100 lines, "
-                                    "maximum 200; use offset to continue. Returns total lines.", schema)
-                shaped.append(spec)
-            specs = [*shaped, *tool_specs()]
     registered = run.registry.register(specs)
     log.info("mcp tool registration: %s", [s.name for s in registered])
     debug(log, "run.started", run_id=run.run_id, allowed_tools=sorted(allowed) if allowed else None,

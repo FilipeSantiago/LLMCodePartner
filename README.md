@@ -41,8 +41,7 @@ filesystem is the main execution path: the WP planner, coders, reviewers and cha
 turns use Claude Code's and Codex's own file and shell tools in the project
 directory, and OpenSpec artifacts are read and written on disk. IDE MCP stays
 available for IDE-specific extras only (inspections, symbols, refactorings, run
-configurations). Unregistered projects fail by default; set
-`CODEPARTNER_EXECUTION_MODE=auto` or `ide` to keep the IDE path for them. Codex runs
+configurations). Unregistered projects fail. Codex runs
 without its own sandbox, so the container is the only boundary and every mounted
 project is reachable. Register projects with
 `scripts/register_project.py`, chain `compose.projects.yaml` through `COMPOSE_FILE`,
@@ -128,23 +127,6 @@ into the image. `.dockerignore` excludes the local `.env` file.
 - Capability diagnostics log tool names, schema-shape decisions, and call IDs only.
   Request bodies, prompts, credentials, and tool arguments are never logged.
 - Tool-call timeout: `.env` `MCP_TOOL_TIMEOUT=120` (seconds).
-- Coder tool observations: `CODEPARTNER_ACI_ENABLED=true` (default). Set it to
-  `false` for a measured baseline of the legacy file reader; security checks
-  remain active. The shared bridge presents full files by default (or explicit
-  line ranges), IDE-provided search matches, explicit command/edit outcomes, and
-  complete observation reloads to Claude and Codex. `codepartner_read_file`
-  accepts `path`, `start_line`, `end_line`, and `refresh`; `codepartner_search_in_file`
-  accepts a project-relative `path`, `query`, and optional `limit`.
-  `codepartner_get_observation` retrieves an earlier result, or an index with
-  `observation_id="index"`.
-  Coding-run measurements are recorded in `telemetry_aci_attempts` in the
-  routing database, including agent and backend calls, returned lines, output
-  bytes, duplicates, edits, and provider-reported usage.
-- Tool-result compression: `CODEPARTNER_COMPRESS_ENABLED=false` (default). When
-  enabled, large search, listing, command and generic results pass through the
-  context-compress filter pipeline in an isolated sidecar (`compose.compress.yaml`)
-  and are accepted only if no identifier, error line or JSON value is lost; the
-  original stays retrievable. See [docs/context-compression.md](docs/context-compression.md).
 - Tracing (opt-in): `.env` `OTEL_ENABLED=true` exports one OpenTelemetry trace per
   execution (routing, Claude/Codex runs, MCP tool calls; no prompts or source) to a
   separate OTel Collector + self-hosted Langfuse stack (`compose.observability.yaml`).
@@ -253,31 +235,25 @@ active task's description and task-level acceptance criteria, not on an MCP writ
 call. Work-package criteria are cumulative context for the package and cannot be
 used to require implementation or tests assigned to later sibling tasks. Legacy
 tasks without explicit task criteria use their description as the review criterion.
-The review service reads claimed project artifacts from the mounted project (through
-the request-scoped IDE MCP on the `ide` path) and supplies a balanced, bounded source snapshot to the reviewer so
+The review service reads claimed project artifacts from the mounted project and supplies a balanced, bounded source snapshot to the reviewer so
 interfaces, factories, concrete implementations, and tests receive coverage.
 Task mutation-journal paths are authoritative review evidence. A basename in a
 coder report is reconciled to a unique journal path first; legacy or supplemental
-claims use IDE project search only after a literal not-found result and only when
+claims use a project file search only after a literal not-found result and only when
 the exact filename has one match. Missing or ambiguous paths remain pending.
-Notebook artifacts use the notebook reader when available and fall back to the
-IDE source reader for raw `.ipynb` JSON when the file is not IDE-backed.
 Unreadable required deliverables keep the review pending; unreadable scratch,
 temporary, debug, or ad-hoc artifacts are disclosed as optional limitations
 unless the task objective or acceptance criteria explicitly require them.
 The reviewer
-may read further files with read-only tools (natively, or IDE MCP reads on the `ide`
-path). Its decision must identify the artifacts it assessed;
+may read further files with read-only tools. Its decision must identify the artifacts it assessed;
 an unverified review stays pending and cannot become a confirmation question.
-On the `ide` path, Codex reviewer runs disable the built-in shell and pre-approve
-only the private run's optimizer-approved IDE read/search tools; natively they are
-read-only sessions (see docs/native-execution.md).
+Reviewer runs are read-only native sessions (see docs/native-execution.md).
 If Claude coded the task, Codex reviews it; if Codex coded it, Claude reviews
 it. When only one provider is usable, a fresh read-only review uses that
 provider. `/review` remains a separate manual read-only command, while `/spec`,
 `/update`, and `/rework` only persist their own OpenSpec artifacts.
 
-If a reviewer is unavailable or cannot inspect through IDE MCP, the task stays
+If a reviewer is unavailable or cannot inspect the project, the task stays
 pending; reply `retry review` in the same chat after the issue is fixed. Reviewer
 pairings and model tiers are configured in `config/model-routing.yaml`.
 Codex routes may configure a separate `review_reasoning_effort`; this raises the

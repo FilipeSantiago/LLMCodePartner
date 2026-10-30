@@ -4,11 +4,6 @@ import json
 
 from telemetry.storage import TelemetryStorage
 
-_COMPRESSION_KEYS = ("compress_applied", "compress_fallbacks", "compress_guard_rejections",
-                     "compress_bytes_before", "compress_bytes_after", "dedup_hits",
-                     "est_tokens_saved")
-
-
 def normalize_usage(usage: dict | None) -> dict:
     """Provider usage as uncached input, cache read, cache write and output tokens.
 
@@ -133,61 +128,4 @@ class TelemetryAggregation:
                 for row in modes.values():
                     if not row.pop("cost_complete"):
                         row["cost_usd"] = None
-        return result
-
-    def aci_comparison(self, task_ids: list[str]) -> dict:
-        """Compare recorded coder attempts by observation mode without source data."""
-        if not task_ids:
-            return {}
-        placeholders = ",".join("?" for _ in task_ids)
-        with self.storage._database() as db:
-            rows = db.execute(
-                "SELECT task_id, metrics_json, usage_json, cost_usd "
-                "FROM telemetry_aci_attempts WHERE task_id IN (" + placeholders + ")",
-                tuple(task_ids),
-            ).fetchall()
-        result: dict[str, dict] = {}
-        for task_id, metrics_json, usage_json, cost in rows:
-            metrics = json.loads(metrics_json)
-            usage = json.loads(usage_json) if usage_json else {}
-            mode = metrics.get("observation_mode", "unknown")
-            compression = metrics.get("compression_mode", "off")
-            if compression != "off":
-                mode = f"{mode}+compress:{compression}"
-            if metrics.get("exploration_mode") == "reader":
-                mode = f"{mode}+explore:reader"
-            group = result.setdefault(task_id, {}).setdefault(mode, {
-                "attempts": 0, "agent_calls": 0, "backend_calls": 0,
-                "lines_returned": 0, "model_output_bytes": 0,
-                "backend_output_bytes": 0, "input_tokens": 0,
-                "cached_input_tokens": 0, "output_tokens": 0,
-                "cost_usd": 0.0,
-                # Estimated by the compressor (bytes/4), never provider-reported.
-                "estimated": {key: 0 for key in _COMPRESSION_KEYS},
-                # Reported by the provider, normalized across Claude and Codex.
-                "actual": {"uncached_input_tokens": 0, "cache_read_tokens": 0,
-                           "cache_write_tokens": 0, "output_tokens": 0,
-                           "total_input_tokens": 0},
-            })
-            group["attempts"] += 1
-            for key in ("agent_calls", "backend_calls", "lines_returned",
-                        "model_output_bytes", "backend_output_bytes"):
-                group[key] += metrics.get(key, 0)
-            group["input_tokens"] += usage.get("input_tokens", usage.get("inputTokens", 0)) or 0
-            group["cached_input_tokens"] += (usage.get("cache_read_input_tokens")
-                                              or usage.get("cached_input_tokens") or 0)
-            group["output_tokens"] += usage.get("output_tokens", usage.get("outputTokens", 0)) or 0
-            group["cost_usd"] += cost or 0.0
-            for key in _COMPRESSION_KEYS:
-                group["estimated"][key] += metrics.get(key, 0)
-            for key, value in normalize_usage(usage).items():
-                group["actual"][key] += value
-        for modes in result.values():
-            for group in modes.values():
-                actual = group["actual"]
-                # Diagnostic only: smaller tool results can lower this ratio
-                # while total cost falls.
-                group["cache_read_ratio"] = (
-                    round(actual["cache_read_tokens"] / actual["total_input_tokens"], 4)
-                    if actual["total_input_tokens"] else None)
         return result

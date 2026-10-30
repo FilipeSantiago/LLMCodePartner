@@ -3,24 +3,20 @@
 import unittest
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from agent.routing.persistence import RoutingPersistence
 from agent.workflow.controller import ConversationWorkflow
 from agent.workflow.interpreter import ConversationIntentInterpreter
-from api import dialog_controller
-from mcp_bridge.models import TextEvent
-from model.chat import ChatCompletionRequest, ChatMessage
-from tests import ide_mode
+from tests import native_mode
 
 
 def setUpModule():
-    ide_mode.pin()
+    native_mode.pin()
 
 
 def tearDownModule():
-    ide_mode.unpin()
+    native_mode.unpin()
 
 
 
@@ -77,42 +73,3 @@ class ConversationClassifierTests(unittest.IsolatedAsyncioTestCase):
             pending = await workflow.pending("conv")
             self.assertEqual(pending[0]["action"], "CODING")
 
-    async def test_ad_hoc_coding_runs_only_after_confirmation(self):
-        with tempfile.TemporaryDirectory() as directory:
-            persistence = RoutingPersistence(Path(directory) / "routing.sqlite3")
-            session = SimpleNamespace(client=object(),
-                                      tools=SimpleNamespace(specs=[], handlers={}))
-            calls = []
-
-            class Agent:
-                def tools(self, messages, specs, **kwargs):
-                    calls.append(messages[-1]["content"])
-
-                    async def events():
-                        yield TextEvent("coding started")
-                    return events()
-
-            def request(content, stream=False):
-                return ChatCompletionRequest(
-                    model="test", conversation_id="conv", stream=stream,
-                    messages=[ChatMessage(role="user", content=content)])
-
-            classification = {"action": "CODING", "selectors": (),
-                              "instruction": "Fix the parser", "confidence": "high"}
-            with (mock.patch.object(dialog_controller, "get_session", return_value=session),
-                  mock.patch.object(dialog_controller, "task_execution",
-                                    SimpleNamespace(persistence=persistence)),
-                  mock.patch.object(dialog_controller.providers, "active", return_value=Agent()),
-                  mock.patch.object(ConversationIntentInterpreter, "interpret",
-                                    return_value=classification)):
-                preview = await dialog_controller.chat_completions(request("Fix the parser"))
-                self.assertEqual(calls, [])
-                token = (await persistence.pending_workflow_proposals("conv"))[0][
-                    "confirmation_token"]
-                self.assertIn(f"confirm {token}", preview.choices[0].message.content)
-                response = await dialog_controller.chat_completions(
-                    request(f"confirm {token}", stream=True))
-                body = b"".join([chunk if isinstance(chunk, bytes) else chunk.encode()
-                                 async for chunk in response.body_iterator]).decode()
-                self.assertIn("coding started", body)
-                self.assertEqual(calls, ["Fix the parser"])

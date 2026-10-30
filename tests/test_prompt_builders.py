@@ -92,7 +92,7 @@ class IsolationTests(unittest.TestCase):
             [{"role": "user", "content": "task"}], "/tmp/project", "a.py")
         self.assertIn("Working directory: /tmp/project", coder[0]["content"])
         reviewer = ReviewerPromptBuilder().with_context(ReviewerPromptContext(
-            task(), "Change", native=True, workspace="/tmp/project")).build().text
+            task(), "Change", workspace="/tmp/project")).build().text
         self.assertIn("Working directory: /tmp/project", reviewer)
 
     def test_overriding_a_shared_fragment_changes_only_that_role(self):

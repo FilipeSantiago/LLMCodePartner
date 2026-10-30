@@ -9,7 +9,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from api import dialog_controller
 from agent.planning import service as planning_service
 from agent.planning.models import ApprovedWPPlan, WPPlanDraft, plan_id_for
 from agent.prompt import PlannerPromptBuilder
@@ -25,15 +24,15 @@ from agent.task_contracts.contractor import TaskContractor
 from mcp_bridge.models import DoneEvent, ErrorEvent, TextEvent
 from model.chat import ChatMessage
 from tests.test_turn_routing import _Artifacts, _Execution, _WorldTest, _specs
-from tests import ide_mode
+from tests import native_mode
 
 
 def setUpModule():
-    ide_mode.pin()
+    native_mode.pin()
 
 
 def tearDownModule():
-    ide_mode.unpin()
+    native_mode.unpin()
 
 
 TASKS = ("WP4-T1", "WP4-T2")
@@ -478,22 +477,6 @@ class PlannerServiceTests(unittest.IsolatedAsyncioTestCase):
                     "ANTHROPIC_BASE_URL" in provider.calls[0].get("execution_env", {}),
                     mode == "required")
 
-    async def test_start_routes_by_wp_complexity_and_keeps_structured_state(self):
-        provider = PlannerProvider(plan_payload(), read=["src/registry.py", "src/trainer.py"])
-        turn = await self.planner(provider).start(
-            "conv", "WP4", "Let's do WP4", _specs(), {"read_file": _read})
-        self.assertEqual(turn.planner_model, "claude-opus")
-        self.assertEqual(turn.revision, 1)
-        self.assertEqual(turn.gaps, [])
-        self.assertEqual(set(turn.draft.tasks), set(TASKS))
-        session = await self.persistence.active_planning("conv")
-        self.assertEqual(session["wp_complexity"], "high")
-        self.assertEqual(session["draft"]["tasks"]["WP4-T1"]["approach"], "Extend the registry")
-        self.assertEqual(provider.calls[0]["role"], "optimizer")
-        turns = await self.persistence.planning_turns(session["session_id"])
-        self.assertEqual(turns[0]["tool_metrics"]["file_reads"], 2)
-        self.assertEqual(turns[0]["usage"]["input_tokens"], 1000)
-
     async def test_discuss_revises_the_same_session_with_current_state(self):
         provider = PlannerProvider(plan_payload(), plan_payload(summary="Smaller scope."))
         planner = self.planner(provider)
@@ -548,16 +531,6 @@ class PlannerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.artifacts.package = replace(self.artifacts.package, objective="Something else")
         with self.assertRaisesRegex(PlanningError, "changed in OpenSpec"):
             await planner.approve(turn.session_id, 2)
-
-    async def test_tool_budget_refuses_calls_past_the_limit(self):
-        self.config = replace(self.config, planner=replace(self.config.planner,
-                                                           max_tool_calls=1))
-        provider = PlannerProvider(plan_payload(), read=["a.py", "b.py", "c.py"])
-        turn = await self.planner(provider).start("conv", "WP4", "go", _specs(),
-                                                  {"read_file": _read})
-        turns = await self.persistence.planning_turns(turn.session_id)
-        self.assertEqual(turns[0]["tool_metrics"]["tool_calls"], 1)
-        self.assertEqual(turns[0]["tool_metrics"]["refused_over_budget"], 2)
 
     async def test_kb_lookups_are_free_and_file_reads_have_their_own_budget(self):
         from agent.routing.tool_metrics import (BUDGET_EXHAUSTED, READ_BUDGET_EXHAUSTED,
@@ -813,45 +786,6 @@ class PlanModeConversationTests(_WorldTest):
         self.assertIn("- `src/registry.py` — A registry already exists", answer)
         prompt = self.provider.calls[0]["conversation"][0]["content"]
         self.assertIn("Progress notes: before each tool call", prompt)
-
-    async def test_kb_progress_precedes_planner_file_inspection(self):
-        self.world.sessions["conv"].knowledge_base = {
-            "enabled": True, "provider": "codebase-memory", "project_id": "target"}
-        self.provider.read = ["src/registry.py"]
-        self.world.sessions["conv"].tools.handlers = {"read_file": _read}
-
-        async def kb_context(config, stage, request, progress=None):
-            self.assertEqual(config["project_id"], "target")
-            self.assertEqual(stage, "implementation")
-            self.assertIn("Load data through one factory", request)
-            await progress("Checking Codebase Memory project and index status")
-            await progress("Reading indexed architecture")
-            return "Indexed architecture for the planner"
-
-        with mock.patch.object(dialog_controller, "planning_context", kb_context), \
-                mock.patch.object(dialog_controller, "configured_planner_tools",
-                                  return_value=([], {}, "")):
-            answer = await self.say("Let's do WP4")
-        self.assertLess(answer.index("Checking Codebase Memory project"),
-                        answer.index("Reading indexed architecture"))
-        self.assertLess(answer.index("Reading indexed architecture"),
-                        answer.index("**Investigating WP4"))
-        self.assertLess(answer.index("**Investigating WP4"),
-                        answer.index("Reading `src/registry.py`"))
-        self.assertIn("Indexed architecture for the planner",
-                      self.provider.calls[0]["conversation"][0]["content"])
-
-    async def test_narration_can_be_turned_off(self):
-        config = load_routing_config()
-        quiet = replace(config, planner=replace(config.planner, narrate=False))
-        self.provider.read = ["src/registry.py"]
-        self.provider.notes = {"src/registry.py": "Checking how loaders are registered"}
-        self.world.sessions["conv"].tools.handlers = {"read_file": _read}
-        with mock.patch.object(planning_service, "load_routing_config", return_value=quiet):
-            answer = await self.say("Let's do WP4")
-        self.assertIn("- 🔎 Reading `src/registry.py`", answer)
-        self.assertNotIn("💭", answer)
-        self.assertNotIn("Progress notes", self.provider.calls[0]["conversation"][0]["content"])
 
     async def test_cancel_abandons_planning(self):
         await self.say("Let's do WP4")

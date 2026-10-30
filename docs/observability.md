@@ -167,7 +167,7 @@ Key attributes, all exported through a strict allowlist:
 |---|---|
 | execution | `codepartner.execution.id` (Run id), `codepartner.session.id` / `langfuse.session.id` (conversation id), `codepartner.command`, `codepartner.execution.status` (`completed`/`failed`/`cancelled`), duration, tool-call, tool-error and error counts, provider, model, task/job/decision ids, `codepartner.routing.strategy`, `codepartner.diagnostic_trace_id`, Langfuse trace metadata and tags. |
 | model.routing | kind (`coder`/`planner`), complexity, candidates, fallbacks, excluded models, selected provider/model, reasoning effort, strategy (`semantic-router`, `deterministic-fallback`, `planner-tier`), duration. **No** routing reason text. |
-| llm.execution | provider, requested model, `codepartner.aggregate.*` run totals when reported, `codepartner.source.*` delivered-read counts and bytes, cost (Claude), native tool counts, status, terminal reason. Run totals are excluded from Langfuse generation usage so turn usage is counted once. |
+| llm.execution | provider, requested model, `codepartner.aggregate.*` run totals when reported, cost (Claude), native tool counts, status, terminal reason. Run totals are excluded from Langfuse generation usage so turn usage is counted once. |
 | llm.turn | One span per Claude assistant message or Codex JSON turn, with sequence, run/job/task IDs, provider, model, `gen_ai.usage.*` when reported, tool-call counts, and `codepartner.turn.context_measurement`. Bridged tool spans are children of the active turn. |
 | mcp.tool_call | `gen_ai.tool.name`, `mcp.method.name=tools/call`, `codepartner.mcp.server` (`jetbrains-ide`, `jetbrains-standalone`, `codebase-memory`, `codepartner-aci`), route (`direct`, `ide_bridge`, `refused`), status, mutating flag, argument key names, argument and result byte counts, duration, `error.type` (`tool_error`, `timeout`, `policy_refused`, `invalid_call`, `stopped` or an exception class). |
 
@@ -181,13 +181,6 @@ provider token fields are omitted rather than recorded as zero.
 
 The provider Run records aggregate usage under `codepartner.aggregate.*` for
 diagnosis. Only turn spans carry `gen_ai.usage.*` for Langfuse accounting.
-The same Run span records first-read bytes, bounded previews, explicit complete
-reads, explicit ranges, follow-up reads and preview-observation expansions under
-`codepartner.source.*`; the
-corresponding per-attempt values remain in `telemetry_aci_attempts.metrics_json`.
-These are delivered-output measurements, not provider token savings. Historical
-WP6 attempts have no such fields, and no post-change task comparison is available
-until equivalent work runs on the new build.
 
 ### WP6 baseline and comparison
 

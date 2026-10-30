@@ -4,12 +4,27 @@ Events are wire-format-agnostic; the OpenAI SSE translation lives in
 `conversation/streaming_responder.py`, not here.
 """
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from uuid import uuid4
 from typing import Any
 
 from mcp_bridge.registry import ToolRegistry
+
+
+def tool_failed(raw: str | None) -> bool:
+    text = (raw or "").lstrip()
+    if text.lower().startswith(("error", "failed", "access denied")):
+        return True
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return False
+    if isinstance(value, dict):
+        return bool(value.get("isError") or value.get("is_error") or value.get("error")) \
+            or value.get("status") in {"failed", "error"}
+    return False
 
 
 # --- Events placed on a Run's queue, consumed by the OpenAI SSE translator ---
@@ -92,9 +107,6 @@ class Run:
     # bridge tools, they execute against PyCharm's standalone MCP endpoint and
     # therefore do not require an AI Chat OpenAI tool-call round trip.
     direct_tool_handlers: dict[str, Callable[[dict], Awaitable[str]]] = field(default_factory=dict)
-    # Populated only for coding runs. Trusted OpenSpec artifact reads bypass this
-    # presentation layer so rollback snapshots remain complete.
-    tool_interface: Any | None = None
     # Optional native filesystem execution (`agent.workspace.NativeRun`). None keeps
     # every source operation on the IDE bridge.
     native: Any | None = None

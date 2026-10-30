@@ -1,7 +1,5 @@
-"""Read-only tool instrumentation for non-coder roles (planner and similar).
-
-Coder runs are measured by `AgentToolInterface`; roles that run with direct
-read/search handlers wrap those handlers here instead.
+"""Read-only tool instrumentation for roles that run with direct read/search handlers
+(planner and similar): those handlers are wrapped here.
 """
 
 from dataclasses import dataclass, field

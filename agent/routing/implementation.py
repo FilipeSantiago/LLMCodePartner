@@ -32,7 +32,7 @@ from agent.routing.task_execution import TaskExecutionService
 from agent.spec.artifact_store import ArtifactStore
 from agent.spec.models import (CompletionReview, Task, ValidationContract,
                                WorkPackage, WorkPackageReview)
-from agent.task_contracts.contractor import TaskContractor, requested_paths, USER_RESOLUTION_REASON
+from agent.task_contracts.contractor import TaskContractor, requested_paths
 from agent.task_contracts.persistence import TaskContractPersistence
 from agent.workspace import (NATIVE_SHELL_TOOL, command_result, native_project,
                              run_native_command)
@@ -307,7 +307,7 @@ class ImplementationService:
                 paths.append(first)
         if paths:
             commands.append("pytest " + " ".join(shlex.quote(path) for path in paths))
-        return tuple([await self._project_test_command(None, command, project)
+        return tuple([self._project_test_command(command, project)
                       for command in dict.fromkeys(commands)])
 
     async def _finding_owners(self, job_id: str, rows: list[ImplementationJobTask],
@@ -1538,21 +1538,17 @@ class ImplementationService:
         """Run the WP's required tests once when no captured run has passed.
 
         The reviewer is read-only, so a required "tests pass" item can only be met
-        by CodePartner-captured execution. The run goes through the journaled
-        ``execute_tool`` wrapper and is recorded as evidence for the reviewer.
+        by CodePartner-captured execution. The run is recorded as evidence for the reviewer.
         """
         evidence = []
         for row in package_rows:
             evidence.extend(await self.persistence.verification_evidence(job_id, row.position))
         if has_passing_test_run(evidence):
             return
-        handlers = journal.wrapped_handlers()
-        dispatcher = next((name for name in handlers
-                           if name.rsplit("__", 1)[-1] == "execute_tool"), None)
         project = native_project()
-        if dispatcher is None and project is None:
-            yield TextEvent(ui.block("The required tests have no passing run, and this IDE exposes no "
-                            "`execute_tool` for CodePartner to run them."))
+        if project is None:
+            yield TextEvent(ui.block("The required tests have no passing run, and this "
+                                     "conversation has no native project to run them in."))
             return
         command = next((found for item in reversed(evidence)
                         if (found := shell_test_command(
@@ -1569,19 +1565,13 @@ class ImplementationService:
                                 "or changed test file was found to run."))
                 return
             command = "pytest " + " ".join(shlex.quote(path) for path in test_paths)
-        command = await self._project_test_command(journal, command, project)
+        command = self._project_test_command(command, project)
         yield TextEvent(ui.block(f"Running the required tests through CodePartner: `{command}`"))
-        if project is not None:
-            output, exit_code = await run_native_command(project, command)
-            result = command_result(output, exit_code)
-            await journal.record_verification(
-                NATIVE_SHELL_TOOL, {"command": command}, result,
-                exit_code == 0 if exit_code is not None else verification_succeeded(result))
-            return
-        try:
-            await handlers[dispatcher]({"command": command})
-        except Exception as exc:
-            log.warning("required_test_run_failed job_id=%s error=%s", job_id, exc)
+        output, exit_code = await run_native_command(project, command)
+        result = command_result(output, exit_code)
+        await journal.record_verification(
+            NATIVE_SHELL_TOOL, {"command": command}, result,
+            exit_code == 0 if exit_code is not None else verification_succeeded(result))
 
     @staticmethod
     def _test_blocker_lines(evidence: list[dict]) -> list[str]:
@@ -1605,22 +1595,15 @@ class ImplementationService:
                 "and the reviewer will judge their output."]
 
     @staticmethod
-    async def _project_test_command(journal: RollbackJournal, command: str,
-                                    project=None) -> str:
+    def _project_test_command(command: str, project) -> str:
         """Run a bare pytest through the project's environment rather than PATH."""
         if not re.match(r"(?:pytest|py\.test)(?:\s|$)", command):
             return command
-        if project is not None:
-            # A host .venv is unusable in the container; uv builds its own environment.
-            root = Path(project.workspace)
-            if (root / "uv.lock").exists() or (root / "pyproject.toml").exists():
-                return f"uv run {command}"
-            return f"python3 -m {command}"
-        if (await journal._read("uv.lock"))[0]:
+        # A host .venv is unusable in the container; uv builds its own environment.
+        root = Path(project.workspace)
+        if (root / "uv.lock").exists() or (root / "pyproject.toml").exists():
             return f"uv run {command}"
-        if (await journal._read(".venv/pyvenv.cfg"))[0]:
-            return f".venv/bin/python -m {command}"
-        return f"python -m {command}"
+        return f"python3 -m {command}"
 
     async def retry_review(self, job_id: str, position: int,
                            messages: list[dict], specs: list[ToolSpec],

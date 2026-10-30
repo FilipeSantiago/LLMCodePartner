@@ -4,18 +4,13 @@
 #
 #   workspace:  container path; must be a bind mount under /workspace
 #   host_path:  the same directory on the host (matches the IDE project path)
-#   execution:  native - the mounted filesystem; report an error when unavailable (default)
-#               auto   - native when possible, otherwise the IDE tools
-#               ide    - always the IDE tools
 # A conversation binds to the entry whose id equals `project.id` in the project's
 # .codepartner/config.yaml, or whose host_path equals the IDE project path.
 projects:
   music-generation:
     workspace: /workspace/music-generation
     host_path: /home/you/Documents/research/MusicGeneration
-    execution: native
 
   volley-vision:
     workspace: /workspace/volley-vision
     host_path: /home/you/Documents/research/VolleyVision
-    execution: native

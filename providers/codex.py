@@ -31,7 +31,7 @@ from pathlib import Path
 from mcp_bridge import mcp_http
 from mcp_bridge import server as engine
 from mcp_bridge.models import ErrorEvent, Event, ProgressEvent, Run, TextEvent
-from mcp_bridge.registry import ROLE_CODER, ToolSpec, allowed_for, native_bridged_specs
+from mcp_bridge.registry import ToolSpec, allowed_for, native_bridged_specs
 from providers import scope_guard, subagents
 from providers.base import Provider
 from telemetry import tracing
@@ -247,7 +247,6 @@ class CodexProvider(Provider):
             run = engine.start_run(prompt, system, specs, strategy=strategy,
                                    allowed=allowed_for(role),
                                    direct_tool_handlers=direct_tool_handlers,
-                                   agent_tool_interface=role == ROLE_CODER and native is None,
                                    trace_kind="llm", trace_provider=self.NAME,
                                    trace_model=model if concrete_model else model_for(model),
                                    trace_reasoning_effort=reasoning_effort)

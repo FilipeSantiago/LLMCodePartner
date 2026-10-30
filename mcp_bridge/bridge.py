@@ -6,8 +6,7 @@ from uuid import uuid4
 
 from agent.workspace import to_host, to_workspace
 from mcp_bridge.activity import describe_call
-from mcp_bridge.models import MutationEvent, ProgressEvent, Run, ToolCallEvent
-from mcp_bridge.agent_tools import tool_failed
+from mcp_bridge.models import MutationEvent, ProgressEvent, Run, ToolCallEvent, tool_failed
 from mcp_bridge.registry import is_mutating_tool, operations_for
 from logger.diagnostic import debug
 from telemetry import tracing
@@ -58,17 +57,7 @@ async def call_tool(run: Run, name: str, arguments: dict) -> str:
     the future until the client returns a `role:"tool"` result. Raises
     `asyncio.TimeoutError` if the client doesn't answer within `TOOL_TIMEOUT`.
     """
-    async def dispatch(tool_name: str, tool_args: dict) -> str:
-        if run.tool_interface is None:
-            return await _call_backend(run, tool_name, tool_args)
-        result = await run.tool_interface.execute(
-            tool_name, tool_args,
-            lambda actual_name, actual_args: _call_backend(run, actual_name, actual_args))
-        run.tool_interface.metrics["model_output_bytes"] += len(result.encode())
-        run.tool_interface.record_delivered_result(tool_name, tool_args, result)
-        return result
-
-    return await dispatch(name, arguments)
+    return await _call_backend(run, name, arguments)
 
 
 async def _call_backend(run: Run, name: str, arguments: dict) -> str:
@@ -98,8 +87,6 @@ async def _dispatch_backend(run: Run, name: str, arguments: dict, tool) -> str:
     if run.metadata.get("stop_requested"):
         tracing.tool_route(tool, "refused", refusal="stopped")
         return "Error: this job is being stopped; no further tool calls are allowed."
-    if run.tool_interface is not None:
-        run.tool_interface.metrics["backend_calls"] += 1
     # Every route, including direct standalone tools, goes through the per-run
     # catalog adapter.  A provider cannot bypass dispatcher/schema restrictions.
     try:
@@ -124,10 +111,7 @@ async def _dispatch_backend(run: Run, name: str, arguments: dict, tool) -> str:
     tool_call_id = "call_" + uuid4().hex[:24]
     fut = register(tool_call_id, run, name, arguments)
     await run.put(ToolCallEvent(tool_call_id, name, arguments))
-    result = await await_result(tool_call_id, fut)
-    if run.tool_interface is not None:
-        run.tool_interface.metrics["backend_output_bytes"] += len(result.encode())
-    return result
+    return await await_result(tool_call_id, fut)
 
 
 async def _call_direct(run: Run, handler, name: str, arguments: dict,
@@ -154,8 +138,6 @@ async def _call_direct(run: Run, handler, name: str, arguments: dict,
              run.metadata.get("trace_id"), run.run_id, name)
     debug(log, "bridge.direct_tool_result", trace_id=run.metadata.get("trace_id"),
           run_id=run.run_id, tool_name=name, result_length=len(text or ""))
-    if run.tool_interface is not None:
-        run.tool_interface.metrics["backend_output_bytes"] += len(text.encode())
     return text
 
 

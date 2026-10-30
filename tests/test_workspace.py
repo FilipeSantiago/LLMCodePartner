@@ -7,7 +7,6 @@ git-baseline rollback and the selective KB policy.
 import asyncio
 import json
 import os
-import stat
 import subprocess
 import tempfile
 import unittest
@@ -81,7 +80,7 @@ class _Fixture(unittest.TestCase):
         self.patches = [
             _env(CODEPARTNER_WORKSPACE_ROOT=str(self.ws_root),
                  CODEPARTNER_PROJECTS_CONFIG=str(self.config),
-                 CODEPARTNER_EXECUTION_MODE=None, CODEPARTNER_NATIVE_PROVIDERS=None),
+                 CODEPARTNER_NATIVE_PROVIDERS=None),
             mock.patch("agent.workspace.os.path.ismount",
                        side_effect=lambda path: str(path) in self.mounted),
         ]
@@ -101,7 +100,7 @@ class _Fixture(unittest.TestCase):
         stamp = self.config.stat().st_mtime_ns + 1_000_000
         os.utime(self.config, ns=(stamp, stamp))
 
-    def project(self, project_id="demo", execution="auto", git=True, mount=True) -> Path:
+    def project(self, project_id="demo", git=True, mount=True) -> Path:
         path = self.ws_root / project_id
         if git:
             _repo(path)
@@ -110,7 +109,7 @@ class _Fixture(unittest.TestCase):
         if mount:
             self.mounted.add(str(path))
         self.register(f"projects:\n  {project_id}:\n    workspace: {path}\n"
-                      f"    host_path: /home/u/{project_id}\n    execution: {execution}\n")
+                      f"    host_path: /home/u/{project_id}\n")
         return path
 
 
@@ -168,51 +167,31 @@ class RegistryTests(_Fixture):
 
 
 class NativePlanTests(_Fixture):
-    def test_auto_native_when_registered_mounted_and_git(self):
+    def test_native_when_registered_mounted_and_git(self):
         self.project("demo")
-        plan = workspace.plan_native("claude", project_id="demo")
-        self.assertTrue(plan.native)
-        self.assertEqual(plan.mode, "auto")
+        self.assertTrue(workspace.plan_native("claude", project_id="demo").native)
 
-    def test_auto_falls_back_with_reasons(self):
-        self.assertFalse(workspace.plan_native("claude", project_id=None).native)
+    def test_unavailable_plans_give_reasons(self):
+        unbound = workspace.plan_native("codex", project_id=None)
+        self.assertFalse(unbound.native)
+        self.assertIn("register_project.py", unbound.reason)
         self.project("demo", git=False)
         plan = workspace.plan_native("claude", project_id="demo")
         self.assertFalse(plan.native)
         self.assertIn("git", plan.reason)
-        self.assertEqual(plan.mode, "auto")
 
-    def test_excluded_files_stay_native_and_provider_allowlist_keeps_ide(self):
+    def test_unmounted_project_reports_the_mount(self):
+        self.project("demo", mount=False)
+        plan = workspace.plan_native("claude", project_id="demo")
+        self.assertFalse(plan.native)
+        self.assertIn("bind mount", plan.reason)
+
+    def test_excluded_files_stay_native_and_provider_allowlist_applies(self):
         self.project("demo")
         self.assertTrue(workspace.plan_native("claude", ("secret.py",), project_id="demo").native)
         with _env(CODEPARTNER_NATIVE_PROVIDERS="claude"):
             self.assertIn("CODEPARTNER_NATIVE_PROVIDERS",
                           workspace.plan_native("codex", project_id="demo").reason)
-
-    def test_explicit_native_reports_instead_of_falling_back(self):
-        self.project("demo", execution="native", mount=False)
-        plan = workspace.plan_native("claude", project_id="demo")
-        self.assertEqual(plan.mode, "native")
-        self.assertFalse(plan.native)
-        self.assertIn("bind mount", plan.reason)
-        with _env(CODEPARTNER_EXECUTION_MODE="native"):
-            unbound = workspace.plan_native("claude", project_id=None)
-        self.assertEqual(unbound.mode, "native")
-        self.assertIn("not bound", unbound.reason)
-
-    def test_defaults_are_native_for_claude_and_codex(self):
-        self.register("projects:\n  demo:\n    workspace: %s\n" % (self.ws_root / "demo"))
-        self.assertEqual(workspace.registry().get("demo").execution, "native")
-        unbound = workspace.plan_native("codex", project_id=None)
-        self.assertEqual(unbound.mode, "native")
-        self.assertIn("register_project.py", unbound.reason)
-        self.project("demo", execution="native")
-        self.assertTrue(workspace.plan_native("codex", project_id="demo").native)
-
-    def test_ide_mode_override(self):
-        self.project("demo")
-        with _env(CODEPARTNER_EXECUTION_MODE="ide"):
-            self.assertFalse(workspace.plan_native("claude", project_id="demo").native)
 
     def test_toolchain_uses_container_uv_environment(self):
         path = self.project("demo")
@@ -300,13 +279,6 @@ class TaskExecutionNativeTests(_Fixture):
         self.assertEqual(context.owner_metadata["execution_mode"], "native")
         self.assertIn(KB_FIRST_RULE, context.messages[-1]["content"])
 
-    def test_auto_without_project_runs_ide_path(self):
-        import asyncio
-        with _env(CODEPARTNER_EXECUTION_MODE="auto"):
-            executor, _ = asyncio.run(self._execute())
-        self.assertIsNone(executor.contexts[0].native)
-        self.assertEqual(executor.contexts[0].owner_metadata["execution_mode"], "ide")
-
     def test_default_without_project_is_an_error(self):
         import asyncio
         executor, events = asyncio.run(self._execute())
@@ -333,7 +305,7 @@ class TaskExecutionNativeTests(_Fixture):
 
     def test_explicit_native_unavailable_is_an_error(self):
         import asyncio
-        self.project("demo", execution="native", git=False)
+        self.project("demo", git=False)
         workspace.activate("demo")
         executor, events = asyncio.run(self._execute())
         self.assertEqual(executor.contexts, [])
@@ -913,7 +885,7 @@ class FilesystemArtifactTests(_Fixture):
         from api import dialog_controller
         self.project("demo")
         workspace.activate("demo")
-        store = dialog_controller._artifact_store(None, [])
+        store = dialog_controller._artifact_store()
         self.assertIsInstance(store._client, FilesystemFileClient)
         self.assertTrue(dialog_controller._chat_native(True).read_only)
         writer = dialog_controller._chat_native(False)
@@ -922,5 +894,3 @@ class FilesystemArtifactTests(_Fixture):
         workspace.activate(None)
         with self.assertRaises(dialog_controller._NativeUnavailable):
             dialog_controller._chat_native(True)
-        with _env(CODEPARTNER_EXECUTION_MODE="ide"):
-            self.assertIsNone(dialog_controller._chat_native(True))

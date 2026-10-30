@@ -21,9 +21,6 @@ import yaml
 
 log = logging.getLogger("codepartner.workspace")
 
-MODES = ("auto", "native", "ide")
-# The filesystem is the main execution path; `auto` (IDE fallback) and `ide` are opt-ins.
-DEFAULT_MODE = "native"
 # Task capabilities that never write (matches the executors' `read_only` metadata).
 READ_ONLY_CAPABILITIES = frozenset({
     "read", "research", "inspect", "inspection", "analysis", "review", "verification"})
@@ -41,7 +38,6 @@ class RegisteredProject:
     id: str
     workspace: str
     host_path: str | None = None
-    execution: str = DEFAULT_MODE
 
 
 def _workspace_root() -> Path:
@@ -71,13 +67,11 @@ def _parse(raw: Any) -> dict[str, RegisteredProject]:
         if host_path is not None and (not isinstance(host_path, str)
                                       or not host_path.startswith("/")):
             raise WorkspaceError(f"project {project_id!r} host_path must be absolute")
-        execution = str(value.get("execution") or DEFAULT_MODE).lower()
-        if execution not in MODES:
-            raise WorkspaceError(
-                f"project {project_id!r} execution must be one of {', '.join(MODES)}")
+        if str(value.get("execution") or "native").lower() != "native":
+            raise WorkspaceError(f"project {project_id!r}: only native execution is supported")
         projects[project_id] = RegisteredProject(
             project_id, os.path.normpath(workspace),
-            os.path.normpath(host_path) if host_path else None, execution)
+            os.path.normpath(host_path) if host_path else None)
     return projects
 
 
@@ -340,7 +334,6 @@ def read_only_session(project: RegisteredProject) -> NativeRun:
 
 @dataclass(frozen=True)
 class NativePlan:
-    mode: str
     project: RegisteredProject | None = None
     reason: str | None = None
 
@@ -400,44 +393,33 @@ def project_inventory(root: str, limit_chars: int = 8000) -> str:
 
 def plan_native(provider: str | None, excluded_files=(),
                 project_id: str | None = None) -> NativePlan:
-    """Decide whether one attempt runs natively. Excluded files do not prevent it:
-    changes to them are detected and fail the attempt afterwards.
-
-    `auto` falls back to the IDE path with a reason; an explicit `native` mode
-    returns the reason so the caller can fail instead of silently falling back.
-    """
+    """Decide whether one attempt can run natively; without a project, `reason` says
+    why and the caller fails. Excluded files do not prevent it: changes to them are
+    detected and fail the attempt afterwards."""
     project_id = project_id if project_id is not None else active_project_id()
-    override = os.getenv("CODEPARTNER_EXECUTION_MODE", "").strip().lower()
-    if override and override not in MODES:
-        return NativePlan("native", reason=f"CODEPARTNER_EXECUTION_MODE={override!r} is invalid")
     if project_id is None:
-        if (override or DEFAULT_MODE) == "native":
-            return NativePlan("native", reason="this conversation is not bound to a registered "
-                                               f"project (see /project); {REGISTER_HINT}")
-        return NativePlan("ide", reason="no registered project")
+        return NativePlan(reason="this conversation is not bound to a registered "
+                                 f"project (see /project); {REGISTER_HINT}")
     try:
         project = registry().get(project_id)
     except WorkspaceError as exc:
-        return NativePlan(override or DEFAULT_MODE, reason=str(exc))
-    mode = override or project.execution
-    if mode == "ide":
-        return NativePlan("ide", reason="execution mode is ide")
+        return NativePlan(reason=str(exc))
     if provider is not None and provider.lower() not in _native_providers():
-        return NativePlan(mode, reason=f"provider {provider!r} is not in "
-                                       "CODEPARTNER_NATIVE_PROVIDERS")
+        return NativePlan(reason=f"provider {provider!r} is not in "
+                                 "CODEPARTNER_NATIVE_PROVIDERS")
     try:
         validate_workspace(project)
     except WorkspaceError as exc:
-        return NativePlan(mode, reason=str(exc))
+        return NativePlan(reason=str(exc))
     if not is_git_worktree(project.workspace):
-        return NativePlan(mode, reason=f"{project.workspace} is not the root of a git work "
-                                       "tree; native change detection needs git")
-    return NativePlan(mode, project)
+        return NativePlan(reason=f"{project.workspace} is not the root of a git work "
+                                 "tree; native change detection needs git")
+    return NativePlan(project)
 
 
 def native_project() -> RegisteredProject | None:
     """The conversation's project when Code Partner itself works on its files
-    (artifacts, its own test runs); None on the IDE path."""
+    (artifacts, its own test runs); None when it has no usable one."""
     return plan_native(None).project
 
 

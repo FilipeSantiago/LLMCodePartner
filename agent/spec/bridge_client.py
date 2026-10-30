@@ -12,7 +12,6 @@ from logger.diagnostic import debug
 
 from agent.spec.jetbrains_mcp import JetBrainsMcpError
 from agent.spec.artifact_store import ArtifactLookupIndeterminate
-from agent.spec.jetbrains_mcp import JetBrainsMcpClient
 
 log = logging.getLogger("codepartner.spec.bridge")
 _NUMBERED_LINE = re.compile(r"^L\d+: ?")
@@ -180,75 +179,3 @@ class BridgeMcpFileClient:
             True,
             first_numbered,
         )
-
-
-class DirectMcpFileClient:
-    """Resolve artifact operations against the conversation's standalone MCP tools."""
-
-    def __init__(self, client: JetBrainsMcpClient, specs):
-        from mcp_bridge.registry import ToolRegistry
-        self._client = client
-        self._registry = ToolRegistry()
-        self._registry.register(list(specs))
-
-    async def create_file(self, path: str, content: str, overwrite: bool = True) -> None:
-        BridgeMcpFileClient._artifact_path(path)
-        await self._call(OP_FILE_CREATE, {
-            "pathInProject": path, "text": content, "overwrite": overwrite,
-        })
-
-    async def read_file(self, path: str) -> str:
-        BridgeMcpFileClient._artifact_path(path)
-        result = ""
-        for _ in range(8):
-            limit = 4000 + next(_read_limit_sequence) % 1001
-            try:
-                result = await self._call(OP_FILE_READ, {"file_path": path, "limit": limit})
-            except JetBrainsMcpError as exc:
-                if _DUPLICATE_DETERMINISTIC_CALL.search(str(exc)):
-                    continue
-                raise
-            if not _DUPLICATE_DETERMINISTIC_CALL.search(result):
-                break
-        else:
-            raise JetBrainsMcpError(f"configured IDE MCP server rejected repeated reads of {path}")
-        text, _wrapper = BridgeMcpFileClient._text_from_tool_response(result)
-        if _TRUNCATED.search(text):
-            raise JetBrainsMcpError(f"PyCharm truncated {path} while reading it")
-        text, _numbered, _preamble = BridgeMcpFileClient._strip_numbered_lines(text)
-        return text
-
-    async def file_exists(self, path: str) -> bool:
-        BridgeMcpFileClient._artifact_path(path)
-        result = ""
-        for limit in (2, 3, 4, 5, 6, 7, 8, 9):
-            try:
-                result = await self._call(OP_FILE_SEARCH, {"q": path, "limit": limit})
-            except JetBrainsMcpError as exc:
-                if _DUPLICATE_DETERMINISTIC_CALL.search(str(exc)):
-                    continue
-                raise
-            if not _DUPLICATE_DETERMINISTIC_CALL.search(result):
-                break
-        else:
-            raise ArtifactLookupIndeterminate(
-                "configured IDE MCP server rejected repeated deterministic file searches"
-            )
-        try:
-            payload = json.loads(result)
-        except json.JSONDecodeError:
-            return path in result
-        return any(item.get("filePath") == path for item in payload.get("items", [])
-                   if isinstance(item, dict)) if isinstance(payload, dict) else False
-
-    async def _call(self, operation: str, arguments: dict) -> str:
-        try:
-            name, prepared = self._registry.prepare_call(operation, arguments, DOMAIN_SOURCE)
-        except (LookupError, ValueError) as exc:
-            raise JetBrainsMcpError(
-                f"configured IDE MCP server has no compatible {operation!r} tool: {exc}"
-            ) from exc
-        result = await self._client.call_tool(name, prepared)
-        if result.lstrip().lower().startswith("error"):
-            raise JetBrainsMcpError(result)
-        return result

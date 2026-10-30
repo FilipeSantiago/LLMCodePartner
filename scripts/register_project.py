@@ -1,7 +1,7 @@
 """Register a host project for native execution (run on the host, not in the container).
 
     .venv/bin/python scripts/register_project.py music-generation ~/Documents/research/MusicGeneration
-    .venv/bin/python scripts/register_project.py volley-vision ~/src/VolleyVision --execution native
+    .venv/bin/python scripts/register_project.py volley-vision ~/src/VolleyVision
 
 Adds the project to config/projects.yaml and its bind mount to compose.projects.yaml.
 Registry edits apply without a restart; a new or changed mount needs
@@ -44,7 +44,7 @@ def _load(path: Path, default: dict) -> dict:
     return data
 
 
-def register(project_id: str, host_path: Path, execution: str, replace: bool) -> bool:
+def register(project_id: str, host_path: Path, replace: bool) -> bool:
     """Write both files; return True when the container must be recreated."""
     workspace = f"/workspace/{project_id}"
     registry = _load(REGISTRY, {"projects": {}})
@@ -54,8 +54,7 @@ def register(project_id: str, host_path: Path, execution: str, replace: bool) ->
     if existing and existing.get("host_path") not in (None, str(host_path)) and not replace:
         raise SystemExit(f"{project_id!r} is already registered for {existing['host_path']}; "
                          "pass --replace to change it")
-    projects[project_id] = {"workspace": workspace, "host_path": str(host_path),
-                            "execution": execution}
+    projects[project_id] = {"workspace": workspace, "host_path": str(host_path)}
     compose = _load(COMPOSE, {"services": {"codepartner": {"volumes": []}}})
     service = compose.setdefault("services", {}).setdefault("codepartner", {})
     volumes = service.setdefault("volumes", []) or []
@@ -94,7 +93,6 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("project_id")
     parser.add_argument("host_path")
-    parser.add_argument("--execution", choices=("auto", "native", "ide"), default="native")
     parser.add_argument("--replace", action="store_true",
                         help="change the host path of an existing registration")
     args = parser.parse_args(argv)
@@ -103,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     host_path = Path(os.path.expanduser(args.host_path)).resolve()
     if reason := _refused(host_path):
         parser.error(reason)
-    recreate = register(args.project_id, host_path, args.execution, args.replace)
+    recreate = register(args.project_id, host_path, args.replace)
     print(f"Registered {args.project_id}: {host_path} -> /workspace/{args.project_id}")
     if subprocess.run(["git", "-C", str(host_path), "rev-parse", "--show-toplevel"],
                       capture_output=True, text=True).stdout.strip() != str(host_path):

@@ -14,7 +14,6 @@ from uuid import uuid4
 import yaml
 
 from agent.routing.jetbrains_tools import DirectIdeTools
-from agent.spec.bridge_client import DirectMcpFileClient
 from agent.spec import session_store
 from agent.spec.filesystem_client import FilesystemFileClient
 from agent.spec.jetbrains_mcp import JetBrainsMcpClient, JetBrainsMcpError
@@ -317,13 +316,9 @@ async def configure_session(conversation_id: str, raw_config: str) -> IdeMcpSess
 
     client = JetBrainsMcpClient(url=url, headers={"IJ_MCP_SERVER_PROJECT_PATH": project_path})
     tools = await DirectIdeTools.discover(client)
-    project_files = _native_files(project_path) or DirectMcpFileClient(client, tools.specs)
+    project_files = _native_files(project_path)
     project_name = None
-    try:
-        exists = await project_files.file_exists(".codepartner/config.yaml")
-    except JetBrainsMcpError:
-        raise
-    if exists:
+    if project_files is not None and await project_files.file_exists(".codepartner/config.yaml"):
         try:
             project_config = yaml.safe_load(await project_files.read_file(
                 ".codepartner/config.yaml"))

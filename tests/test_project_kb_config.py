@@ -1,4 +1,4 @@
-"""Project KB metadata is read through the resolved IDE MCP project."""
+"""Project KB metadata is read from the mounted native project."""
 
 import json
 import unittest
@@ -42,8 +42,6 @@ class ProjectKbConfigTest(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(specs=(), handlers={})
 
         class Files:
-            def __init__(self, _client, _specs):
-                pass
 
             async def file_exists(self, path):
                 return await Client().file_exists(path)
@@ -56,7 +54,8 @@ class ProjectKbConfigTest(unittest.IsolatedAsyncioTestCase):
             config["knowledge_base"] = legacy
         with patch("agent.spec.ide_mcp_sessions.JetBrainsMcpClient", Client), \
                 patch("agent.spec.ide_mcp_sessions.DirectIdeTools", Tools), \
-                patch("agent.spec.ide_mcp_sessions.DirectMcpFileClient", Files):
+                patch("agent.spec.ide_mcp_sessions._native_files",
+                      lambda _path: Files()):
             return await configure_session("test_kb_config", json.dumps(config))
 
     async def test_yaml_mapping_wins_over_legacy(self):

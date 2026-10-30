@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from agent.spec.models import Task
+from agent.workspace import NativeRun
 from mcp_bridge.models import DoneEvent, TextEvent
 from mcp_bridge.registry import ToolSpec
 from providers import subagents
@@ -64,18 +65,12 @@ PLANNER = {
 PLANNER_REPAIR = ["tasks is missing WP1-T2", "summary is empty"]
 
 CODER = {
-    "coder_ide_plain": dict(),
-    "coder_ide_planned_kb_first": dict(
-        execution_instruction="Keep the API stable", contract=_CONTRACT,
-        plan_context=_PLAN, handoff_context=_HANDOFF, kb_policy="kb_first"),
-    "coder_ide_no_aci": dict(plan_context=_PLAN, aci_enabled=False),
-    "coder_native_plain": dict(native=True),
+    "coder_native_plain": dict(),
     "coder_native_delegated": dict(
-        native=True, contract=_CONTRACT, plan_context=_PLAN, handoff_context=_HANDOFF,
+        contract=_CONTRACT, plan_context=_PLAN, handoff_context=_HANDOFF,
         request=_request("task", (subagents.READER, subagents.CHECKS),
                          ("src/factory.py", "src/registry.py"), ("src/registry.py",))),
-    "coder_native_delegated_no_scope": dict(
-        native=True, plan_context=_PLAN, request=_request("task")),
+    "coder_native_delegated_no_scope": dict(plan_context=_PLAN, request=_request("task")),
 }
 CODER_MESSAGES = [{"role": "system", "content": "SYSTEM PREFIX"},
                   {"role": "assistant", "content": "dropped"},
@@ -99,7 +94,7 @@ DELEGATION = {
         "reviewer", (subagents.READER, subagents.CHECKS), read_only=("src/c.py",)),
 }
 
-REVIEWER = ("reviewer_ide", "reviewer_native_reader", "reviewer_native_plain",
+REVIEWER = ("reviewer_native_reader", "reviewer_native_plain",
             "reviewer_repair", "reviewer_native_diff")
 
 # The diff scenario: a modified file, a new file, and a planned file left unchanged.
@@ -135,8 +130,7 @@ def render_coder(case: dict) -> str:
     messages = TaskExecutionService._execution_messages(
         task(), CODER_MESSAGES, case.get("execution_instruction", ""),
         case.get("contract"), case.get("plan_context", ""), case.get("handoff_context", ""),
-        native=case.get("native", False), kb_policy=case.get("kb_policy", "selective"),
-        subagent_request=case.get("request"), aci_enabled=case.get("aci_enabled", True))
+        subagent_request=case.get("request"))
     return json.dumps(messages, indent=2, ensure_ascii=False)
 
 
@@ -197,26 +191,22 @@ async def render_reviewer(variant: str) -> str:
             EditRange("src/factory.py", "change line 20", 18, 21),
             EditRange("src/factory.py", "change line 35", 35, 36),
             EditRange("src/registry.py", "register the factory", 12, 14)))
-    native = variant.startswith("reviewer_native")
-    env = {"CODEPARTNER_EXECUTION_MODE": "native" if native else "ide",
-           "CODEPARTNER_READER_SUBAGENT": "true" if variant == "reviewer_native_reader"
+    env = {"CODEPARTNER_READER_SUBAGENT": "true" if variant == "reviewer_native_reader"
            else "false"}
     with tempfile.TemporaryDirectory() as root, \
             mock.patch.dict(os.environ, env), \
             mock.patch("agent.routing.review.providers.get", return_value=Provider()):
-        patches = []
-        if native:
-            Path(root, "src").mkdir()
-            Path(root, "src", "factory.py").write_text(
-                _AFTER if variant == "reviewer_native_diff" else "class Factory: ...\n")
-            if variant == "reviewer_native_diff":
-                Path(root, "src", "new.py").write_text("def new():\n    return 1\n")
-                Path(root, "src", "registry.py").write_text(_REGISTRY)
-            project = SimpleNamespace(workspace=root, project_id="demo", host_path=root)
-            plan = SimpleNamespace(mode="native", native=True, project=project, reason="")
-            patches = [mock.patch("agent.routing.review.plan_native", return_value=plan),
-                       mock.patch("agent.routing.review.read_only_session",
-                                  return_value=SimpleNamespace(read_only=True))]
+        Path(root, "src").mkdir()
+        Path(root, "src", "factory.py").write_text(
+            _AFTER if variant == "reviewer_native_diff" else "class Factory: ...\n")
+        if variant == "reviewer_native_diff":
+            Path(root, "src", "new.py").write_text("def new():\n    return 1\n")
+            Path(root, "src", "registry.py").write_text(_REGISTRY)
+        project = SimpleNamespace(workspace=root, project_id="demo", host_path=root)
+        plan = SimpleNamespace(native=True, project=project, reason="")
+        patches = [mock.patch("agent.routing.review.plan_native", return_value=plan),
+                   mock.patch("agent.routing.review.read_only_session",
+                              side_effect=lambda _: NativeRun(workspace=root, read_only=True))]
         for patch in patches:
             patch.start()
         try:

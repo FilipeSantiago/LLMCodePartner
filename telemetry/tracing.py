@@ -168,16 +168,6 @@ _SCHEMA: dict[str, Any] = {
     "codepartner.aggregate.cache_read_tokens": _int,
     "codepartner.aggregate.cache_write_tokens": _int,
     "codepartner.aggregate.output_tokens": _int,
-    "codepartner.source.first_read_bytes": _int,
-    "codepartner.source.preview_reads": _int,
-    "codepartner.source.preview_bytes": _int,
-    "codepartner.source.preview_followup_reads": _int,
-    "codepartner.source.preview_observation_expansions": _int,
-    "codepartner.source.preview_observation_bytes": _int,
-    "codepartner.source.explicit_full_reads": _int,
-    "codepartner.source.explicit_full_bytes": _int,
-    "codepartner.source.explicit_range_reads": _int,
-    "codepartner.source.explicit_range_bytes": _int,
     # Routing.
     "codepartner.routing.kind": _enum(_ROUTING_KIND),
     "codepartner.routing.complexity": _enum(_COMPLEXITY),
@@ -673,7 +663,6 @@ def finish_run(run: Any, terminal: str, outcome: str, error: BaseException | Non
                if isinstance(metadata.get(key), str)}
         native = metadata.get("native_tool_metrics") if isinstance(
             metadata.get("native_tool_metrics"), dict) else {}
-        source = (run.tool_interface.summary() if run.tool_interface is not None else {})
         execution = run_trace.execution
         execution.facts.update({key: value for key, value in ids.items() if value})
         common = {
@@ -691,18 +680,6 @@ def finish_run(run: Any, terminal: str, outcome: str, error: BaseException | Non
             "codepartner.execution.tool_calls": run_trace.tool_calls,
             "codepartner.execution.tool_errors": run_trace.tool_errors,
             "codepartner.execution.errors": run_trace.errors,
-            "codepartner.source.first_read_bytes": source.get("first_source_read_bytes"),
-            "codepartner.source.preview_reads": source.get("bounded_preview_reads"),
-            "codepartner.source.preview_bytes": source.get("bounded_preview_bytes"),
-            "codepartner.source.preview_followup_reads": source.get("preview_followup_reads"),
-            "codepartner.source.preview_observation_expansions": source.get(
-                "preview_observation_expansions"),
-            "codepartner.source.preview_observation_bytes": source.get(
-                "preview_observation_bytes"),
-            "codepartner.source.explicit_full_reads": source.get("explicit_full_file_reads"),
-            "codepartner.source.explicit_full_bytes": source.get("explicit_full_file_bytes"),
-            "codepartner.source.explicit_range_reads": source.get("explicit_range_reads"),
-            "codepartner.source.explicit_range_bytes": source.get("explicit_range_bytes"),
         }
         if run_trace.kind == "llm":
             response_model = _main_model(getattr(run, "model_usage", None))
@@ -901,7 +878,7 @@ def finish_tool(tool: ToolSpan | None, name: str, *, result: Any = None,
     if tool is None:
         return
     try:
-        from mcp_bridge.agent_tools import tool_failed
+        from mcp_bridge.models import tool_failed
         bare = name.rsplit("__", 1)[-1]
         failure: str | BaseException | None = None
         if error is not None:

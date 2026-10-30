@@ -1,4 +1,4 @@
-"""The coding agent's task prompt, for IDE MCP and native execution."""
+"""The coding agent's task prompt for native execution."""
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -73,15 +73,12 @@ def _task_contract(task: "Task", execution_instruction: str, contract) -> list[s
     ]
 
 
-def _planned(plan_context: str, ide: bool) -> str:
+def _planned(plan_context: str) -> str:
     if not plan_context:
         return ""
     return ("A planner already investigated this work package; the context above is "
-            "scoped to this task" + (" and its line ranges are leads" if ide else "")
-            + ". Report any deviation from it in the summary, or in remaining_gaps if it "
-            "leaves this task incomplete" + (" (use execution_dispute when it concerns "
-                                            "execution)" if ide else "")
-            + ". Respect the do-not-modify areas. Where the OpenSpec description or context "
+            "scoped to this task. Report any deviation from it in the summary, or in "
+            "remaining_gaps if it leaves this task incomplete. Respect the do-not-modify areas. Where the OpenSpec description or context "
             "disagrees with the approved plan, follow the plan: it reflects the current "
             "repository.")
 
@@ -118,7 +115,7 @@ class InlineCoderPromptBuilder(PromptBuilder[InlineCoderPromptContext]):
         return [
             *_task_contract(context.task, context.execution_instruction, context.contract),
             context.plan_context,
-            _planned(context.plan_context, ide=False),
+            _planned(context.plan_context),
             "## Current source\nThe current text of every file region this task needs, "
             "read for you just now, with line numbers. It is complete and authoritative: "
             "you have no tools and do not need any.",
@@ -188,74 +185,14 @@ class CoderPromptContext:
     contract: object = None
     plan_context: str = ""
     handoff_context: str = ""
-    native: bool = False
-    kb_policy: str = "selective"
     # Native runs with subagents: the coder locates context and the reader reads it.
     subagent_request: "Request | None" = None
-    aci_enabled: bool = True
 
 
 class CoderPromptBuilder(ParentPromptBuilder[CoderPromptContext]):
     role = PromptRole.CODER
 
     def sections(self, context: CoderPromptContext) -> list[str]:
-        if context.native:
-            return self._native_sections(context)
-        return [
-            *_task_contract(context.task, context.execution_instruction, context.contract),
-            context.plan_context,
-            context.handoff_context,
-            _planned(context.plan_context, ide=True),
-            EXPLORATION_RULES,
-            self.own_reads_rule(),
-            self.bulk_rule(),
-            ("" if context.plan_context else
-             "Use the IDE MCP tools as needed to complete the task's actual objective."),
-            self.read_pipeline(),
-            ("Use the approved plan's files and symbols as KB search and outline seeds. "
-             "Use current IDE reads for the exact signatures, edit regions and tests; "
-             "indexed line numbers may have shifted. Broaden discovery only for a concrete "
-             "question the plan does not settle." if context.kb_policy == "kb_first" else ""),
-            ("Use codepartner_read_file with explicit line ranges for targeted source "
-             "reads. A path-only call returns up to 200 lines; continue with ranges or "
-             "request full_file=true when the whole file is genuinely needed. "
-             "Repeated reads use a run-local cache; pass "
-             "refresh=true when you need a fresh IDE read. Use codepartner_search_in_file "
-             "to locate text within one file. Tool results include observation IDs that "
-             "codepartner_get_observation can expand when diagnostics require more detail."
-             if context.aci_enabled
-             else "Use the advertised IDE file tools to inspect relevant source."),
-            "Edit existing files with apply_patch; use create_new_file only for files "
-            "that do not exist yet. Keep each tool call's arguments small; very large tool-call "
-            "payloads can fail to parse and stop the task.",
-            "If only the universal `execute_tool` is available, it runs IDE tools, not shell "
-            "commands: run tests as `execute_terminal_command --command \"uv run pytest "
-            "tests/test_x.py -v\"` (named `--param value` arguments only).",
-            "If this task requires Python verification, inspect the project metadata and "
-            "configured IDE interpreter or run configurations before declaring the checks "
-            "unavailable. Prefer the project-native environment (for example `uv run pytest` "
-            "or `.venv/bin/python -m pytest` when those are actually present) over a bare "
-            "system `python` or `pytest`. Do not add test execution to a research or inspection "
-            "task unless its own description or acceptance criteria requires it.",
-            _HANDOFF_SCHEMA +
-            "Mention planned work assigned to later tasks in the summary; "
-            "it does not make this task incomplete. "
-            "List every created or changed file. Write every path relative to the repository "
-            "root and include its directories (for example, tests/test_trainer.py, never only "
-            "test_trainer.py). This manifest helps discovery but does not replace the mutation "
-            "journal or captured execution evidence. "
-            "Evidence IDs must be numeric IDs actually issued by CodePartner; descriptive labels "
-            "are claims, not evidence. If you disagree with a reviewer statement that code or "
-            "tests do not compile, collect, or run, replace execution_dispute:null with an object "
-            "containing claim, source_paths, working_directory, and steps. Each step must name an "
-            "advertised tool and its exact arguments so CodePartner can replay it for the reviewer. "
-            "Do not create a project-local runner to support a dispute. "
-            "Do not claim a test ran unless it did. Do not create summary, completion, "
-            "evidence, verification, or test-result files solely to communicate with the "
-            "reviewer; return those details in your final response instead.",
-        ]
-
-    def _native_sections(self, context: CoderPromptContext) -> list[str]:
         """The CLI's own file and shell tools in the project's working directory; IDE
         tools only for IDE-specific work."""
         rules = self.delegation_rules(context.subagent_request)
@@ -263,7 +200,7 @@ class CoderPromptBuilder(ParentPromptBuilder[CoderPromptContext]):
             *_task_contract(context.task, context.execution_instruction, context.contract),
             context.plan_context,
             context.handoff_context,
-            _planned(context.plan_context, ide=False),
+            _planned(context.plan_context),
             *((rules, _DELEGATED_EXECUTION_RULES) if rules
               else (EXPLORATION_RULES,)),
             self.own_reads_rule(),

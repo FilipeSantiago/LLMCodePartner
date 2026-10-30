@@ -42,11 +42,8 @@ class NativeBootstrapConfigTests(_Fixture):
         self._with_config("demo")
         self.assertEqual(sessions.native_bootstrap_config(), CONFIG)
 
-    def test_no_config_or_ide_mode_needs_the_bootstrap(self):
+    def test_no_config_needs_the_bootstrap(self):
         self.project("demo")
-        self.assertIsNone(sessions.native_bootstrap_config())
-        self._with_config("other")
-        self.register(self.config.read_text().replace("execution: auto", "execution: ide"))
         self.assertIsNone(sessions.native_bootstrap_config())
 
     def test_several_candidates_are_ambiguous(self):

@@ -1,9 +1,0 @@
-{
-  "name": "codepartner-compress-bridge",
-  "private": true,
-  "type": "module",
-  "description": "Text-only bridge to the context-compress output pipeline",
-  "dependencies": {
-    "context-compress": "2026.8.3"
-  }
-}

@@ -13,15 +13,10 @@ class GuidanceTests(unittest.TestCase):
         self.assertNotEqual(PromptFactory.create(PromptRole.CODER).read_pipeline(),
                             PromptFactory.create(PromptRole.REVIEWER).read_pipeline())
 
-    def test_coder_prompts_follow_the_policy(self):
-        for native in (True, False):
-            prompt = TaskExecutionService._execution_messages(
-                task(), [], "", native=native, kb_policy="kb_first")[0]["content"]
-            self.assertIn(PromptFactory.create(PromptRole.CODER).read_pipeline(), prompt)
-            self.assertNotIn("first call for each file returns KB navigation", prompt)
-        selective = TaskExecutionService._execution_messages(
-            task(), [], "", native=True)[0]["content"]
-        self.assertIn(PromptFactory.create(PromptRole.CODER).read_pipeline(), selective)
+    def test_coder_prompt_has_the_read_pipeline(self):
+        prompt = TaskExecutionService._execution_messages(task(), [], "")[0]["content"]
+        self.assertIn(PromptFactory.create(PromptRole.CODER).read_pipeline(), prompt)
+        self.assertNotIn("first call for each file returns KB navigation", prompt)
 
 
 class MetricsTests(unittest.TestCase):

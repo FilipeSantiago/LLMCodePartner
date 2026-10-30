@@ -462,7 +462,7 @@ class WPPlannerService:
                 await progress(progress_line("note", notes[refused]))
 
         plan = plan_native(model.provider)
-        if plan.mode == "native" and not plan.native:
+        if not plan.native:
             raise PlanningError(f"native execution is unavailable: {plan.reason}")
         # Read-only native run: its own file tools and the KB, under the KB-first prompt rule.
         native = read_only_session(plan.project) if plan.native else None

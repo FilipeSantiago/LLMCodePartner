@@ -14,7 +14,6 @@ import re
 import time
 from contextvars import ContextVar
 from collections import deque
-from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 from starlette.responses import StreamingResponse
@@ -26,7 +25,6 @@ from agent.spec import (
     ArtifactStoreError,
     CliOpenSpecAdapter,
     OpenSpecArtifactStore,
-    OpenSpecError,
     SpecCommandError,
     SpecCommandHandler,
     extract_help_response,
@@ -51,8 +49,8 @@ from agent.spec import (
     is_update_command,
 )
 from agent.spec.modes import request_shape
-from agent.spec.refinement import RefinementError, RefinementService
-from agent.spec.bridge_client import BridgeMcpFileClient, DirectMcpFileClient
+from agent.spec.refinement import RefinementService
+from agent.spec.bridge_client import BridgeMcpFileClient
 from agent import workspace
 from agent.spec.filesystem_client import FilesystemFileClient
 from agent.spec.ide_mcp_sessions import (
@@ -63,7 +61,6 @@ from agent.spec.ide_mcp_sessions import (
     strip_conversation_marker,
 )
 from agent.routing import ImplementationService, TaskExecutionService
-from agent.spec.implementation_intent import selectors_in_text
 from agent.workflow.controller import (WorkflowController, parse_decision,
                                        BARE_CONFIRM, BARE_REJECT, PASSTHROUGH_ACTIONS,
                                        PLAN_APPROVAL, PLAN_DISCUSS, PlanStart)
@@ -75,7 +72,7 @@ from agent.planning.knowledge_base import (KnowledgeBaseError, configured_execut
                                            catch_up_index, configured_planner_tools,
                                            planning_context, refresh_accepted_wp)
 from conversation.presentation import progress_line
-from agent.routing.config import RoutingConfigError, load_routing_config
+from agent.routing.config import RoutingConfigError
 from agent.workflow.states import WorkflowAction as WorkflowAction
 from agent.workflow.review_retry import (explicit_operational_retry_request,
                                          explicit_retry_request,
@@ -85,8 +82,8 @@ from conversation import openai_request as oreq
 from conversation.non_streaming_responder import NonStreamingResponder
 from conversation.streaming_responder import StreamingResponder
 from mcp_bridge.registry import (
-    DOMAIN_SOURCE, OP_FILE_CREATE, OP_FILE_READ, OP_FILE_SEARCH, ToolRegistry,
-    ROLE_CODER, ROLE_OPTIMIZER, classify_tool, has_existing_source_editor,
+    OP_FILE_CREATE, OP_FILE_READ, OP_FILE_SEARCH, ToolRegistry,
+    ROLE_CODER, ROLE_OPTIMIZER, classify_tool,
 )
 from mcp_bridge import bridge
 from mcp_bridge import server as bridge_server
@@ -144,7 +141,7 @@ def _resume_service(run, session, active_specs):
     refresh the KB when the resumed review accepts the Work Package.
     """
     return run.metadata.get("implementation_service") or ImplementationService(
-        _artifact_store(session.client, active_specs) if session else artifact_store,
+        _artifact_store() if session else artifact_store,
         task_execution, task_execution.persistence, kb_refresh=_kb_refresher(session))
 
 
@@ -281,7 +278,7 @@ async def _conversation_workflow_turn(request, messages, conversation_id, sessio
         if verb == "reject":
             return responder.reply(await workflow.reject(proposal), request.model, created)
         if verb == "change":
-            artifacts = (_artifact_store(session.client, active_specs)
+            artifacts = (_artifact_store()
                          if session is not None else None)
             changed = await workflow.change(proposal, decision.correction, artifacts)
             return responder.reply(changed if isinstance(changed, str) else changed.render(),
@@ -299,7 +296,7 @@ async def _conversation_workflow_turn(request, messages, conversation_id, sessio
             return responder.reply(
                 "Review mode is read-only; this proposal was not confirmed. "
                 "Switch modes to continue.", request.model, created)
-        artifacts = _artifact_store(session.client, active_specs)
+        artifacts = _artifact_store()
         claimed = await workflow.claim(proposal, artifacts)
         if not claimed.claimed:
             return responder.reply(claimed.render(), request.model, created)
@@ -383,7 +380,7 @@ async def _conversation_workflow_turn(request, messages, conversation_id, sessio
                         "I can propose implementation once the IDE MCP session is active. "
                         "Nothing was executed.", request.model, created)
                 plan = await workflow.plan_start_for_selectors(
-                    _artifact_store(session.client, active_specs), selectors,
+                    _artifact_store(), selectors,
                     instruction or text)
                 workflow.record_turn(conversation_id, "user", "command", text,
                                      outcome="plan_start" if isinstance(plan, PlanStart)
@@ -418,7 +415,7 @@ async def _conversation_workflow_turn(request, messages, conversation_id, sessio
                  "plan" if request.model == PLAN_MODEL else
                  "review" if request.model == "codepartner-review" else
                  "spec" if request.model == "codepartner-spec" else "")
-    artifacts = (_artifact_store(session.client, active_specs)
+    artifacts = (_artifact_store()
                  if session is not None else None)
     result = await workflow.route_turn(conversation_id, text, mode_hint, artifacts,
                                        snapshot, messages[:-1])
@@ -487,7 +484,7 @@ def _plan_turn(request, workflow, session, active_specs, direct_handlers,
         return responder.reply(
             "Work Package planning needs a streaming IDE MCP session. Nothing was executed.",
             request.model, created)
-    artifacts = _artifact_store(session.client, active_specs)
+    artifacts = _artifact_store()
     planner = WPPlannerService(artifacts, workflow.persistence,
                                config=getattr(task_execution, "config", None))
 
@@ -614,19 +611,15 @@ def _chat_native(read_only: bool):
     """Native settings for a chat/workflow model turn of the active provider.
 
     Answers and `/review` are read-only sessions. Ad-hoc coding turns write without
-    a change journal, exactly as their IDE-tool equivalent did; journaled
-    writes belong to implementation jobs. None means the IDE path (`execution: ide`
-    or `auto` without a usable workspace)."""
+    a change journal; journaled writes belong to implementation jobs."""
     plan = workspace.plan_native(getattr(providers.active(), "NAME", None))
-    if plan.native:
-        if read_only:
-            return workspace.read_only_session(plan.project)
-        env, notes = workspace.toolchain(plan.project)
-        return workspace.NativeRun(workspace=plan.project.workspace, env=env, notes=notes)
-    if plan.mode == "native":
+    if not plan.native:
         raise _NativeUnavailable(f"Native execution is unavailable: {plan.reason}. "
                                  "Nothing was executed.")
-    return None
+    if read_only:
+        return workspace.read_only_session(plan.project)
+    env, notes = workspace.toolchain(plan.project)
+    return workspace.NativeRun(workspace=plan.project.workspace, env=env, notes=notes)
 
 
 def _native_tools(read_only: bool, messages, specs, role, handlers, request, created,
@@ -669,13 +662,13 @@ def _with_marker(response: StreamingResponse, conversation_id: str) -> Streaming
                              headers=dict(response.headers))
 
 
-def _artifact_store(client, specs):
-    """OpenSpec artifacts of the conversation's project: on disk when it is a native
-    workspace, through the IDE MCP only on the `execution: ide` path."""
+def _artifact_store():
+    """OpenSpec artifacts of the conversation's native project, read from disk; without
+    one, the store refuses target-project access."""
     project = workspace.native_project()
     if project is not None:
         return OpenSpecArtifactStore(FilesystemFileClient(project.workspace))
-    return OpenSpecArtifactStore(DirectMcpFileClient(client, specs))
+    return OpenSpecArtifactStore()
 
 
 def _advertisement_audit(request: ChatCompletionRequest, trace_id: str) -> dict:
@@ -703,8 +696,8 @@ def _advertisement_audit(request: ChatCompletionRequest, trace_id: str) -> dict:
 def _bridge_required_response(command: str) -> HTTPException:
     return HTTPException(
         status_code=409,
-        detail=(f"{command} requires the request-scoped IDE MCP bridge for target-project artifacts. "
-                "Run it from the intended IDE project with compatible file tools advertised."),
+        detail=(f"{command} needs this conversation bound to a registered native project "
+                "(see /project)."),
     )
 
 
@@ -713,40 +706,6 @@ def _tool_calls_permitted(request: ChatCompletionRequest) -> bool:
     if choice == "none":
         return False
     return not (isinstance(choice, dict) and choice.get("type") == "none")
-
-
-def _artifact_tools_compatible(specs: list[ToolSpec]) -> bool:
-    """Check that the configured server can read, search, and persist artifacts."""
-    registry = ToolRegistry(allowed_operations=_ARTIFACT_OPERATIONS)
-    registry.register(specs)
-    try:
-        registry.prepare_call(OP_FILE_READ, {"file_path": ".codepartner/spec-index.json"})
-        registry.prepare_call(OP_FILE_SEARCH, {"q": ".codepartner/spec-index.json", "limit": 2})
-        registry.prepare_call(OP_FILE_CREATE, {
-            "pathInProject": ".codepartner/.bridge-check",
-            "text": "",
-            "overwrite": True,
-        })
-    except (LookupError, ValueError):
-        return False
-    return True
-
-
-async def _blocked_capability_response(request: ChatCompletionRequest, operation: str,
-                                       specs: list[ToolSpec], created: int):
-    """Return a normal OpenAI reply for a well-formed but unexecutable command."""
-    decisions = [classify_tool(spec) for spec in specs]
-    names = ", ".join(spec.name for spec in specs) or "none"
-    supported = ", ".join(decision.name for decision in decisions if decision.accepted) or "none"
-    reason = ("No supported source-write or refactor tool was discovered from this chat's IDE MCP server. "
-              f"Discovered tools: {names}. Supported definitions: {supported}. "
-              "No changes were applied. Expose a supported write/refactor MCP tool in the IDE server.")
-    operation_id = str(uuid4())
-    await task_execution.persistence.record_blocked_operation(operation_id, operation, reason)
-    log.info("capability_blocked operation=%s operation_id=%s advertised_count=%d supported_count=%d",
-             operation, operation_id, len(specs), len([d for d in decisions if d.accepted]))
-    responder = StreamingResponder() if request.stream else NonStreamingResponder()
-    return responder.reply(reason, request.model, created)
 
 
 async def _project_reply(session, conversation_id: str | None, content: str) -> str:
@@ -769,7 +728,7 @@ async def _project_reply(session, conversation_id: str | None, content: str) -> 
             return ("No projects are registered. See docs/native-execution.md to register "
                     "and mount one.")
         return "\n".join(["Registered projects:", *(
-            f"- `{item.id}` → {item.workspace} (execution {item.execution}): {status(item)}"
+            f"- `{item.id}` → {item.workspace}: {status(item)}"
             for item in projects.values())])
     if action == "use":
         if project_id not in projects:
@@ -796,13 +755,12 @@ async def _project_reply(session, conversation_id: str | None, content: str) -> 
                 f"({projects[project_id].workspace}).")
     current = getattr(session, "workspace_id", None)
     if current is None:
-        return ("This conversation is not bound to a registered project, so tasks run "
-                "through the IDE tools. Use `/project list` and `/project use <id>`.")
+        return ("This conversation is not bound to a registered project, so tasks cannot "
+                "run. Use `/project list` and `/project use <id>`.")
     item = projects.get(current)
     if item is None:
-        return f"Bound project {current!r} is no longer registered; tasks run through the IDE."
-    return (f"Project `{current}` → {item.workspace} (execution {item.execution}): "
-            f"{status(item)}.")
+        return f"Bound project {current!r} is no longer registered; tasks cannot run."
+    return f"Project `{current}` → {item.workspace}: {status(item)}."
 
 
 def _requires_mcp(request: ChatCompletionRequest, last: dict) -> bool:
@@ -871,7 +829,7 @@ def _start_artifact_command(messages: list[dict], specs: list[ToolSpec], trace_i
                             kb_config: dict | None = None):
     """Run OpenSpec persistence through the conversation's configured MCP server."""
     async def strategy(run, _prompt, _system, _specs):
-        store = _artifact_store(client, specs)
+        store = _artifact_store()
         content = messages[-1].get("content") or ""
         if is_reset_command(content):
             wp_id = extract_reset_wp_id(content)
@@ -915,7 +873,7 @@ def _start_refinement_command(specs: list[ToolSpec], trace_id: str, client,
                                              progress=kb_progress)
                       if action in {"draft", "update"} else "")
         service = RefinementService(
-            _artifact_store(client, specs), CliOpenSpecAdapter(), task_execution.persistence,
+            _artifact_store(), CliOpenSpecAdapter(), task_execution.persistence,
             kb_context)
         if action == "start":
             content = await service.start(conversation_id, target_id)
@@ -942,7 +900,7 @@ def _start_rework_command(specs: list[ToolSpec], selectors: list[str],
                           kb_config: dict | None = None):
     """Create corrective work using the conversation's configured MCP server."""
     async def strategy(run, _prompt, _system, _specs):
-        store = _artifact_store(client, specs)
+        store = _artifact_store()
         targets = await store.tasks_for_selectors(selectors, include_completed=True)
         kb_request = "\n".join((feedback, *(task.description for _, task in targets)))
         async def kb_progress(line: str):
@@ -991,7 +949,7 @@ def _start_implementation_confirmation(messages: list[dict], specs: list[ToolSpe
                                        job_id: str, position: int, approved: bool,
                                        feedback: str, instruction: str):
     async def strategy(run, _prompt, _system, _specs):
-        service = ImplementationService(_artifact_store(client, specs), task_execution)
+        service = ImplementationService(_artifact_store(), task_execution)
         await _consume_implementation_events(
             run, service, service.confirm(job_id, position, approved, feedback,
                                           messages, specs, direct_tool_handlers, instruction),
@@ -1008,7 +966,7 @@ def _start_implementation_review_retry(messages: list[dict], specs: list[ToolSpe
                                        trace_id: str, client, direct_tool_handlers: dict,
                                        job_id: str, position: int, instruction: str):
     async def strategy(run, _prompt, _system, _specs):
-        service = ImplementationService(_artifact_store(client, specs), task_execution)
+        service = ImplementationService(_artifact_store(), task_execution)
         await _consume_implementation_events(
             run, service, service.retry_review(job_id, position, messages, specs,
                                                instruction, direct_tool_handlers),
@@ -1026,7 +984,7 @@ def _start_implementation_resolution(messages: list[dict], specs: list[ToolSpec]
                                      job_id: str, position: int, instruction: str,
                                      action: str, detail: str = ""):
     async def strategy(run, _prompt, _system, _specs):
-        service = ImplementationService(_artifact_store(client, specs), task_execution)
+        service = ImplementationService(_artifact_store(), task_execution)
         if action == "submit_again":
             events = service.retry_coder(
                 job_id, position, messages, specs, instruction,
@@ -1224,8 +1182,7 @@ async def chat_completions(request: ChatCompletionRequest):
             selectors, feedback = extract_scoped_request(last.get("content") or "", "rework", True)
         except SpecCommandError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if (workspace.native_project() is None
-                and not _artifact_tools_compatible(active_specs)):
+        if workspace.native_project() is None:
             raise _bridge_required_response("/rework")
         run = _start_rework_command(active_specs, selectors, feedback, trace_id,
                                     session.client, session.knowledge_base)
@@ -1237,7 +1194,7 @@ async def chat_completions(request: ChatCompletionRequest):
             raise HTTPException(status_code=400, detail="/review requires a streaming request")
         try:
             selectors, question = extract_scoped_request(last.get("content") or "", "review")
-            targets = await _artifact_store(session.client, active_specs).tasks_for_selectors(
+            targets = await _artifact_store().tasks_for_selectors(
                 selectors, include_completed=True
             )
         except SpecCommandError as exc:

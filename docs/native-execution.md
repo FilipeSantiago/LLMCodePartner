@@ -46,7 +46,7 @@ session without asking the IDE. The conversation id then travels as a hidden
 resends with the history (it is stripped before any model sees it). Sessions,
 bootstrap ids and `/project use` bindings are stored in the routing database, so a
 container restart or an idle gap rebuilds the session without a tool call. With
-several such projects, an unregistered project or `execution: ide`, the first turn
+several such projects or an unregistered project, the first turn
 of a new chat still reads `ide_mcp.json` through the IDE once.
 
 Each IDE window has its own conversation and binding, so several mounted
@@ -101,20 +101,10 @@ docker compose run --rm --no-deps --user root codepartner \
   chown -R "$(id -u):$(id -g)" /home/codepartner
 ```
 
-## Execution modes
+## Execution
 
-`execution` in the registry, or `CODEPARTNER_EXECUTION_MODE` for every project,
-selects the mode:
-
-| Mode | Behaviour |
-|---|---|
-| `native` (default) | Native only. If it is unavailable, the turn fails with the reason; it never falls back silently. |
-| `auto` | Native when available. Otherwise the IDE path, with the reason logged. |
-| `ide` | The IDE MCP path. |
-
-A conversation that is not bound to a registered project fails in the default mode
-and tells you to register the project. Set `CODEPARTNER_EXECUTION_MODE=auto` or
-`ide` to keep using unregistered projects through the IDE.
+Execution is native only. If it is unavailable, the turn fails with the reason; a
+conversation that is not bound to a registered project is told to register it.
 
 Native execution is available when:
 - the conversation is bound to a registered project;
@@ -300,7 +290,6 @@ one-tool request needs 1–3 turns).
   `exploration_mode`: normalized tokens including `cache_read_tokens`, `cost_usd` (None when
   any attempt reported no cost, as Codex does), and the counters above. Inline attempts
   (docs/inline-execution.md) appear under the mode `inline`, with their call counters.
-  `aci_comparison` labels reader runs `+explore:reader`.
 
 ### What is and is not isolated
 
@@ -324,8 +313,7 @@ The only boundary is therefore the container and what is mounted into it. This i
 
 Claude Code has no OS sandbox either; its `cwd` is the workspace, but its `Bash`
 tool runs with the container's permissions. To opt Codex out, set
-`CODEPARTNER_NATIVE_PROVIDERS=claude`; its attempts then fail in `native` mode or
-use the IDE path in `auto` mode.
+`CODEPARTNER_NATIVE_PROVIDERS=claude`; its attempts then fail.
 
 ### Read-only runs: detection and tool restrictions
 
@@ -449,7 +437,7 @@ docker compose exec codepartner python scripts/smoke_native.py --project music-g
 
 ## Telemetry for comparisons
 
-Every coder attempt carries `execution_mode` (`native` or `ide`) and
+Every coder attempt carries `execution_mode` (`native` or `inline`) and
 `workspace_project` in its run metadata. Native planner turns record
 `execution_mode: native` and `native_tool_metrics` in their planning-turn
 `tool_metrics`; the file paths there are best-effort observations, not evidence. Native attempts write a

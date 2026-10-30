@@ -13,30 +13,28 @@ from unittest import mock
 from agent.planning.models import ApprovedWPPlan, WPPlanDraft
 from agent.planning.projection import project, validate_draft
 from agent.prompt.coder import CoderPromptBuilder
-from agent.prompt.planner import SYSTEM
 from agent.planning.render import coder_context, reviewer_context
 from agent.routing.implementation import ImplementationService, _compact_context_handoff
 from agent.routing.persistence import RoutingPersistence
-from agent.routing.review import ReviewDecision, ReviewService
+from agent.routing.review import ReviewDecision
 from agent.routing.task_execution import TaskExecutionService
 from agent.spec.models import OpenSpecChange, render_tasks
 from agent.spec.openspec_adapter import CliOpenSpecAdapter, OpenSpecError
 from mcp_bridge.models import DoneEvent, TextEvent
-from mcp_bridge.registry import ToolSpec
 from tests.test_routing import _Artifacts, task
 from tests.test_wp_planner import plan_payload
-from tests import ide_mode
+from tests import native_mode
 
 KB_FIRST_RULE = CoderPromptBuilder().read_pipeline()
 KB_SELECTIVE_GUIDANCE = KB_FIRST_RULE
 
 
 def setUpModule():
-    ide_mode.pin()
+    native_mode.pin()
 
 
 def tearDownModule():
-    ide_mode.unpin()
+    native_mode.unpin()
 
 
 WP1_TASKS = ("WP1-T1", "WP1-T2")
@@ -193,25 +191,6 @@ class DiscoveryHandoffTests(unittest.TestCase):
         self.assertNotIn("Objective: Do WP1-T2", context)
         self.assertIn("Objective: Do WP1-T2", coder_context(plan, "WP1-T2", events))
 
-    def test_execution_prompts_share_rules_and_handoff(self):
-        from agent.prompt.coder import EXPLORATION_RULES
-        for native in (False, True):
-            prompt = TaskExecutionService._execution_messages(
-                task(), [], "", native=native)[0]["content"]
-            self.assertIn(EXPLORATION_RULES, prompt)
-            self.assertIn('"execution_dispute":null', prompt)
-            self.assertIn("Never read the whole repository", prompt)
-            self.assertIn("only for a concrete question they leave open", prompt)
-            self.assertNotIn("never limit necessary work", prompt)
-        contract = SimpleNamespace(revision=2, goal=task().description,
-                                   primary_files=("src/a.py",))
-        prompt = TaskExecutionService._execution_messages(
-            task(), [], "", contract)[0]["content"]
-        self.assertEqual(prompt.count(task().description),
-                         TaskExecutionService._execution_messages(
-                             task(), [], "")[0]["content"].count(task().description))
-        self.assertIn("TaskContract revision 2. Expected files: src/a.py", prompt)
-
     def test_missing_or_stale_discovery_remains_optional(self):
         legacy = WPPlanDraft.from_dict(plan_payload(task_ids=WP1_TASKS), "WP1", 1)
         self.assertEqual(legacy.discovery, [])
@@ -224,21 +203,6 @@ class DiscoveryHandoffTests(unittest.TestCase):
         draft = WPPlanDraft.from_dict(payload, "WP1", 1)
         self.assertEqual(len(draft.discovery), 1)
         self.assertEqual(validate_draft(draft, list(WP1_TASKS)), [])
-
-    def test_shared_guidance_reaches_planner_and_coder(self):
-        self.assertEqual(SYSTEM.count("## Read pipeline"), 1)
-        self.assertNotIn(KB_FIRST_RULE, SYSTEM)
-        self.assertIn("current-source evidence", KB_FIRST_RULE)
-        # The default selective policy keeps KB-first guidance for planners only.
-        prompt = TaskExecutionService._execution_messages(task(), [], "")[0]["content"]
-        self.assertIn(KB_SELECTIVE_GUIDANCE, prompt)
-        self.assertIn(KB_FIRST_RULE, prompt)
-        self.assertNotIn("KB search and outline seeds", prompt)
-        prompt = TaskExecutionService._execution_messages(
-            task(), [], "", kb_policy="kb_first")[0]["content"]
-        self.assertIn(KB_FIRST_RULE, prompt)
-        self.assertIn("KB search and outline seeds", prompt)
-
 
 class PersistedContextHandoffTests(unittest.IsolatedAsyncioTestCase):
     async def test_unplanned_job_uses_saved_report_from_same_package(self):
@@ -353,71 +317,6 @@ class PlannedJobReviewTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("src/wp1-t2.py", reviewed._planner_relevant_files)
             # Planner context is never folded into task text, where paths become required.
             self.assertNotIn("Approved plan:", reviewed.context)
-
-
-class ReviewerPromptTests(unittest.IsolatedAsyncioTestCase):
-    async def test_planned_files_are_optional_hints_in_the_prompt(self):
-        class Provider:
-            async def tools(self, messages, specs, **kwargs):
-                self.prompt = messages[0]["content"]
-                yield TextEvent(json.dumps({
-                    "verdict": "done", "rationale": "Inspected the factory",
-                    "evidence": ["The factory exists"], "inspected_paths": ["src/factory.py"],
-                    "findings": []}))
-                yield DoneEvent("endTurn")
-
-        async def read_file(arguments):
-            if arguments["file_path"] == "src/factory.py":
-                return "class Factory: ..."
-            return "Error: file not found"
-
-        queued = task()
-        object.__setattr__(queued, "_planner_review_context", "Objective: one factory")
-        object.__setattr__(queued, "_planner_relevant_files", ("src/not_created_yet.py",))
-        provider = Provider()
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            decision = await ReviewService().review(
-                SimpleNamespace(title="Factory", work_packages=[]), queued,
-                "Changed `src/factory.py`.", "claude-haiku",
-                [ToolSpec("read_file", "Read", {"type": "object", "properties": {
-                    "file_path": {"type": "string"}}})], {"read_file": read_file})
-        self.assertEqual(decision.verdict, "done")
-        self.assertIn("Approved WP plan context", provider.prompt)
-        self.assertIn("Objective: one factory", provider.prompt)
-        # The configured kb_first policy gives IDE-path reviewers the KB-first guidance.
-        from agent.prompt.reviewer import ReviewerPromptBuilder
-        self.assertIn(ReviewerPromptBuilder().read_pipeline(), provider.prompt)
-        self.assertNotIn(KB_FIRST_RULE, provider.prompt)
-        self.assertIn("not correctness evidence", provider.prompt)
-
-    async def test_planner_only_file_is_not_eagerly_read_when_change_is_known(self):
-        class Provider:
-            async def tools(self, messages, specs, **kwargs):
-                self.prompt = messages[0]["content"]
-                yield TextEvent(json.dumps({
-                    "verdict": "done", "rationale": "Factory inspected",
-                    "evidence": ["Factory exists"], "inspected_paths": ["src/factory.py"],
-                    "findings": []}))
-                yield DoneEvent("endTurn")
-
-        reads = []
-
-        async def read_file(arguments):
-            reads.append(arguments["file_path"])
-            return "L1: class Factory: pass"
-
-        queued = task()
-        object.__setattr__(queued, "_planner_relevant_files", ("src/old_dependency.py",))
-        provider = Provider()
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            decision = await ReviewService().review(
-                SimpleNamespace(title="Factory", work_packages=[]), queued,
-                "Changed `src/factory.py`.", "claude-haiku",
-                [ToolSpec("read_file", "Read", {"type": "object", "properties": {
-                    "file_path": {"type": "string"}}})], {"read_file": read_file})
-        self.assertEqual(decision.verdict, "done")
-        self.assertEqual(reads, ["src/factory.py"])
-        self.assertIn("src/old_dependency.py", provider.prompt)
 
 
 class PlanningMigrationTests(unittest.TestCase):

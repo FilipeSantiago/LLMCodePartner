@@ -19,6 +19,7 @@ from mcp_bridge.models import Run
 from mcp_bridge.registry import ToolSpec
 from providers import subagents
 from providers.codex import CodexProvider, record_collab_item, role_args, role_config
+from tests.native_mode import native_pinned
 from tests.test_routing import task
 
 ON = {subagents.ENV: "true"}
@@ -250,7 +251,7 @@ class TrackerTests(unittest.TestCase):
 class PromptTests(unittest.TestCase):
     def test_flag_off_coder_prompt_is_unchanged(self):
         plain = TaskExecutionService._execution_messages(
-            task(), [{"role": "user", "content": "x"}], native=True)[-1]["content"]
+            task(), [{"role": "user", "content": "x"}])[-1]["content"]
         self.assertIn(EXPLORATION_RULES, plain)
         self.assertNotIn("DELEGATION RULES", plain)
         self.assertIn("tools to read, search and edit files", plain)
@@ -258,7 +259,7 @@ class PromptTests(unittest.TestCase):
     def test_coder_prompt_replaces_exploration_part_when_enabled(self):
         rules = subagents.exploration_rules(request())
         prompt = TaskExecutionService._execution_messages(
-            task(), [{"role": "user", "content": "x"}], native=True,
+            task(), [{"role": "user", "content": "x"}],
             subagent_request=request())[-1]["content"]
         self.assertIn(rules, prompt)
         self.assertNotIn(EXPLORATION_RULES, prompt)
@@ -552,7 +553,7 @@ class ProgressStreamTests(unittest.IsolatedAsyncioTestCase):
             lines.append(line)
 
         with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.dict(os.environ, {"CODEPARTNER_EXECUTION_MODE": "ide"}):
+                native_pinned():
             planner = WPPlannerService(
                 PlanArtifacts(), RoutingPersistence(os.path.join(directory, "r.sqlite3")),
                 config=load_routing_config(), provider_lookup=lambda _name: Provider())
@@ -627,7 +628,7 @@ class CoderRunTests(unittest.IsolatedAsyncioTestCase):
                                             "not a reading list):\nsrc/: a.py")
         self.assertIs(CoderPromptBuilder().with_workspace(messages, "", ""), messages)
         self.assertIn("follow the plan: it reflects the current repository",
-                      _planned("ctx", ide=False))
+                      _planned("ctx"))
 
     def test_execution_cache_ttl_is_configurable(self):
         from agent.routing.config import load_routing_config

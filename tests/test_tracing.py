@@ -100,29 +100,6 @@ class TracingCase(unittest.IsolatedAsyncioTestCase):
 
 
 class RootExecutionTests(TracingCase):
-    async def test_read_preview_metrics_are_on_existing_llm_span(self):
-        async def reader(arguments):
-            start, limit = arguments["offset"], arguments["limit"]
-            return "\n".join(f"L{i}: line {i}" for i in range(start, min(start + limit, 301)))
-
-        async def strategy(run, prompt, system, specs):
-            await bridge.call_tool(run, "codepartner_read_file", {"path": "source.py"})
-            await bridge.call_tool(run, "codepartner_read_file",
-                                   {"path": "source.py", "full_file": True})
-            return "endTurn"
-
-        run = engine.start_run("", None, [spec("read_file")], strategy,
-                               direct_tool_handlers={"read_file": reader},
-                               agent_tool_interface=True, trace_kind="llm",
-                               trace_provider="claude")
-        await drain(run)
-        attrs = self.one(tracing.LLM_SPAN).attributes
-        self.assertEqual(attrs["codepartner.source.preview_reads"], 1)
-        self.assertEqual(attrs["codepartner.source.explicit_full_reads"], 1)
-        self.assertEqual(attrs["codepartner.source.preview_followup_reads"], 1)
-        self.assertGreater(attrs["codepartner.source.first_read_bytes"], 0)
-        self.assertNotIn("source.py", self.all_attribute_text())
-
     async def test_successful_run_produces_a_root_execution_span(self):
         tracing.set_session("conv_abc123")
 

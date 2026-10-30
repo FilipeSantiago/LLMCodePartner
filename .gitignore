@@ -26,5 +26,3 @@ __pycache__/
 /config/projects.yaml
 /compose.projects.yaml
 
-# Local compress-bridge install (npm ci in infra/compress-bridge)
-node_modules/

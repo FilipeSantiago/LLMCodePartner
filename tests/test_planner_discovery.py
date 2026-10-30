@@ -1,28 +1,19 @@
 """Planner discovery telemetry: levels, evidence strength, estimates, observe invariance."""
 
-import copy
-import json
-import tempfile
 import unittest
-from dataclasses import replace
-from pathlib import Path
 
 from agent.planning.discovery import DiscoveryTracker, evidence_seed, paths_in
-from agent.routing.config import DiscoveryConfig, load_routing_config
-from agent.routing.persistence import RoutingPersistence
 from agent.routing.tool_metrics import instrument_handlers
-from mcp_bridge.models import DoneEvent, TextEvent
 from mcp_bridge.registry import ToolSpec
-from tests.test_wp_planner import PlanArtifacts, WPPlannerService, plan_payload
-from tests import ide_mode
+from tests import native_mode
 
 
 def setUpModule():
-    ide_mode.pin()
+    native_mode.pin()
 
 
 def tearDownModule():
-    ide_mode.unpin()
+    native_mode.unpin()
 
 
 BIG = "x" * 7000
@@ -174,93 +165,12 @@ SCRIPT = (("kb_get_file_outline", {"file_path": "src/registry.py"}),
           ("read_file", {"file_path": "src/registry.py"}))
 
 
-async def _handler(arguments):
-    if "q" in arguments:
-        return "src/loaders.py:3: LoaderFactory"
-    return f"source of {arguments.get('file_path')}\n" + BIG
-
-
-class ScriptedProvider:
-    """Calls a fixed tool sequence and records exactly what the model would see."""
-
-    def __init__(self):
-        self.seen = []
-
-    def tools(self, conversation, specs, **kwargs):
-        record = {"conversation": copy.deepcopy(conversation),
-                  "specs": [(spec.name, spec.description, json.dumps(spec.schema))
-                            for spec in specs], "results": []}
-        self.seen.append(record)
-
-        async def events():
-            handlers = kwargs["direct_tool_handlers"]
-            for name, arguments in SCRIPT:
-                record["results"].append(await handlers[name](dict(arguments)))
-            yield TextEvent(json.dumps(plan_payload()))
-            yield DoneEvent("endTurn", usage={"input_tokens": 1000, "output_tokens": 200})
-        return events()
-
-
 def _specs():
     schema = {"type": "object", "properties": {"file_path": {"type": "string"}}}
     return [ToolSpec("read_file", "read", schema),
             ToolSpec("search_text", "search", {"type": "object",
                                               "properties": {"q": {"type": "string"}}}),
             ToolSpec("kb_get_file_outline", "outline", schema)]
-
-
-class _PlannerRuns(unittest.IsolatedAsyncioTestCase):
-    async def run_mode(self, mode, thresholds=None):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        persistence = RoutingPersistence(Path(directory.name) / "routing.sqlite3")
-        config = load_routing_config()
-        discovery = DiscoveryConfig(mode=mode)
-        discovery = replace(discovery, role_modes={**discovery.role_modes,
-                                                   "planner": mode})
-        if thresholds is not None:
-            discovery = replace(discovery, thresholds=thresholds)
-        config = replace(config, planner=replace(config.planner, discovery=discovery))
-        provider = ScriptedProvider()
-        handlers = {name: _handler for name in ("read_file", "search_text",
-                                                "kb_get_file_outline")}
-        turn = await WPPlannerService(PlanArtifacts(), persistence, config=config,
-                                      provider_lookup=lambda _name: provider).start(
-            "conv", "WP4", "Wire LoaderFactory into src/trainer.py", _specs(), handlers,
-            kb_status=KB_CONTEXT)
-        turns = await persistence.planning_turns(turn.session_id)
-        return provider.seen, turns[0]["tool_metrics"]
-
-
-class ObserveInvarianceTests(_PlannerRuns):
-    async def test_observe_leaves_schemas_prompts_and_responses_unchanged(self):
-        off_seen, off_metrics = await self.run_mode("off")
-        observe_seen, observe_metrics = await self.run_mode("observe")
-        self.assertEqual(observe_seen, off_seen)
-        # With discovery off nothing is tracked; observe records without changing anything.
-        self.assertNotIn("discovery", off_metrics)
-        self.assertIn("retrieval_levels", observe_metrics["discovery"])
-
-    async def test_observe_records_discovery_metrics(self):
-        _, metrics = await self.run_mode("observe")
-        discovery = metrics["discovery"]
-        self.assertEqual(discovery["retrieval_levels"], {"L1": 2, "L2": 1, "L3": 3})
-        # A repeated whole read is still direct: only L1/L2 calls mark progression.
-        self.assertEqual((discovery["l3_direct"], discovery["l3_escalated"]), (2, 1))
-        self.assertEqual(discovery["evidence_strength"]["strong"], 4)
-        self.assertEqual(discovery["unexplained_reads"], 0)
-        self.assertTrue(discovery["kb_prefetch"] and discovery["kb_tools_offered"])
-        self.assertGreater(discovery["est_prompt_tokens"], 0)
-        self.assertEqual(discovery["threshold_crossings"], [])
-        self.assertEqual(metrics["repeated_source_reads"], 1)
-
-
-async def _source(arguments):
-    return ("line " + "x" * 40 + "\n") * 300  # ~14 KB, 300 lines
-
-
-async def _outline(arguments):
-    return json.dumps({"symbols": []})
 
 
 class WholeReadByLimitTests(unittest.TestCase):
@@ -275,78 +185,6 @@ class WholeReadByLimitTests(unittest.TestCase):
         summary = tracker.summary()
         self.assertEqual(summary["retrieval_levels"], {"L1": 0, "L2": 2, "L3": 1})
         self.assertEqual(summary["l3_direct"], 1)
-
-
-class _Script(ScriptedProvider):
-    def __init__(self, script, cancel_after=None):
-        super().__init__()
-        self.script, self.cancel_after = script, cancel_after
-
-    def tools(self, conversation, specs, **kwargs):
-        record = {"conversation": copy.deepcopy(conversation), "results": []}
-        self.seen.append(record)
-
-        async def events():
-            import asyncio
-            handlers = kwargs["direct_tool_handlers"]
-            for number, (name, arguments) in enumerate(self.script, 1):
-                record["results"].append(await handlers[name](dict(arguments)))
-                if number == self.cancel_after:
-                    raise asyncio.CancelledError
-            yield TextEvent(json.dumps(plan_payload()))
-            yield DoneEvent("endTurn", usage={"input_tokens": 1000, "output_tokens": 200})
-        return events()
-
-
-class KbFirstServiceTests(unittest.IsolatedAsyncioTestCase):
-    async def plan(self, provider, specs, handlers):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.persistence = RoutingPersistence(Path(directory.name) / "routing.sqlite3")
-        service = WPPlannerService(PlanArtifacts(), self.persistence,
-                                   config=load_routing_config(),
-                                   provider_lookup=lambda _name: provider)
-        turn = await service.start("conv", "WP4", "Wire LoaderFactory", specs, handlers)
-        return (await self.persistence.planning_turns(turn.session_id))[0]
-
-    async def test_read_pipeline_applies_with_or_without_kb_tools(self):
-        script = (("read_file", {"file_path": "src/big.py"}),
-                  ("read_file", {"file_path": "src/big.py"}))
-        handlers = {"read_file": _source, "kb_get_file_outline": _outline}
-        provider = _Script(script)
-        row = await self.plan(provider, _specs(), handlers)
-        prompt = provider.seen[0]["conversation"][0]["content"]
-        self.assertEqual(prompt.count("## Read pipeline"), 1)
-        # The pipeline is a prompt rule: reads are never replaced or refused.
-        self.assertTrue(all(result.startswith("line") for result in provider.seen[0]["results"]))
-        self.assertNotIn("outline_gate", row["tool_metrics"])
-        self.assertEqual((row["tool_metrics"]["file_reads"], row["tool_metrics"]["kb_calls"]),
-                         (2, 0))
-        plain = _Script(script)
-        await self.plan(plain, _specs()[:2], {"read_file": _source})
-        self.assertEqual(plain.seen[0]["conversation"][0]["content"].count(
-            "## Read pipeline"), 1)
-        self.assertTrue(all(result.startswith("line") for result in plain.seen[0]["results"]))
-
-    async def test_a_stopped_run_is_recorded_then_stops(self):
-        import asyncio
-        provider = _Script((("read_file", {"file_path": "src/a.py", "offset": 2,
-                                           "limit": 10}),), cancel_after=1)
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        persistence = RoutingPersistence(Path(directory.name) / "routing.sqlite3")
-        service = WPPlannerService(PlanArtifacts(), persistence, config=load_routing_config(),
-                                   provider_lookup=lambda _name: provider)
-        with self.assertRaises(asyncio.CancelledError):
-            await service.start("conv", "WP4", "go", _specs()[:1], {"read_file": _source})
-        session = await persistence.active_planning("conv")
-        rows = await persistence.planning_turns(session["session_id"])
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["error"], "cancelled")
-        self.assertTrue(rows[0]["tool_metrics"]["cancelled"])
-        self.assertEqual(rows[0]["tool_metrics"]["failure_kind"], "cancelled")
-        self.assertEqual(rows[0]["tool_metrics"]["file_reads"], 1)
-        self.assertEqual(rows[0]["tool_metrics"]["discovery"]["retrieval_levels"]["L2"], 1)
 
 
 if __name__ == "__main__":
@@ -398,30 +236,6 @@ class AdviseTests(unittest.TestCase):
             self.assertIsNone(tracker.observe("read_file", {"file_path": "x.py"}, BIG,
                                               read=True, repeated=True))
         self.assertEqual(tracker.summary()["threshold_crossings"], [])
-
-
-class AdviseServiceTests(_PlannerRuns):
-    async def test_advise_adds_planner_guidance_and_one_advisory_per_threshold(self):
-        from agent.prompt.coder import CoderPromptBuilder
-        KB_FIRST_RULE = CoderPromptBuilder().read_pipeline()
-        from agent.prompt.planner import DISCOVERY_GUIDANCE
-        seen, metrics = await self.run_mode(
-            "advise", {tier: dict(THRESHOLDS) for tier in ("low", "medium", "high", "complex")})
-        prompt = seen[0]["conversation"][0]["content"]
-        self.assertIn(DISCOVERY_GUIDANCE, prompt)
-        self.assertNotIn(DISCOVERY_GUIDANCE, KB_FIRST_RULE)
-        advised = [result for result in seen[0]["results"] if "Planning advisory" in result]
-        self.assertEqual(len(advised), 2)  # full reads at call 4; tool calls at call 3
-        limits = [item["limit"] for item in metrics["discovery"]["threshold_crossings"]]
-        self.assertEqual(sorted(limits), ["full_reads", "tool_calls"])
-        self.assertEqual(len(limits), len(set(limits)))
-        # Hard caps and their accounting are unchanged.
-        self.assertEqual(metrics["refused_over_budget"], 0)
-
-    async def test_observe_prompt_has_no_planner_guidance(self):
-        from agent.prompt.planner import DISCOVERY_GUIDANCE
-        seen, _ = await self.run_mode("observe")
-        self.assertNotIn(DISCOVERY_GUIDANCE, seen[0]["conversation"][0]["content"])
 
 
 class SharedGuidanceTests(unittest.TestCase):

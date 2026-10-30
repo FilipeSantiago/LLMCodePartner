@@ -1,4 +1,4 @@
-"""The independent reviewer's prompt, for native filesystem and IDE MCP reviews."""
+"""The independent reviewer's prompt for native filesystem reviews."""
 
 import json
 from dataclasses import dataclass, field
@@ -16,7 +16,6 @@ class ReviewerPromptContext:
     """The evidence the review service gathered; the builder only renders it."""
     task: "Task"
     change_title: str
-    native: bool = False
     workspace: str = ""
     # A native review whose source inspection goes through a reader subagent.
     reader_offered: bool = False
@@ -103,8 +102,7 @@ class ReviewerPromptBuilder(ParentPromptBuilder[ReviewerPromptContext]):
 
     def access(self, context: ReviewerPromptContext) -> str:
         """Where the reviewer reads current source: its own filesystem tools (or a reader
-        subagent) in a native review, the request-scoped IDE MCP otherwise; nothing in
-        an inline review, whose evidence the review service gathered in full."""
+        subagent); nothing in an inline review, whose evidence the review service gathered in full."""
         if context.tool_free:
             return ("You are the independent reviewer. You have no tools. The review service "
                     "read the project just now: the verified artifact snapshot below holds "
@@ -125,14 +123,7 @@ class ReviewerPromptBuilder(ParentPromptBuilder[ReviewerPromptContext]):
             "project files. You may use its contents as evidence and "
             + ("ask the reader subagent for references or code outside it. "
                if context.reader_offered else "may read more within your scope. ")
-        ) if context.native else (
-            "You are the independent reviewer. Access current project file contents only "
-            "through this chat's request-scoped IDE MCP. Do not use a shell, container "
-            "filesystem, web, KB index claims, or the coder's claims as a substitute for "
-            "current source evidence. "
-            + "The verified artifact snapshot below was read by the review service "
-            "through that same IDE MCP. You may use its contents as evidence "
-            "and may request more read-only IDE MCP reads within your scope. "))
+        ))
 
     def instructions(self, context: ReviewerPromptContext) -> str:
         return (
@@ -229,7 +220,7 @@ class ReviewerPromptBuilder(ParentPromptBuilder[ReviewerPromptContext]):
                 "evidence_service instead of guessing. ")
 
     def evidence(self, context: ReviewerPromptContext) -> str:
-        source = "Filesystem" if context.native else "IDE MCP"
+        source = "Filesystem"
         return (
             "Start with the authoritative mutation journal below. Every entry must be "
             "accounted for before considering coder path claims or other task files. "
@@ -277,7 +268,7 @@ class ReviewerPromptBuilder(ParentPromptBuilder[ReviewerPromptContext]):
             f"{json.dumps(unresolved, ensure_ascii=False)}\n"
             "For each unresolved reference: decide from context which file is meant (an "
             "'ambiguous' entry lists the project files with that name; some may already be in the "
-            "snapshot as ambiguity_candidate reads), read more through IDE MCP if needed, and "
+            "snapshot as ambiguity_candidate reads), read more files if needed, and "
             "state the resolution in evidence (for example `__init__.py` -> "
             "`data_loader/__init__.py`). If a file the coder claimed to create or change does "
             "not exist, return needs_work with an implementation finding that names the path. "

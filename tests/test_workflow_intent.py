@@ -619,8 +619,8 @@ class TranscriptTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(dialog_controller, "task_execution", task_execution),
             mock.patch.object(dialog_controller, "_artifact_store",
                               return_value=fixture.artifacts),
-            mock.patch.object(dialog_controller, "_artifact_tools_compatible",
-                              return_value=True),
+            mock.patch.object(dialog_controller.workspace, "native_project",
+                              return_value=object()),
             mock.patch.object(ImplementationService, "__init__", _service_init(fixture)),
         )
 

@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import re
 import sqlite3
 import tempfile
 import unittest
@@ -32,18 +31,18 @@ from agent.spec.command import (
     is_implementation_command,
     is_run_command,
 )
-from agent.spec.models import Task, OpenSpecChange
+from agent.spec.models import Task
 from mcp_bridge.models import DoneEvent, ErrorEvent, MutationEvent, Run, TextEvent
 from mcp_bridge.registry import ToolSpec
-from tests import ide_mode
+from tests import native_mode
 
 
 def setUpModule():
-    ide_mode.pin()
+    native_mode.pin()
 
 
 def tearDownModule():
-    ide_mode.unpin()
+    native_mode.unpin()
 
 
 
@@ -208,95 +207,6 @@ class _SuccessfulExecutor:
 
 
 class ExecutionFallbackTests(unittest.IsolatedAsyncioTestCase):
-    async def test_claude_session_limit_skips_duplicate_direct_attempt(self):
-        calls = []
-
-        class LimitedClaude:
-            async def execute(self, _task, _model, context):
-                calls.append(("claude", context.use_gateway))
-                yield ErrorEvent("You've hit your session limit (API status 429)")
-                yield DoneEvent("failed")
-
-        class DirectCodex:
-            async def execute(self, _task, _model, context):
-                calls.append(("codex", context.use_gateway))
-                yield TextEvent("finished")
-                yield DoneEvent("endTurn")
-
-        with tempfile.TemporaryDirectory() as directory:
-            config = load_routing_config()
-            service = TaskExecutionService(
-                config=config,
-                router=ModelRoutingService(config, Router("claude-haiku")),
-                persistence=RoutingPersistence(Path(directory) / "routing.sqlite3"),
-                executors=ExecutorRegistry({
-                    "claude-cli": LimitedClaude(), "codex-cli": DirectCodex()}))
-            [event async for event in service.execute(task("simple"), "CHG1", [], [])]
-        self.assertEqual(calls, [("claude", True), ("codex", False)])
-
-    def test_execution_replaces_run_transport_command_with_task_content(self):
-        messages = TaskExecutionService._execution_messages(
-            task(), [{"role": "system", "content": "system"}, {"role": "user", "content": "/run WP1-T1"}],
-            "Keep the tracking URI injectable",
-        )
-        self.assertEqual(messages[0]["content"], "system")
-        self.assertIn("Implement OpenSpec task WP1-T1", messages[-1]["content"])
-        self.assertIn("Keep the tracking URI injectable", messages[-1]["content"])
-        self.assertIn('"schema_version":1', messages[-1]["content"])
-        self.assertIn('"changed_files"', messages[-1]["content"])
-        self.assertIn('"execution_dispute":null', messages[-1]["content"])
-        self.assertIn("planned work assigned to later tasks in the summary",
-                      messages[-1]["content"])
-        self.assertIn("numeric IDs actually issued", messages[-1]["content"])
-        self.assertIn("does not replace the mutation journal", messages[-1]["content"])
-        self.assertIn("Do not create summary", messages[-1]["content"])
-        self.assertIn("project-native environment", messages[-1]["content"])
-        self.assertIn(".venv/bin/python -m pytest", messages[-1]["content"])
-        self.assertNotIn("/run", messages[-1]["content"])
-
-    async def test_pre_output_executor_failure_tries_same_tier_candidate(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config = load_routing_config()
-            router = ModelRoutingService(config, Router(config.candidates_for("simple")[0]))
-            registry = ExecutorRegistry({
-                "claude-cli": _FailingExecutor(),
-                "codex-cli": _SuccessfulExecutor(),
-            })
-            service = TaskExecutionService(
-                config=config, router=router,
-                persistence=RoutingPersistence(Path(directory) / "routing.sqlite3"),
-                executors=registry,
-            )
-            events = [event async for event in service.execute(
-                task("simple"), "CHG1", [{"role": "user", "content": "/run WP1-T1"}], []
-            )]
-            self.assertEqual([event.text for event in events if isinstance(event, TextEvent)],
-                             ["completed by fallback"])
-
-    async def test_streamed_text_failure_returns_to_persisted_job(self):
-        class PartialExecutor:
-            async def execute(self, _task, _model, _context):
-                yield TextEvent("Inspected the task.")
-                yield ErrorEvent("connection reset")
-                yield DoneEvent("failed")
-
-        with tempfile.TemporaryDirectory() as directory:
-            config = load_routing_config()
-            service = TaskExecutionService(
-                config=config,
-                router=ModelRoutingService(config, Router("claude-haiku")),
-                persistence=RoutingPersistence(Path(directory) / "routing.sqlite3"),
-                executors=ExecutorRegistry({
-                    "claude-cli": PartialExecutor(),
-                    "codex-cli": _SuccessfulExecutor(),
-                }),
-            )
-            events = [event async for event in service.execute(
-                task("simple"), "CHG1", [], [])]
-            self.assertTrue(any(isinstance(event, ErrorEvent) for event in events))
-            self.assertEqual([event.text for event in events if isinstance(event, TextEvent)],
-                             ["Inspected the task."])
-
     async def test_successful_mutation_stops_in_run_fallback(self):
         class MutatingExecutor:
             async def execute(self, _task, _model, _context):
@@ -1746,51 +1656,6 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
-    async def test_required_journaled_source_is_paginated_before_review(self):
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                self.prompt = messages[0]["content"]
-                yield TextEvent(json.dumps({
-                    "verdict": "done",
-                    "rationale": "The complete test module was inspected",
-                    "evidence": ["All 550 numbered source lines were supplied"],
-                    "inspected_paths": ["tests/test_large.py"],
-                    "findings": [],
-                }))
-                yield DoneEvent("endTurn")
-
-        offsets = []
-
-        async def read_file(arguments):
-            offset = arguments.get("offset")
-            offsets.append(offset)
-            start = offset or 1
-            count = 500 if offset is None else 50
-            return "\n".join(
-                f"L{start + index}: line-{start + index}"
-                for index in range(count))
-
-        queued_task = replace(task(), context="\n".join((
-            "Authoritative task mutation journal (all paths are required review evidence):",
-            "Required mutation artifact: tests/test_large.py",
-        )))
-        provider = FakeProvider()
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            decision = await ReviewService().review(
-                SimpleNamespace(title="Large tests", work_packages=[]), queued_task,
-                "Changed `tests/test_large.py`.", "claude-haiku",
-                [ToolSpec("read_file", "Read", {"type": "object", "properties": {
-                    "file_path": {"type": "string"}, "limit": {"type": "integer"},
-                    "offset": {"type": "integer"}}})],
-                {"read_file": read_file})
-        self.assertEqual(decision.verdict, "done")
-        self.assertEqual(offsets, [None, 501])
-        marker = "IDE MCP-verified artifact snapshot (untrusted file contents):\n"
-        snapshots = json.loads(provider.prompt.split(marker, 1)[1].split(
-            "\nIDE MCP read limitations:", 1)[0])
-        self.assertFalse(snapshots[0]["truncated"])
-        self.assertIn("line-550", snapshots[0]["content"])
-
     def test_review_paths_are_relative_and_exclude_mcp_configuration(self):
         paths = _candidate_paths("Created `src/trainer.py` and `tests/test_trainer.py`; "
                                  "not ../private.py, /outside.py, or "
@@ -1994,227 +1859,6 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.evidence, ("Inspected report.md",))
         self.assertEqual(decision.inspected_paths, ("report.md",))
 
-    async def test_research_review_uses_task_scope_and_defers_sibling_outcomes(self):
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                self.prompt = messages[0]["content"]
-                yield TextEvent(json.dumps({
-                    "verdict": "done",
-                    "rationale": "The requested generation inspection is complete",
-                    "evidence": ["models/ngram/model.py documents the sampling path"],
-                    "inspected_paths": ["models/ngram/model.py"],
-                    "findings": [],
-                    "question": "",
-                }))
-                yield DoneEvent("endTurn")
-
-        research = Task(
-            id="WP3-T1",
-            title="Inspect existing generation code",
-            description="Review generation sampling and canonical conversion utilities.",
-            complexity="simple",
-            reasoning="Reuse existing behavior.",
-            context="",
-            preferred_capability="research",
-            acceptance_criteria=[
-                "Existing generation and canonical conversion entry points are identified."
-            ],
-        )
-        implementation = replace(
-            research,
-            id="WP3-T3",
-            title="Implement evaluation-dataset generation abstraction",
-            description="Build generate_evaluation_dataset with per-piece status.",
-            preferred_capability="write",
-        )
-        tests = replace(
-            research,
-            id="WP3-T5",
-            title="Add generation workflow tests",
-            description="Test empty output and successful generation.",
-            preferred_capability="test",
-        )
-        package = SimpleNamespace(
-            objective="Provide a generic evaluation and generation pipeline.",
-            acceptance_criteria=[
-                "generate_evaluation_dataset returns canonical generated data.",
-                "Empty generated output raises a clear error.",
-            ],
-            tasks=[research, implementation, tests],
-        )
-        provider = FakeProvider()
-
-        async def read_file(_arguments):
-            return "def note_table_predict(context): pass"
-
-        change = SimpleNamespace(title="Evaluation pipeline", work_packages=[package])
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            decision = await ReviewService().review(
-                change, research,
-                "Inspected `models/ngram/model.py`.", "claude-haiku",
-                [ToolSpec("read_file", "Read a file", {"type": "object", "properties": {
-                    "file_path": {"type": "string"}}})],
-                {"read_file": read_file},
-            )
-
-        self.assertEqual(decision.verdict, "ask_user")
-        self.assertNotIn(
-            "Test execution was not independently verified through IDE MCP.",
-            decision.evidence,
-        )
-        self.assertIn("active task only", provider.prompt)
-        self.assertIn("Active-task acceptance criteria", provider.prompt)
-        self.assertIn("Sibling tasks with deferred responsibilities", provider.prompt)
-        self.assertIn("WP3-T3", provider.prompt)
-        self.assertIn("WP3-T5", provider.prompt)
-
-    async def test_reviewer_uses_mcp_snapshot_without_initiating_tool_call(self):
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                self.prompt = messages[0]["content"]
-                yield TextEvent('{"verdict":"done","rationale":"Contract matches the task",'
-                                '"evidence":["src/trainer.py defines Trainer"],'
-                                '"inspected_paths":["src/trainer.py"],"findings":[]}')
-                yield DoneEvent("endTurn")
-
-        reads = []
-        async def read_file(arguments):
-            reads.append(arguments)
-            return "L1: class Trainer:\nL2:     pass"
-        provider = FakeProvider()
-        change = SimpleNamespace(title="Trainer contract", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            decision = await ReviewService().review(
-                change, task(), "Created `src/trainer.py`.", "claude-haiku",
-                [ToolSpec("read_file", "Read a file", {"type": "object",
-                 "properties": {"file_path": {"type": "string"}}})],
-                {"read_file": read_file})
-        self.assertEqual([item["file_path"] for item in reads], ["src/trainer.py"])
-        self.assertIn("class Trainer", provider.prompt)
-        self.assertIn("Access current project file contents only", provider.prompt)
-        self.assertEqual(decision.inspected_paths, ("src/trainer.py",))
-
-    async def test_approval_must_account_for_every_journaled_mutation(self):
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                yield TextEvent(json.dumps({
-                    "verdict": "done",
-                    "rationale": "The reported file looks correct",
-                    "evidence": ["Inspected src/reported.py"],
-                    "inspected_paths": ["src/reported.py"],
-                    "findings": [],
-                }))
-                yield DoneEvent("endTurn")
-
-        reads = []
-
-        async def read_file(arguments):
-            reads.append(arguments["file_path"])
-            return "implemented"
-
-        queued_task = replace(task(), context="\n".join((
-            "Authoritative task mutation journal (all paths are required review evidence):",
-            "Required mutation artifact: src/reported.py",
-            "Required mutation artifact: src/omitted.py",
-        )))
-        change = SimpleNamespace(title="Trainer contract", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
-            with self.assertRaisesRegex(
-                    ReviewError, "did not account for every journaled mutation"):
-                await ReviewService().review(
-                    change, queued_task, "Changed `src/reported.py`.", "claude-haiku",
-                    [ToolSpec("read_file", "Read a file", {"type": "object",
-                     "properties": {"file_path": {"type": "string"}}})],
-                    {"read_file": read_file})
-        self.assertEqual(set(reads), {"src/reported.py", "src/omitted.py"})
-
-    async def test_coder_basename_is_reconciled_to_unique_journal_path(self):
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                yield TextEvent(json.dumps({
-                    "verdict": "done",
-                    "rationale": "The trainer contract tests cover the interface",
-                    "evidence": ["Inspected the trainer contract tests"],
-                    "inspected_paths": ["tests/test_trainer_contract.py"],
-                    "findings": [],
-                }))
-                yield DoneEvent("endTurn")
-
-        reads = []
-
-        async def read_file(arguments):
-            reads.append(arguments["file_path"])
-            if arguments["file_path"] != "tests/test_trainer_contract.py":
-                raise RuntimeError("unexpected non-journal path")
-            return "def test_contract(): pass"
-
-        async def search_file(_arguments):
-            raise AssertionError("journal reconciliation must not need project search")
-
-        queued_task = replace(task(), context="\n".join((
-            "Authoritative task mutation journal (all paths are required review evidence):",
-            "Required mutation artifact: tests/test_trainer_contract.py",
-        )))
-        specs = [
-            ToolSpec("read_file", "Read", {"type": "object", "properties": {
-                "file_path": {"type": "string"}}}),
-            ToolSpec("search_file", "Search", {"type": "object", "properties": {
-                "q": {"type": "string"}, "limit": {"type": "integer"}}}),
-        ]
-        change = SimpleNamespace(title="Trainer contract", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
-            decision = await ReviewService().review(
-                change, queued_task, "Changed `test_trainer_contract.py`.",
-                "claude-haiku", specs,
-                {"read_file": read_file, "search_file": search_file})
-        self.assertEqual(reads, ["tests/test_trainer_contract.py"])
-        self.assertEqual(decision.inspected_paths, ("tests/test_trainer_contract.py",))
-
-    async def test_unique_project_search_resolves_supplemental_basename(self):
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                self.prompt = messages[0]["content"]
-                yield TextEvent(json.dumps({
-                    "verdict": "done",
-                    "rationale": "The tests cover the contract",
-                    "evidence": ["Inspected the resolved contract test"],
-                    "inspected_paths": ["tests/test_trainer_contract.py"],
-                    "findings": [],
-                }))
-                yield DoneEvent("endTurn")
-
-        reads = []
-        searches = []
-
-        async def read_file(arguments):
-            path = arguments["file_path"]
-            reads.append(path)
-            if path == "test_trainer_contract.py":
-                raise RuntimeError("File test_trainer_contract.py doesn't exist")
-            return "def test_contract(): pass"
-
-        async def search_file(arguments):
-            searches.append(arguments)
-            return {"items": [{"filePath": "tests/test_trainer_contract.py"}]}
-
-        specs = [
-            ToolSpec("read_file", "Read", {"type": "object", "properties": {
-                "file_path": {"type": "string"}}}),
-            ToolSpec("search_file", "Search", {"type": "object", "properties": {
-                "q": {"type": "string"}, "limit": {"type": "integer"}}}),
-        ]
-        provider = FakeProvider()
-        change = SimpleNamespace(title="Trainer contract", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            decision = await ReviewService().review(
-                change, task(), "Added `test_trainer_contract.py`.", "claude-haiku",
-                specs, {"read_file": read_file, "search_file": search_file})
-        self.assertEqual(reads, ["test_trainer_contract.py",
-                                 "tests/test_trainer_contract.py"])
-        self.assertEqual(searches[0]["q"], "**/test_trainer_contract.py")
-        self.assertIn('"claimed_path": "test_trainer_contract.py"', provider.prompt)
-        self.assertEqual(decision.inspected_paths, ("tests/test_trainer_contract.py",))
-
     async def test_reviewer_discovers_artifact_when_coder_supplies_no_path(self):
         class FakeProvider:
             async def tools(self, messages, specs, **kwargs):
@@ -2257,38 +1901,6 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("initial artifact snapshot is empty", provider.prompt)
         self.assertEqual(decision.inspected_paths, ("trainer/factory.py",))
 
-    async def test_ambiguous_supplemental_basename_goes_to_reviewer(self):
-        files = {"tests/unit/test_contract.py": "def test_unit(): pass",
-                 "tests/integration/test_contract.py": "def test_integration(): pass"}
-
-        async def read_file(arguments):
-            if arguments["file_path"] not in files:
-                raise RuntimeError(f"File {arguments['file_path']} doesn't exist")
-            return files[arguments["file_path"]]
-
-        async def search_file(_arguments):
-            return {"items": [{"filePath": path} for path in files]}
-
-        provider = _RecordingReviewer("tests/unit/test_contract.py", {
-            "verdict": "done", "rationale": "The unit contract test exists",
-            "evidence": ["`test_contract.py` -> `tests/unit/test_contract.py` from context"],
-            "inspected_paths": ["tests/unit/test_contract.py"], "findings": []})
-        specs = [ToolSpec("read_file", "Read", {"type": "object", "properties": {
-                "file_path": {"type": "string"}}}),
-                 ToolSpec("search_file", "Search", {"type": "object", "properties": {
-                "q": {"type": "string"}, "limit": {"type": "integer"}}})]
-        change = SimpleNamespace(title="Contract", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            decision = await ReviewService().review(
-                change, task(), "Added `test_contract.py`.", "claude-haiku",
-                specs, {"read_file": read_file, "search_file": search_file})
-        self.assertEqual(decision.verdict, "done")
-        reference = decision.unresolved_references[0]
-        self.assertEqual((reference["path"], reference["status"]), ("test_contract.py", "ambiguous"))
-        self.assertEqual(sorted(reference["matches"]), sorted(files))
-        self.assertIn("Unresolved references", provider.prompt)
-        self.assertIn('"candidate_for": "test_contract.py"', provider.prompt)
-
     async def test_missing_supplemental_basename_goes_to_reviewer(self):
         async def read_file(arguments):
             if arguments["file_path"] == "tests/test_other.py":
@@ -2320,85 +1932,6 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.unresolved_references[0]["status"], "not_found")
         self.assertIn("test_missing.py", provider.prompt)
 
-    async def test_non_missing_read_failure_does_not_trigger_path_search(self):
-        search_file = mock.AsyncMock()
-
-        async def read_file(_arguments):
-            raise RuntimeError("IDE permission denied")
-        provider = _RecordingReviewer()
-        change = SimpleNamespace(title="Review", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            with self.assertRaisesRegex(
-                    ReviewError, r"did not successfully inspect[\s\S]*Unresolved references given "
-                                 r"to the reviewer:\n- `test_contract\.py` from [^\n]*: unreadable "):
-                await ReviewService().review(
-                    change, task(), "Added `test_contract.py`.", "claude-haiku",
-                    [ToolSpec("read_file", "Read", {"type": "object", "properties": {
-                "file_path": {"type": "string"}}}), ToolSpec("search_file", "Search", {"type": "object", "properties": {
-                "q": {"type": "string"}, "limit": {"type": "integer"}}})], {"read_file": read_file, "search_file": search_file})
-        self.assertIn("Unresolved references", provider.prompt)
-        search_file.assert_not_awaited()
-
-    async def test_task_and_coder_dual_source_path_is_independently_resolved(self):
-        search_file = mock.AsyncMock(return_value={
-            "items": [{"filePath": "tests/test_contract.py"}],
-        })
-
-        async def read_file(arguments):
-            if arguments["file_path"] == "test_contract.py":
-                raise RuntimeError("File test_contract.py doesn't exist")
-            return "def test_contract(): pass"
-
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                yield TextEvent(json.dumps({
-                    "verdict": "done",
-                    "rationale": "The independently resolved test is valid",
-                    "evidence": ["Inspected the resolved test"],
-                    "inspected_paths": ["tests/test_contract.py"],
-                    "findings": [],
-                }))
-                yield DoneEvent("endTurn")
-
-        queued_task = replace(task(), context="Verify test_contract.py")
-        specs = [
-            ToolSpec("read_file", "Read", {"type": "object", "properties": {
-                "file_path": {"type": "string"}}}),
-            ToolSpec("search_file", "Search", {"type": "object", "properties": {
-                "q": {"type": "string"}, "limit": {"type": "integer"}}}),
-        ]
-        change = SimpleNamespace(title="Contract", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
-            decision = await ReviewService().review(
-                change, queued_task, "Changed `test_contract.py`.", "claude-haiku",
-                specs, {"read_file": read_file, "search_file": search_file})
-        search_file.assert_awaited_once()
-        self.assertEqual(decision.inspected_paths, ("tests/test_contract.py",))
-
-    async def test_mixed_literal_read_failures_do_not_trigger_path_search(self):
-        search_file = mock.AsyncMock(return_value={
-            "items": [{"filePath": "models/train.ipynb"}],
-        })
-
-        async def read_notebook(_arguments):
-            raise RuntimeError("File train.ipynb doesn't exist")
-
-        async def read_file(_arguments):
-            raise RuntimeError("IDE permission denied")
-        provider = _RecordingReviewer()
-        change = SimpleNamespace(title="Review", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            with self.assertRaisesRegex(
-                    ReviewError, r"did not successfully inspect[\s\S]*Unresolved references given "
-                                 r"to the reviewer:\n- `train\.ipynb` from [^\n]*: unreadable "):
-                await ReviewService().review(
-                    change, task(), "Changed `train.ipynb`.", "claude-haiku",
-                    [ToolSpec("read_notebook", "Read notebook", {"type": "object", "properties": {"file_path": {"type": "string"}}}), ToolSpec("read_file", "Read", {"type": "object", "properties": {
-                "file_path": {"type": "string"}}}), ToolSpec("search_file", "Search", {"type": "object", "properties": {
-                "q": {"type": "string"}, "limit": {"type": "integer"}}})], {"read_notebook": read_notebook, "read_file": read_file, "search_file": search_file})
-        self.assertIn("Unresolved references", provider.prompt)
-        search_file.assert_not_awaited()
-
     async def test_journal_path_is_never_remapped_by_project_search(self):
         search_file = mock.AsyncMock()
 
@@ -2423,170 +1956,6 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
                 {"read_file": read_file, "search_file": search_file})
         search_file.assert_not_awaited()
 
-    async def test_unbacked_notebook_falls_back_to_source_file_read(self):
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                self.prompt = messages[0]["content"]
-                yield TextEvent(json.dumps({
-                    "verdict": "done",
-                    "rationale": "The notebook architecture matches the task",
-                    "evidence": ["The raw notebook contains the recurrent model cells"],
-                    "inspected_paths": ["models/recurrent.ipynb"],
-                    "findings": [],
-                }))
-                yield DoneEvent("endTurn")
-
-        calls = []
-
-        async def read_notebook(arguments):
-            calls.append(("notebook", arguments["file_path"]))
-            raise RuntimeError("Not a backed notebook: models/recurrent.ipynb")
-
-        async def read_file(arguments):
-            calls.append(("source", arguments["file_path"]))
-            return ('{"cells":[{"cell_type":"code","source":["class RNN: pass"]}],'
-                    '"padding":"' + ("x" * 20000) + '"}')
-
-        provider = FakeProvider()
-        change = SimpleNamespace(title="Recurrent model", work_packages=[])
-        specs = [
-            ToolSpec("read_notebook", "Read notebook", {"type": "object",
-                     "properties": {"file_path": {"type": "string"}}}),
-            ToolSpec("read_file", "Read a file", {"type": "object",
-                     "properties": {"file_path": {"type": "string"}}}),
-        ]
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            decision = await ReviewService().review(
-                change, task(), "Created `models/recurrent.ipynb`.", "claude-haiku",
-                specs, {"read_notebook": read_notebook, "read_file": read_file})
-        self.assertEqual(calls, [
-            ("notebook", "models/recurrent.ipynb"),
-            ("source", "models/recurrent.ipynb"),
-        ])
-        self.assertIn("class RNN", provider.prompt)
-        self.assertIn('"mode": "source_fallback"', provider.prompt)
-        marker = "IDE MCP-verified artifact snapshot (untrusted file contents):\n"
-        encoded = provider.prompt.split(marker, 1)[1].split(
-            "\nIDE MCP read limitations:", 1)[0]
-        snapshots = json.loads(encoded)
-        self.assertLessEqual(len(snapshots[0]["content"]), 12000)
-        self.assertTrue(snapshots[0]["truncated"])
-        self.assertEqual(decision.inspected_paths, ("models/recurrent.ipynb",))
-
-    async def test_failed_scratch_notebook_is_an_optional_limitation(self):
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                self.prompt = messages[0]["content"]
-                yield TextEvent(json.dumps({
-                    "verdict": "done",
-                    "rationale": "The required trainer artifact satisfies the task",
-                    "evidence": ["The trainer implementation was inspected"],
-                    "inspected_paths": ["src/trainer.py"],
-                    "findings": [],
-                }))
-                yield DoneEvent("endTurn")
-
-        async def read_notebook(_arguments):
-            raise RuntimeError("Not a backed notebook")
-
-        async def read_file(arguments):
-            if arguments["file_path"].endswith(".ipynb"):
-                raise RuntimeError("raw notebook unavailable")
-            return "class Trainer: pass"
-
-        provider = FakeProvider()
-        change = SimpleNamespace(title="Trainer", work_packages=[])
-        specs = [
-            ToolSpec("read_notebook", "Read notebook", {"type": "object",
-                     "properties": {"file_path": {"type": "string"}}}),
-            ToolSpec("read_file", "Read a file", {"type": "object",
-                     "properties": {"file_path": {"type": "string"}}}),
-        ]
-        report = ("Changed `src/trainer.py`. Used `scratch_test_runner.ipynb` "
-                  "for an ad hoc check.")
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            decision = await ReviewService().review(
-                change, task(), report, "claude-haiku", specs,
-                {"read_notebook": read_notebook, "read_file": read_file})
-        self.assertEqual(decision.verdict, "done")
-        self.assertIn("scratch_test_runner.ipynb", provider.prompt)
-        self.assertIn('"required": false', provider.prompt)
-        self.assertIn("raw notebook unavailable", provider.prompt)
-
-    async def test_unbacked_notebook_is_named_after_fallback_failure(self):
-        async def read_notebook(_arguments):
-            raise RuntimeError("Not a backed notebook")
-
-        async def read_file(_arguments):
-            raise RuntimeError("raw notebook unavailable")
-        provider = _RecordingReviewer()
-        change = SimpleNamespace(title="Review", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            with self.assertRaisesRegex(
-                    ReviewError, r"did not successfully inspect[\s\S]*Unresolved references given "
-                                 r"to the reviewer:\n- `models/recurrent\.ipynb` from [^\n]*: unreadable "):
-                await ReviewService().review(
-                    change, task(), "Created `models/recurrent.ipynb`.", "claude-haiku",
-                    [ToolSpec("read_notebook", "Read notebook", {"type": "object", "properties": {"file_path": {"type": "string"}}}), ToolSpec("read_file", "Read a file", {"type": "object", "properties": {"file_path": {"type": "string"}}})], {"read_notebook": read_notebook, "read_file": read_file})
-        self.assertIn("Unresolved references", provider.prompt)
-
-    async def test_scratch_notebook_named_by_task_context_reaches_reviewer(self):
-        async def read_notebook(_arguments):
-            raise RuntimeError("Not a backed notebook")
-
-        async def read_file(_arguments):
-            raise RuntimeError("raw notebook unavailable")
-
-        queued_task = replace(task(), context=(
-            "Validate the behavior recorded in `scratch_test_runner.ipynb`."))
-        provider = _RecordingReviewer()
-        change = SimpleNamespace(title="Review", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            with self.assertRaisesRegex(
-                    ReviewError, r"did not successfully inspect[\s\S]*Unresolved references given "
-                                 r"to the reviewer:\n- `scratch_test_runner\.ipynb` from [^\n]*: unreadable "):
-                await ReviewService().review(
-                    change, queued_task, "Used `scratch_test_runner.ipynb`.", "claude-haiku",
-                    [ToolSpec("read_notebook", "Read notebook", {"type": "object", "properties": {"file_path": {"type": "string"}}}), ToolSpec("read_file", "Read a file", {"type": "object", "properties": {"file_path": {"type": "string"}}})], {"read_notebook": read_notebook, "read_file": read_file})
-        self.assertIn("Unresolved references", provider.prompt)
-
-    async def test_structured_implementation_finding_is_actionable_and_evidence_backed(self):
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                yield TextEvent(json.dumps({
-                    "verdict": "needs_work",
-                    "rationale": "The factory omits the recurrent trainer",
-                    "evidence": ["trainer_factory.py contains no recurrent mapping"],
-                    "inspected_paths": ["src/trainer_factory.py"],
-                    "findings": [{
-                        "kind": "implementation",
-                        "problem": "The recurrent trainer is not registered",
-                        "suggested_task": "Add a recurrent trainer mapping",
-                        "approval_criteria": [
-                            "The recurrent model type resolves to its trainer",
-                            "Existing factory mappings remain valid",
-                        ],
-                        "artifact_paths": ["src/trainer_factory.py"],
-                    }],
-                    "question": "",
-                }))
-                yield DoneEvent("endTurn")
-
-        async def read_file(_arguments):
-            return "class TrainerFactory: pass"
-
-        change = SimpleNamespace(title="Trainer factory", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
-            decision = await ReviewService().review(
-                change, task(), "Changed `src/trainer_factory.py`.", "claude-haiku",
-                [ToolSpec("read_file", "Read a file", {"type": "object",
-                 "properties": {"file_path": {"type": "string"}}})],
-                {"read_file": read_file})
-        self.assertEqual(decision.verdict, "needs_work")
-        self.assertEqual(decision.findings[0].suggested_task,
-                         "Add a recurrent trainer mapping")
-        self.assertEqual(len(decision.findings[0].approval_criteria), 2)
-
     async def test_cited_line_ranges_are_stripped_from_finding_paths(self):
         class FakeProvider:
             async def tools(self, messages, specs, **kwargs):
@@ -2607,194 +1976,12 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
                 }))
                 yield DoneEvent("endTurn")
 
-        async def read_file(_arguments):
-            return "class TrainerFactory: pass"
-
+        native_mode.write("src/trainer_factory.py", "class TrainerFactory: pass\n")
         change = SimpleNamespace(title="Trainer factory", work_packages=[])
         with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
             decision = await ReviewService().review(
-                change, task(), "Changed `src/trainer_factory.py`.", "claude-haiku",
-                [ToolSpec("read_file", "Read a file", {"type": "object",
-                 "properties": {"file_path": {"type": "string"}}})],
-                {"read_file": read_file})
+                change, task(), "Changed `src/trainer_factory.py`.", "claude-haiku", [], {})
         self.assertEqual(decision.findings[0].artifact_paths, ("src/trainer_factory.py",))
-
-    async def test_verification_only_finding_becomes_pending_review(self):
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                yield TextEvent(json.dumps({
-                    "verdict": "needs_work",
-                    "rationale": "Integration tests remain unverified",
-                    "evidence": ["The supplied factory snapshot was inspected"],
-                    "inspected_paths": ["src/trainer_factory.py"],
-                    "findings": [{
-                        "kind": "verification",
-                        "problem": "The integration test was outside the supplied snapshot",
-                        "suggested_task": "Read the test through IDE MCP and retry review",
-                        "approval_criteria": ["The reviewer can inspect the integration test"],
-                        "artifact_paths": ["tests/test_integration.py"],
-                    }],
-                    "question": "",
-                }))
-                yield DoneEvent("endTurn")
-
-        async def read_file(_arguments):
-            return "class TrainerFactory: pass"
-
-        report = ("Changed `src/trainer_factory.py`. Relevant follow-up: "
-                  "`tests/test_integration.py`.")
-        change = SimpleNamespace(title="Trainer factory", work_packages=[])
-        # Keep the test path out of the service snapshot to model a bounded omission.
-        with (mock.patch("agent.routing.review._MAX_ARTIFACTS", 1),
-              mock.patch("agent.routing.review.providers.get", return_value=FakeProvider())):
-            with self.assertRaisesRegex(ReviewError, "Integration tests remain unverified") as raised:
-                await ReviewService().review(
-                    change, task(), report, "claude-haiku",
-                    [ToolSpec("read_file", "Read a file", {"type": "object",
-                     "properties": {"file_path": {"type": "string"}}})],
-                    {"read_file": read_file})
-        self.assertEqual(raised.exception.reviewer_model, "codex-luna-low")
-        self.assertEqual(raised.exception.findings[0].kind, "verification")
-
-    async def test_finding_without_approval_criteria_is_rejected(self):
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                yield TextEvent(json.dumps({
-                    "verdict": "needs_work",
-                    "rationale": "The factory is incomplete",
-                    "evidence": ["Inspected the factory"],
-                    "inspected_paths": ["src/trainer_factory.py"],
-                    "findings": [{
-                        "kind": "implementation",
-                        "problem": "The recurrent trainer is not registered",
-                        "suggested_task": "Add a recurrent mapping",
-                        "approval_criteria": [],
-                        "artifact_paths": ["src/trainer_factory.py"],
-                    }],
-                    "question": "",
-                }))
-                yield DoneEvent("endTurn")
-
-        async def read_file(_arguments):
-            return "class TrainerFactory: pass"
-
-        change = SimpleNamespace(title="Trainer factory", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
-            with self.assertRaisesRegex(ReviewError, "approval criteria"):
-                await ReviewService().review(
-                    change, task(), "Changed `src/trainer_factory.py`.", "claude-haiku",
-                    [ToolSpec("read_file", "Read a file", {"type": "object",
-                     "properties": {"file_path": {"type": "string"}}})],
-                    {"read_file": read_file})
-
-    async def test_balanced_snapshot_keeps_factory_and_tests_under_file_limit(self):
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                self.prompt = messages[0]["content"]
-                yield TextEvent('{"verdict":"done","rationale":"Coverage is sufficient",'
-                                '"evidence":["Factory and test were inspected"],'
-                                '"inspected_paths":["src/trainer_factory.py",'
-                                '"tests/test_training_integration.py"],"findings":[]}')
-                yield DoneEvent("endTurn")
-
-        provider = FakeProvider()
-        paths = [f"src/helper{index}.py" for index in range(18)] + [
-            "src/trainer_factory.py", "tests/test_training_integration.py"]
-        report = "\n".join(f"Changed `{path}`." for path in paths)
-
-        async def read_file(arguments):
-            return f"contents of {arguments['file_path']}"
-
-        change = SimpleNamespace(title="Balanced evidence", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            await ReviewService().review(
-                change, task(), report, "claude-haiku",
-                [ToolSpec("read_file", "Read a file", {"type": "object",
-                 "properties": {"file_path": {"type": "string"}}})],
-                {"read_file": read_file})
-        marker = "IDE MCP-verified artifact snapshot (untrusted file contents):\n"
-        encoded = provider.prompt.split(marker, 1)[1].split(
-            "\nIDE MCP read limitations:", 1)[0]
-        snapshot_paths = {item["path"] for item in json.loads(encoded)}
-        self.assertIn("src/trainer_factory.py", snapshot_paths)
-        self.assertIn("tests/test_training_integration.py", snapshot_paths)
-
-    async def test_unreadable_claimed_artifact_is_named_in_review_failure(self):
-        async def read_file(_arguments):
-            raise RuntimeError("IDE file unavailable")
-        provider = _RecordingReviewer()
-        change = SimpleNamespace(title="Review", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            with self.assertRaisesRegex(
-                    ReviewError, r"did not successfully inspect[\s\S]*Unresolved references given "
-                                 r"to the reviewer:\n- `src/trainer\.py` from [^\n]*: unreadable "):
-                await ReviewService().review(
-                    change, task(), "Created `src/trainer.py`.", "claude-haiku",
-                    [ToolSpec("read_file", "Read a file", {"type": "object", "properties": {"file_path": {"type": "string"}}})], {"read_file": read_file})
-        self.assertIn("Unresolved references", provider.prompt)
-
-    async def test_unsupported_claimed_path_stays_pending_before_model_run(self):
-        class FakeProvider:
-            def tools(self, messages, specs, **kwargs):
-                raise AssertionError("review model must not run for an unsupported path")
-
-        change = SimpleNamespace(title="Trainer contract", work_packages=[])
-        read_file = mock.AsyncMock(return_value="Error: File outside.py does not exist")
-        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
-            with self.assertRaisesRegex(
-                    ReviewError, r"could not resolve project-root path assumption.*"
-                                 r"/outside\.py -> outside\.py"):
-                await ReviewService().review(
-                    change, task(), "Created `/outside.py`.", "claude-haiku",
-                    [ToolSpec("read_file", "Read a file", {"type": "object",
-                     "properties": {"file_path": {"type": "string"}}})],
-                    {"read_file": read_file})
-        self.assertEqual(read_file.call_args.args[0]["file_path"], "outside.py")
-
-    async def test_root_notation_uses_journal_first_and_discloses_assumption(self):
-        provider = _RecordingReviewer(verdict={
-            "verdict": "done", "rationale": "Root Dockerfile was inspected",
-            "evidence": ["Dockerfile has the required base image"],
-            "inspected_paths": ["Dockerfile"], "findings": [],
-        })
-        manifest = [{"path": "Dockerfile", "change": "modified",
-                     "before_exists": True, "after_exists": True,
-                     "operations": ["replace"], "postimage_verified": True}]
-        queued = replace(task(), context="\n".join((
-            "Required mutation artifact: Dockerfile",
-        )))
-        object.__setattr__(queued, "_review_journal_manifest", manifest)
-        read_file = mock.AsyncMock(return_value="FROM python:3.13")
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            decision = await ReviewService().review(
-                SimpleNamespace(title="Container", work_packages=[]), queued,
-                'Changed `/Dockerfile`.', "claude-haiku",
-                [ToolSpec("read_file", "Read a file", {"type": "object",
-                 "properties": {"file_path": {"type": "string"}}})],
-                {"read_file": read_file})
-        self.assertEqual(read_file.call_args.args[0]["file_path"], "Dockerfile")
-        self.assertIn("Verified mutation journal manifest:", provider.prompt)
-        self.assertLess(provider.prompt.index("Verified mutation journal manifest:"),
-                        provider.prompt.index("Coder's result"))
-        self.assertTrue(any("/Dockerfile means project file Dockerfile" in item
-                            for item in decision.evidence))
-
-    async def test_root_notation_without_journal_requires_exact_ide_read(self):
-        provider = _RecordingReviewer(verdict={
-            "verdict": "done", "rationale": "Root file inspected",
-            "evidence": ["Dockerfile content was inspected"],
-            "inspected_paths": ["Dockerfile"], "findings": [],
-        })
-        read_file = mock.AsyncMock(return_value="FROM python:3.13")
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            decision = await ReviewService().review(
-                SimpleNamespace(title="Container", work_packages=[]), task(),
-                'Changed `/Dockerfile`.', "claude-haiku",
-                [ToolSpec("read_file", "Read a file", {"type": "object",
-                 "properties": {"file_path": {"type": "string"}}})],
-                {"read_file": read_file})
-        self.assertEqual(read_file.call_args.args[0]["file_path"], "Dockerfile")
-        self.assertTrue(any("verified by IDE" in item for item in decision.evidence))
 
     async def test_protected_root_claim_is_never_read(self):
         read_file = mock.AsyncMock(return_value="secret")
@@ -2834,55 +2021,6 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.verdict, "done")
         self.assertIn('"status": "verified_absent"', provider.prompt)
 
-    async def test_journaled_deletion_still_present_blocks_review(self):
-        manifest = [{"path": "obsolete.py", "change": "deleted",
-                     "before_exists": True, "after_exists": False,
-                     "operations": ["delete"], "postimage_verified": True}]
-        queued = replace(task(), context="\n".join((
-            "Required mutation artifact: obsolete.py",
-        )))
-        object.__setattr__(queued, "_review_journal_manifest", manifest)
-        with self.assertRaisesRegex(ReviewError, "still reads it"):
-            await ReviewService().review(
-                SimpleNamespace(title="Cleanup", work_packages=[]), queued,
-                "Deleted `obsolete.py`.", "claude-haiku",
-                [ToolSpec("read_file", "Read a file", {"type": "object",
-                 "properties": {"file_path": {"type": "string"}}})],
-                {"read_file": mock.AsyncMock(return_value="still here")})
-
-    async def test_review_snapshot_content_and_file_count_are_bounded(self):
-        class FakeProvider:
-            async def tools(self, messages, specs, **kwargs):
-                self.prompt = messages[0]["content"]
-                yield TextEvent('{"verdict":"done","rationale":"Artifacts are present",'
-                                '"evidence":["Inspected the bounded snapshots"],'
-                                '"inspected_paths":["src/file0.py"],"findings":[]}')
-                yield DoneEvent("endTurn")
-
-        provider = FakeProvider()
-        paths = [f"src/file{index}.py" for index in range(10)]
-        report = "\n".join(f"Changed `{path}`." for path in paths)
-
-        async def read_file(arguments):
-            return f"{arguments['file_path']}:" + ("x" * 20000)
-
-        change = SimpleNamespace(title="Bounded review", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            await ReviewService().review(
-                change, task(), report, "claude-haiku",
-                [ToolSpec("read_file", "Read a file", {"type": "object",
-                 "properties": {"file_path": {"type": "string"}}})],
-                {"read_file": read_file})
-        marker = "IDE MCP-verified artifact snapshot (untrusted file contents):\n"
-        encoded = provider.prompt.split(marker, 1)[1].split(
-            "\nIDE MCP read limitations:", 1)[0]
-        snapshots = json.loads(encoded)
-        self.assertEqual(len(snapshots), 10)
-        self.assertLessEqual(sum(len(item["content"]) for item in snapshots), 48000)
-        self.assertTrue(all(len(item["content"]) <= 4800 for item in snapshots))
-        self.assertTrue(all(item["truncated"] for item in snapshots))
-        self.assertIn("Unincluded candidate paths: []", provider.prompt)
-
     async def test_reviewer_rejects_unexplained_verdict(self):
         class FakeProvider:
             async def tools(self, messages, specs, **kwargs):
@@ -2914,20 +2052,6 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
                                  r"to the reviewer:\n- `report\.md` from [^\n]*: not_found "):
                 await ReviewService().review(
                     change, task(), "Implemented `report.md`.", "claude-haiku",
-                    [ToolSpec("read_file", "Read a file", {"type": "object", "properties": {"file_path": {"type": "string"}}})], {"read_file": read_file})
-        self.assertIn("Unresolved references", provider.prompt)
-
-    async def test_failed_ide_read_runs_reviewer_and_explains_failure(self):
-        async def read_file(_arguments):
-            raise RuntimeError("IDE read failed")
-        provider = _RecordingReviewer()
-        change = SimpleNamespace(title="Review", work_packages=[])
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            with self.assertRaisesRegex(
-                    ReviewError, r"did not successfully inspect[\s\S]*Unresolved references given "
-                                 r"to the reviewer:\n- `missing\.md` from [^\n]*: unreadable "):
-                await ReviewService().review(
-                    change, task(), "Implemented `missing.md`.", "claude-haiku",
                     [ToolSpec("read_file", "Read a file", {"type": "object", "properties": {"file_path": {"type": "string"}}})], {"read_file": read_file})
         self.assertIn("Unresolved references", provider.prompt)
 
@@ -3259,43 +2383,6 @@ class UnresolvedReferenceTests(unittest.IsolatedAsyncioTestCase):
                               if path.rsplit("/", 1)[-1] == name]}
         return {"read_file": read_file, "search_file": search_file}
 
-    async def test_planned_file_in_wp_text_reaches_reviewer_as_not_found(self):
-        files = {"data_loader/factory.py": "class DataLoaderFactory: pass"}
-        queued_task = replace(task(), description=(
-            "Add a loader factory so future_pipeline.py never branches on representation."))
-        provider = _RecordingReviewer("data_loader/factory.py", {
-            "verdict": "done", "rationale": "Factory delivered; the pipeline is a later WP",
-            "evidence": ["`future_pipeline.py` is not present; it belongs to a later WP"],
-            "inspected_paths": ["data_loader/factory.py"], "findings": []})
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            decision = await ReviewService().review(
-                SimpleNamespace(title="Pipeline", work_packages=[]), queued_task,
-                "Created `data_loader/factory.py`.", "claude-haiku", self.specs,
-                self.handlers(files))
-        self.assertEqual(decision.verdict, "done")
-        self.assertEqual(
-            [(item["path"], item["status"], item["sources"])
-             for item in decision.unresolved_references],
-            [("future_pipeline.py", "not_found", ["task"])])
-        self.assertIn("may belong to a later work package", provider.prompt)
-
-    async def test_bare_init_lists_the_already_read_package_file(self):
-        files = {"data_loader/__init__.py": "from .factory import *",
-                 "models/__init__.py": "", "evaluation/__init__.py": ""}
-        provider = _RecordingReviewer("data_loader/__init__.py", {
-            "verdict": "done", "rationale": "Exports added",
-            "evidence": ["`__init__.py` -> `data_loader/__init__.py`"],
-            "inspected_paths": ["data_loader/__init__.py"], "findings": []})
-        with mock.patch("agent.routing.review.providers.get", return_value=provider):
-            decision = await ReviewService().review(
-                SimpleNamespace(title="Loaders", work_packages=[]), task(),
-                "Updated `data_loader/__init__.py` exports; `__init__.py` now re-exports the "
-                "factory.", "claude-haiku", self.specs, self.handlers(files))
-        self.assertEqual(decision.verdict, "done")
-        reference = decision.unresolved_references[0]
-        self.assertEqual(reference["status"], "ambiguous")
-        self.assertIn("data_loader/__init__.py", reference["matches"])
-
     async def test_unreadable_journaled_file_still_stops_with_named_path(self):
         class FakeProvider:
             def tools(self, *args, **kwargs):
@@ -3356,23 +2443,6 @@ class RequiredTestRunTests(unittest.IsolatedAsyncioTestCase):
         journal, _ = self.journal()
         await journal.wrapped_handlers()["execute_tool"]({"command": "pytest x && rm -rf y"})
         self.assertEqual(self.calls, ["pytest x && rm -rf y"])
-
-    async def test_codepartner_reruns_the_coders_failed_test_command_in_project_env(self):
-        journal, handlers = self.journal()
-        await journal.record_verification(
-            "execute_tool", {"command": "pytest tests/test_a.py -v"},
-            "JetBrainsMcpError: Tool 'pytest' not found", False)
-        service = ImplementationService(_Artifacts(), _TaskExecution(), self.persistence,
-                                        _Reviewer([]))
-        rows = [SimpleNamespace(position=0)]
-        events = [event async for event in service._ensure_required_test_run(
-            "job", rows, journal, self.specs, handlers)]
-        self.assertIn("uv run pytest tests/test_a.py -v", events[0].text)
-        self.assertTrue(self.calls[0].startswith(
-            "execute_terminal_command --command 'uv run pytest tests/test_a.py -v'"))
-        again = [event async for event in service._ensure_required_test_run(
-            "job", rows, journal, self.specs, handlers)]
-        self.assertEqual((again, len(self.calls)), ([], 1))
 
     def test_blocker_message_shows_the_command_and_next_step(self):
         never_started = ImplementationService._test_blocker_lines([{

@@ -454,13 +454,13 @@ class PromptAndConfigTests(unittest.TestCase):
 
     def test_tool_free_reviewer_prompt_has_no_read_instructions(self):
         review = ReviewerPromptBuilder().with_context(ReviewerPromptContext(
-            task(), "change", native=True, tool_free=True,
+            task(), "change", tool_free=True,
             reference_source="### lib.py (REFERENCE, whole file)\n1| x")).build().text
         self.assertIn("You have no tools", review)
         self.assertIn("1| x", review)
         self.assertNotIn("Read pipeline", review)
         agentic = ReviewerPromptBuilder().with_context(ReviewerPromptContext(
-            task(), "change", native=True)).build().text
+            task(), "change")).build().text
         self.assertIn("Read pipeline", agentic)
 
     def test_coder_mode_config(self):

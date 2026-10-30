@@ -2,7 +2,6 @@
 
 import asyncio
 import time
-import os
 from dataclasses import replace
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable, Callable
@@ -87,17 +86,15 @@ class TaskExecutionService:
                 return
             yield ProgressEvent(f"- ↩️ inline: {outcome.fallback}; continuing as a "
                                 "tool-using session from the current files\n")
-        discovery = getattr(self.config, "discovery", None)
-        policy = getattr(discovery, "policy", "selective")
         # Native attempts delegate exploration (within the planner-assigned files) and long
         # test runs to subagents on the configured cheap model.
         subagent_request = subagents.request(
             "task", scope=exploration_scope, models=self.config.subagent_models(),
             max_turns=self.config.subagents.max_turns, read_only=exploration_read_only)
         async for event in self._run(
-                task, decision, self._execution_messages(task, messages, execution_instruction,
-                                                         contract, plan_context, handoff_context,
-                                                         kb_policy=policy),
+                task, decision, self._execution_messages(
+                    task, messages, execution_instruction, contract, plan_context,
+                    handoff_context, subagent_request=subagent_request),
                 specs, direct_tool_handlers or {},
                 {**(owner_metadata or {}),
                  "enforce_scope": getattr(self.config.subagents, "enforce_scope", True),
@@ -107,10 +104,6 @@ class TaskExecutionService:
                      "scope_files": list(dict.fromkeys(
                          (*exploration_scope, *exploration_read_only)))}
                     if exploration_scope else {})},
-                native_messages=self._execution_messages(
-                    task, messages, execution_instruction, contract, plan_context,
-                    handoff_context,
-                    native=True, kb_policy=policy, subagent_request=subagent_request),
                 excluded_files=excluded_files,
                 subagent_request=subagent_request):
             yield event
@@ -119,17 +112,11 @@ class TaskExecutionService:
     def _execution_messages(task: Task, messages: list[dict],
                             execution_instruction: str = "", contract=None,
                             plan_context: str = "", handoff_context: str = "",
-                            native: bool = False,
-                            kb_policy: str = "selective",
-                            subagent_request: subagents.Request | None = None,
-                            aci_enabled: bool | None = None) -> list[dict]:
+                            subagent_request: subagents.Request | None = None) -> list[dict]:
         """Replace the transport command with the actual OpenSpec task objective."""
-        if aci_enabled is None:
-            aci_enabled = os.getenv("CODEPARTNER_ACI_ENABLED", "true").lower() != "false"
         prompt = PromptFactory.create(PromptRole.CODER).with_context(CoderPromptContext(
             task, execution_instruction, contract, plan_context, handoff_context,
-            native=native, kb_policy=kb_policy, subagent_request=subagent_request,
-            aci_enabled=aci_enabled)).build()
+            subagent_request=subagent_request)).build()
         prefix = [message for message in messages[:-1] if message.get("role") == "system"]
         return [*prefix, prompt.user_message()]
 
@@ -193,29 +180,25 @@ class TaskExecutionService:
     async def _run(self, task, decision, messages, specs,
                    direct_tool_handlers: dict,
                    owner_metadata: dict | None = None,
-                   native_messages: list[dict] | None = None,
                    excluded_files: tuple[str, ...] = (),
                    subagent_request=None) -> AsyncIterator[Event]:
         attempts = (decision.recommended_model, *decision.fallback_models)
         last_error: str | None = None
         for index, model_name in enumerate(attempts):
             model = self.config.models[model_name]
-            # `auto` falls back to the IDE path; an explicit `native` mode fails instead.
             plan = plan_native(model.provider, excluded_files)
             native_project = plan.project
+            if native_project is None:
+                reason = plan.reason or "native execution is unavailable"
+                yield ErrorEvent(f"Native execution was requested but is unavailable: "
+                                 f"{reason}. Nothing was executed.")
+                return
             for gateway_used in gateway_attempts(model.gateway_mode):
-                native = (self._native_run(native_project, owner_metadata or {}, task,
-                                           excluded_files)
-                          if native_project is not None else None)
-                if native is None and plan.mode == "native":
-                    reason = plan.reason or "native execution is unavailable"
-                    yield ErrorEvent(f"Native execution was requested but is unavailable: "
-                                     f"{reason}. Nothing was executed.")
-                    return
-                if native is not None:
-                    yield ProgressEvent(f"- 📂 {model.name} works natively in project "
-                                        f"{native_project.id}\n"
-                                        + "".join(f"- ⚠️ {note}\n" for note in native.notes))
+                native = self._native_run(native_project, owner_metadata or {}, task,
+                                          excluded_files)
+                yield ProgressEvent(f"- 📂 {model.name} works natively in project "
+                                    f"{native_project.id}\n"
+                                    + "".join(f"- ⚠️ {note}\n" for note in native.notes))
                 started = time.monotonic()
                 await self.persistence.record_running_model(
                     decision, model.name, model.provider, gateway_used)
@@ -224,20 +207,16 @@ class TaskExecutionService:
                     gateway_url=self.config.agentgateway_url, use_gateway=gateway_used,
                     started_at=started,
                     direct_tool_handlers=direct_tool_handlers,
-                    owner_metadata={**(owner_metadata or {}),
-                                    **({"execution_mode": "native",
-                                        "workspace_project": native_project.id}
-                                       if native is not None else {"execution_mode": "ide"})},
+                    owner_metadata={**(owner_metadata or {}), "execution_mode": "native",
+                                    "workspace_project": native_project.id},
                     native=native,
-                    subagents=subagent_request if native is not None else None,
+                    subagents=subagent_request,
                     prompt_cache_ttl=self.config.execution_cache_ttl,
                 )
-                if native is not None:
-                    inventory = await asyncio.to_thread(project_inventory,
-                                                        native_project.workspace)
-                    context = replace(context, messages=PromptFactory.create(
-                        PromptRole.CODER).with_workspace(
-                        native_messages or messages, native_project.workspace, inventory))
+                inventory = await asyncio.to_thread(project_inventory, native_project.workspace)
+                context = replace(context, messages=PromptFactory.create(
+                    PromptRole.CODER).with_workspace(
+                    messages, native_project.workspace, inventory))
                 executor = self.executors.get(model.executor)
                 attempt_error: str | None = None
                 mutation_seen = False
