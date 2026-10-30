@@ -2587,6 +2587,38 @@ class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
                          "Add a recurrent trainer mapping")
         self.assertEqual(len(decision.findings[0].approval_criteria), 2)
 
+    async def test_cited_line_ranges_are_stripped_from_finding_paths(self):
+        class FakeProvider:
+            async def tools(self, messages, specs, **kwargs):
+                yield TextEvent(json.dumps({
+                    "verdict": "needs_work",
+                    "rationale": "The factory omits the recurrent trainer",
+                    "evidence": ["trainer_factory.py contains no recurrent mapping"],
+                    "inspected_paths": ["src/trainer_factory.py:1-3"],
+                    "findings": [{
+                        "kind": "implementation",
+                        "problem": "The recurrent trainer is not registered",
+                        "suggested_task": "Add a recurrent trainer mapping",
+                        "approval_criteria": ["The recurrent model type resolves to its trainer"],
+                        "artifact_paths": ["src/trainer_factory.py:22-25",
+                                           "src/trainer_factory.py#L1"],
+                    }],
+                    "question": "",
+                }))
+                yield DoneEvent("endTurn")
+
+        async def read_file(_arguments):
+            return "class TrainerFactory: pass"
+
+        change = SimpleNamespace(title="Trainer factory", work_packages=[])
+        with mock.patch("agent.routing.review.providers.get", return_value=FakeProvider()):
+            decision = await ReviewService().review(
+                change, task(), "Changed `src/trainer_factory.py`.", "claude-haiku",
+                [ToolSpec("read_file", "Read a file", {"type": "object",
+                 "properties": {"file_path": {"type": "string"}}})],
+                {"read_file": read_file})
+        self.assertEqual(decision.findings[0].artifact_paths, ("src/trainer_factory.py",))
+
     async def test_verification_only_finding_becomes_pending_review(self):
         class FakeProvider:
             async def tools(self, messages, specs, **kwargs):

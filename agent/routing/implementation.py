@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 
 from agent.planning.models import ApprovedWPPlan, TaskContext
 from agent.planning.rebase import rebase_task, with_package_markers
-from agent.planning.snippets import earlier_task_references, materialize
+from agent.planning.snippets import Snippets, earlier_task_references, materialize
 from agent.planning.render import (DEFAULT_MARGIN, coder_context, prior_task_context,
                                     reviewer_context, task_files, task_read_only_files)
 from agent.routing.config import load_routing_config
@@ -273,7 +273,7 @@ class ImplementationService:
                              settings.lint_command), ""
 
     def _inline_review_references(self, plan: ApprovedWPPlan,
-                                  reviewed: list[str] | None) -> str | None:
+                                  reviewed: list[str] | None) -> Snippets | None:
         """The reviewed tasks' reference source for an inline (tool-free) review, or None
         when the review keeps its tools: agentic mode, no native project, or too much."""
         settings = getattr(self.config, "inline", None)
@@ -285,7 +285,7 @@ class ImplementationService:
                       for ref in context.references]
         source = materialize(TaskContext("REVIEW", "", references=references),
                              project.workspace, budget=settings.context_chars)
-        return source.text if source.fits else None
+        return source if source.fits else None
 
     async def _inline_checks(self, context, project) -> tuple[str, ...]:
         """Commands for the task's expected tests: explicit commands as written, test
@@ -1221,7 +1221,11 @@ class ImplementationService:
                 references = self._inline_review_references(plan, reviewed)
                 if references is not None:
                     object.__setattr__(review_task, "_review_tool_free", True)
-                    object.__setattr__(review_task, "_review_reference_source", references)
+                    object.__setattr__(review_task, "_review_reference_source",
+                                       references.text)
+                    # Read from disk by the review service: evidence the reviewer may cite.
+                    object.__setattr__(review_task, "_review_reference_paths", frozenset(
+                        region.path for region in references.regions))
             if isinstance(self.reviewer, ReviewService):
                 progress_queue: asyncio.Queue[str | None] = asyncio.Queue()
                 outcome: dict = {}

@@ -63,16 +63,16 @@ execution:
 planner:
   tiers:
     low:
-      - claude-haiku
+#      - claude-haiku
       - codex-sol-medium
     medium:
-      - claude-sonnet
+#      - claude-sonnet
       - codex-sol-medium
     high:
-      - claude-sonnet
+#      - claude-sonnet
       - codex-sol-high
     complex:
-      - claude-opus
+#      - claude-opus
       - codex-sol-high
   reasoning_effort:
     complex: xhigh

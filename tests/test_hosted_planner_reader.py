@@ -325,9 +325,10 @@ class CodexArgumentsTests(unittest.IsolatedAsyncioTestCase):
                                    args.index("features.shell_tool=true"))
                 self.assertIn("mcp_servers={}", args)
                 self.assertIn("features.apps=false", args)
+                self.assertNotIn("--dangerously-bypass-hook-trust", args)
+                self.assertFalse(any(arg.startswith("hooks.PreToolUse=") for arg in args))
                 if planner:
                     self.assertFalse(run.native.agent_can_write)
-                    self.assertTrue(any("hooks.PreToolUse=" in arg for arg in args))
                 else:
                     self.assertNotIn("planner_reader", " ".join(args))
 

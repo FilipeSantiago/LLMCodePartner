@@ -23,11 +23,9 @@ import json
 import logging
 import os
 import shlex
-import sys
 import tempfile
 from collections import Counter
 from collections.abc import AsyncIterator
-from dataclasses import asdict
 from pathlib import Path
 
 from mcp_bridge import mcp_http
@@ -323,17 +321,6 @@ class CodexProvider(Provider):
                 # Added after CODEX_ARGS so a local override cannot restore the
                 # parent shell; the separate reader process gets its own config.
                 args += ["-c", "features.shell_tool=false"]
-            if policy is not None:
-                policy_path = Path(roles) / "scope_policy.json"
-                policy_path.write_text(json.dumps(asdict(policy)))
-                hook_command = (f"{shlex.quote(sys.executable)} "
-                                f"{shlex.quote(str(Path(scope_guard.__file__).resolve()))} "
-                                f"{shlex.quote(str(policy_path))}")
-                hook = [{"matcher": "Agent|spawn_agent|collaborationspawn_agent|Bash|exec_command|shell|local_shell|apply_patch|Read|Grep|Glob",
-                         "hooks": [{"type": "command", "command": hook_command}]}]
-                args += ["-c", "features.hooks=true", "-c",
-                         "hooks.PreToolUse=" + json.dumps(hook),
-                         "--dangerously-bypass-hook-trust"]
             if hosted_planner:
                 run.metadata["exploration_mode"] = "reader"
             run.metadata["context_compaction"] = compaction.requested(

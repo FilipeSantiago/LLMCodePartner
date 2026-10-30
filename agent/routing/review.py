@@ -531,6 +531,22 @@ def _project_relative_path(path: object) -> str | None:
     return path
 
 
+_LINE_SUFFIX = re.compile(r"(?::\d+(?:[-:]\d+)*|#L\d+(?:-L?\d+)?)$")
+
+
+def _strip_line_suffixes(paths: list) -> list:
+    """Drop cited line ranges (`a.py:12-30`, `a.py#L12-L30`) that reviewers add to paths,
+    merging duplicates; non-string items are kept for validation to reject."""
+    stripped: list = []
+    for path in paths:
+        if isinstance(path, str):
+            path = _LINE_SUFFIX.sub("", path)
+            if path in stripped:
+                continue
+        stripped.append(path)
+    return stripped
+
+
 def _review_journal(value: object) -> list[dict]:
     """Validate in-process journal metadata, never supplied by task or coder text."""
     if value is None:
@@ -1211,6 +1227,11 @@ class ReviewService:
         tool_free = (bool(getattr(task, "_review_tool_free", False))
                      and not any(item["truncated"] for item in snapshots))
         reader_offered = native_root is not None and subagents.enabled() and not tool_free
+        # The reference source in a tool-free prompt was read from disk by this service,
+        # so the reviewer may cite it like the snapshot.
+        reference_paths = (frozenset(getattr(task, "_review_reference_paths", ()))
+                           if tool_free else frozenset())
+        inspected.update(reference_paths)
         messages = [PromptFactory.create(PromptRole.REVIEWER).with_context(ReviewerPromptContext(
             task, change.title, native=native_root is not None, reader_offered=reader_offered,
             workspace=native_root or "",
@@ -1342,6 +1363,8 @@ class ReviewService:
                     or not all(isinstance(item, str) and item.strip() for item in evidence)):
                 raise ReviewFormatError("reviewer returned no concrete evidence")
             inspected_paths = value.get("inspected_paths", [])
+            if isinstance(inspected_paths, list):
+                inspected_paths = _strip_line_suffixes(inspected_paths)
             if native_root is not None and isinstance(inspected_paths, list):
                 # Native reads are observed best-effort only: a claim the service did not
                 # read and the model's tools were not seen targeting is dropped, not fatal.
@@ -1365,7 +1388,8 @@ class ReviewService:
                 raise ReviewFormatError("reviewer returned invalid findings")
             findings: list[ReviewFinding] = []
             known_paths = (set(candidates) | set(resolved_paths.values())
-                           | {path for _, path, _ in model_reads} | native_seen)
+                           | {path for _, path, _ in model_reads} | native_seen
+                           | reference_paths)
             for raw in raw_findings:
                 if not isinstance(raw, dict) or raw.get("kind") not in {
                         "implementation", "verification"}:
@@ -1374,6 +1398,8 @@ class ReviewService:
                 suggested_task = raw.get("suggested_task")
                 approval_criteria = raw.get("approval_criteria")
                 artifact_paths = raw.get("artifact_paths", [])
+                if isinstance(artifact_paths, list):
+                    artifact_paths = _strip_line_suffixes(artifact_paths)
                 owner, reason = _finding_owner(raw["kind"], str(problem or ""))
                 if (not isinstance(problem, str) or not problem.strip()
                         or len(problem) > 2000):
@@ -1386,11 +1412,18 @@ class ReviewService:
                         or not all(isinstance(item, str) and item.strip()
                                    and len(item) <= 1000 for item in approval_criteria)):
                     raise ReviewFormatError("reviewer returned a finding without valid approval criteria")
-                if (not isinstance(artifact_paths, list)
-                        or not all(isinstance(path, str)
-                                   and _project_relative_path(path) is not None
-                                   and path in known_paths for path in artifact_paths)):
+                if not isinstance(artifact_paths, list):
                     raise ReviewError("reviewer returned a finding with an invalid artifact path")
+                invalid_paths = [path for path in artifact_paths
+                                 if not isinstance(path, str)
+                                 or _project_relative_path(path) is None
+                                 or path not in known_paths]
+                if invalid_paths:
+                    log.info("review_invalid_artifact_paths task_id=%s kind=%s paths=%r",
+                             task.id, raw["kind"], invalid_paths[:10])
+                    raise ReviewError(
+                        "reviewer returned a finding with an invalid artifact path: "
+                        + ", ".join(repr(path) for path in invalid_paths[:5]))
                 # A path CodePartner confirmed absent (read not-found, no search match)
                 # is verified evidence for a "claimed file is missing" defect.
                 verified_absent = {item["path"] for item in unresolved

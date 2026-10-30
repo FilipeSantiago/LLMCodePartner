@@ -682,7 +682,8 @@ class NativeReviewerTests(_Fixture):
         object.__setattr__(queued, "_review_journal_manifest", manifest)
         if tool_free:
             object.__setattr__(queued, "_review_tool_free", True)
-            object.__setattr__(queued, "_review_reference_source", "### ref.py\n1| x")
+            object.__setattr__(queued, "_review_reference_source", "### src/ref.py\n1| x")
+            object.__setattr__(queued, "_review_reference_paths", frozenset({"src/ref.py"}))
         with mock.patch("agent.routing.review.providers.get", return_value=provider):
             config = load_routing_config()
             config = replace(config, discovery=replace(config.discovery, policy="selective"))
@@ -736,6 +737,17 @@ class NativeReviewerTests(_Fixture):
         self.assertIsNone(call["native"])
         self.assertIn("You have no tools", call["prompt"])
         self.assertIn("1| x", call["prompt"])
+        # Reference source is evidence the reviewer may cite in a finding.
+        provider = self._provider({
+            "verdict": "needs_work", "rationale": "app ignores ref", "evidence": ["ref.py x"],
+            "inspected_paths": ["src/app.py", "src/ref.py"],
+            "findings": [{"kind": "implementation", "problem": "app does not use ref.x",
+                          "suggested_task": "use it", "approval_criteria": ["uses ref.x"],
+                          "artifact_paths": ["src/ref.py"], "owner": "coder",
+                          "reason": "implementation_defect"}]})
+        decision = self._review(provider, manifest, tool_free=True)
+        self.assertEqual(decision.verdict, "needs_work")
+        self.assertEqual(decision.findings[0].artifact_paths, ("src/ref.py",))
         # A file the coder names but did not journal is cut to the snapshot budget:
         # the reviewer then keeps its read-only tools.
         (path / "src" / "big.py").write_text("x = 1\n" * 5000)
