@@ -227,13 +227,7 @@ needed, plus a sufficiency checklist. The first time a per-tier soft threshold
 is reached (`tool_calls`, `full_reads`, `est_added_tokens`,
 `repeated_or_unexplained_reads`), one `[Planning advisory, not a limit]` line is
 appended to that tool result and recorded in `threshold_crossings`. Advisories
-never refuse a call; the hard caps above stay in force. The baseline and rollout status are in
-`openspec/changes/optimize-planner-discovery/design.md`. To compare benchmark arms:
-
-```
-uv run python scripts/bench_planner.py --arm baseline=wpplan_a,wpplan_b,wpplan_c \
-    --truth changed_files.txt --rubric rubric.json
-```
+never refuse a call; the hard caps above stay in force.
 
 ## Future compatibility
 

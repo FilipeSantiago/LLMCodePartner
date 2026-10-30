@@ -71,12 +71,6 @@ streaming IDE session. If several jobs match, CodePartner asks which task to ret
 The gateway routes individual provider requests; CodePartner owns CLI agent
 switching and recovery from persisted IDE tool state.
 
-To repair the historical WP3 run that advanced blocked handoffs, use
-`python -m agent.routing.repair_blocked_handoffs --list`, then preview the exact
-job with `--job-id JOB_ID`. Only after reviewing the preview, add `--apply`.
-The command refuses active jobs or any later mutation/review history and preserves
-the original reports and routing audit.
-
 ## Operations
 
 The current stack uses host networking because the PyCharm MCP server is bound to

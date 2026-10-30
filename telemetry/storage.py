@@ -84,16 +84,6 @@ class TelemetryStorage:
                   cost_usd REAL, created_at REAL NOT NULL
                 );
             """)
-            # Older telemetry databases predate some ACI columns. The metrics
-            # writer is shared by coder and reviewer attempts, so keep it usable
-            # without replacing or discarding those existing rows.
-            columns = {row[1] for row in db.execute("PRAGMA table_info(telemetry_aci_attempts)")}
-            for name, kind in (("job_id", "TEXT"), ("task_id", "TEXT"),
-                               ("decision_id", "TEXT"), ("provider", "TEXT"),
-                               ("model", "TEXT"), ("usage_json", "TEXT"),
-                               ("cost_usd", "REAL"), ("created_at", "REAL")):
-                if name not in columns:
-                    db.execute(f"ALTER TABLE telemetry_aci_attempts ADD COLUMN {name} {kind}")
 
     def record_aci_attempt(self, run_id: str, metadata: dict,
                            metrics: dict, usage: dict | None) -> None:

@@ -13,7 +13,6 @@ from agent.task_contracts.models import (
     AcceptanceCriterion, ContextFact, ExecutionLimits, TaskContract,
 )
 from agent.task_contracts.contractor import USER_RESOLUTION_REASON
-from agent.workflow.migration import migrate_paused_states
 
 
 class TaskContractPersistence:
@@ -57,7 +56,6 @@ class TaskContractPersistence:
                   created_at REAL NOT NULL
                 );
             """)
-            migrate_paused_states(db)
 
     async def save(self, job_id: str, position: int, contract: TaskContract) -> None:
         await asyncio.to_thread(self._save, job_id, position, contract)

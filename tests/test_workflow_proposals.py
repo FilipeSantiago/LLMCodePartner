@@ -1,16 +1,13 @@
-"""Proposal tables created by older builds are upgraded instead of breaking proposals."""
+"""Workflow proposal persistence: token collisions and in-band failures."""
 
-import contextlib
-import json
 import sqlite3
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from agent.routing.persistence import _PROPOSAL_COLUMNS, RoutingPersistence
+from agent.routing.persistence import RoutingPersistence
 from agent.workflow.controller import ConversationWorkflow
 from agent.workflow.states import WorkflowAction as A
 from agent.workflow.intent import WorkflowIntent
@@ -37,55 +34,6 @@ def _intent(conversation="conv"):
     return WorkflowIntent(conversation_id=conversation, message_fingerprint="f",
                           action=A.EXECUTE_COMMAND, expected_effects=("Run `/review`",),
                           parameters={"command": "/review WP4"})
-
-
-class LegacyProposalTableTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.path = Path(directory.name) / "routing.sqlite3"
-        now = time.time()
-        with contextlib.closing(sqlite3.connect(self.path)) as db, db:
-            db.execute(LEGACY_DDL)
-            db.execute("""INSERT INTO workflow_action_proposals
-              (proposal_id, confirmation_token, conversation_id, action, payload_json,
-               request_fingerprint, confidence, ambiguities_json, status, created_at,
-               updated_at, expires_at, job_id)
-              VALUES ('old', 'OLDTOK', 'conv', 'STOP_JOB', '{}', 'f', 'high', '[]',
-                      'rejected', ?, ?, ?, 'job-1')""", (now, now, now + 60))
-
-    def columns(self):
-        with contextlib.closing(sqlite3.connect(self.path)) as db:
-            return tuple(row[1] for row in db.execute(
-                "PRAGMA table_info(workflow_action_proposals)"))
-
-    async def test_legacy_table_is_rebuilt_and_proposals_work(self):
-        persistence = RoutingPersistence(self.path)
-        self.assertEqual(self.columns(), _PROPOSAL_COLUMNS)
-
-        workflow = ConversationWorkflow(persistence)
-        old = await workflow.find("conv", "OLDTOK")
-        self.assertEqual(old["status"], "rejected")
-        self.assertEqual(old["interpretation_source"], "deterministic")
-
-        proposal = await workflow.propose(_intent())
-        pending = await workflow.pending("conv")
-        self.assertEqual([row["proposal_id"] for row in pending], [proposal.proposal_id])
-        self.assertEqual(pending[0]["payload"]["parameters"]["command"], "/review WP4")
-        claimed = await workflow.claim(pending[0])
-        self.assertTrue(claimed.claimed)
-
-    def test_migration_is_idempotent(self):
-        RoutingPersistence(self.path)
-        RoutingPersistence(self.path)
-        self.assertEqual(self.columns(), _PROPOSAL_COLUMNS)
-        with contextlib.closing(sqlite3.connect(self.path)) as db:
-            self.assertEqual(db.execute(
-                "SELECT COUNT(*) FROM workflow_action_proposals").fetchone()[0], 1)
-            tables = {row[0] for row in db.execute(
-                "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')")}
-        self.assertNotIn("workflow_action_proposals_legacy", tables)
-        self.assertIn("workflow_proposals_conversation", tables)
 
 
 class ProposalErrorTests(unittest.IsolatedAsyncioTestCase):

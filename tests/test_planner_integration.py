@@ -319,28 +319,5 @@ class PlannedJobReviewTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("Approved plan:", reviewed.context)
 
 
-class PlanningMigrationTests(unittest.TestCase):
-    def test_old_database_gains_plan_columns_and_tables(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "routing.sqlite3"
-            with contextlib.closing(sqlite3.connect(path)) as db:
-                db.execute("""CREATE TABLE implementation_jobs (
-                  job_id TEXT PRIMARY KEY, selectors_json TEXT NOT NULL,
-                  status TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL,
-                  error TEXT)""")
-                db.execute("INSERT INTO implementation_jobs VALUES ('j', '[]', 'completed', 0, 0, NULL)")
-                db.commit()
-            RoutingPersistence(path)
-            with contextlib.closing(sqlite3.connect(path)) as db:
-                columns = {row[1] for row in db.execute("PRAGMA table_info(implementation_jobs)")}
-                tables = {row[0] for row in db.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'")}
-                legacy = db.execute("SELECT plan_id FROM implementation_jobs").fetchone()
-            self.assertIn("plan_id", columns)
-            self.assertIsNone(legacy[0])
-            self.assertTrue({"wp_planning_sessions", "wp_planning_turns", "wp_approved_plans",
-                             "wp_reviewer_context_events"} <= tables)
-
-
 if __name__ == "__main__":
     unittest.main()

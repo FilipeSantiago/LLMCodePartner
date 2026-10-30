@@ -1883,9 +1883,6 @@ class ImplementationService:
         await self.artifacts.mark_task_completed(task_id, review)
         await self.persistence.update_implementation_task(job_id, position, "completed")
 
-    async def _fail(self, job_id: str, position: int, error: str) -> None:
-        await self.persistence.update_implementation_task(job_id, position, "failed", error=error)
-        await self.persistence.finish_implementation_job(job_id, "failed", error)
 
 
 def _handoff(report: str) -> dict:

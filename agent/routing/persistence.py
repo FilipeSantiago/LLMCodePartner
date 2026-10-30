@@ -14,7 +14,6 @@ from agent.routing.models import (
     ExecutionDecision, ImplementationJob,
     ImplementationJobTask,
 )
-from agent.routing.gateway import operational_failure
 
 from agent.workflow.states import PAUSED_STATES
 
@@ -46,39 +45,6 @@ _PROPOSALS_DDL = """
                 CREATE INDEX IF NOT EXISTS workflow_proposals_conversation
                   ON workflow_action_proposals(conversation_id, status, created_at);
 """
-
-
-def _migrate_workflow_proposals(db: sqlite3.Connection) -> None:
-    """Rebuild a proposals table created by an older version (idempotent).
-
-    Earlier builds added NOT NULL columns the current insert does not fill
-    (`updated_at`) and used another column order. SQLite cannot drop a NOT NULL
-    constraint, so the table is copied into the canonical schema in one savepoint.
-    """
-    existing = [row[1] for row in db.execute("PRAGMA table_info(workflow_action_proposals)")]
-    if not existing or tuple(existing) == _PROPOSAL_COLUMNS:
-        return
-    present = set(existing)
-    defaults = {"interpretation_source": "'deterministic'", "ambiguities_json": "'[]'"}
-    select = ", ".join(
-        (f"COALESCE({column}, {defaults[column]})" if column in defaults else column)
-        if column in present else defaults.get(column, "NULL")
-        for column in _PROPOSAL_COLUMNS)
-    db.execute("SAVEPOINT migrate_workflow_proposals")
-    try:
-        db.execute("DROP INDEX IF EXISTS workflow_proposals_conversation")
-        db.execute("ALTER TABLE workflow_action_proposals "
-                   "RENAME TO workflow_action_proposals_legacy")
-        for statement in filter(str.strip, _PROPOSALS_DDL.split(";")):
-            db.execute(statement)
-        db.execute(f"""INSERT INTO workflow_action_proposals ({", ".join(_PROPOSAL_COLUMNS)})
-          SELECT {select} FROM workflow_action_proposals_legacy""")
-        db.execute("DROP TABLE workflow_action_proposals_legacy")
-    except Exception:
-        db.execute("ROLLBACK TO migrate_workflow_proposals")
-        db.execute("RELEASE migrate_workflow_proposals")
-        raise
-    db.execute("RELEASE migrate_workflow_proposals")
 
 
 # Switch states that have not reached a final outcome yet.
@@ -128,7 +94,7 @@ class RoutingPersistence:
                   instruction TEXT NOT NULL DEFAULT '',
                   conversation_id TEXT,
                   status TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL,
-                  error TEXT
+                  error TEXT, project_id TEXT, plan_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS implementation_job_tasks (
                   job_id TEXT NOT NULL, position INTEGER NOT NULL, change_id TEXT NOT NULL,
@@ -172,7 +138,10 @@ class RoutingPersistence:
                 CREATE TABLE IF NOT EXISTS implementation_rollback_files (
                   job_id TEXT NOT NULL, position INTEGER NOT NULL, path TEXT NOT NULL,
                   before_exists INTEGER NOT NULL, before_content TEXT,
-                  expected_hash TEXT, PRIMARY KEY(job_id, position, path)
+                  expected_hash TEXT,
+                  -- Git-baseline preimages of native execution.
+                  native_json TEXT,
+                  PRIMARY KEY(job_id, position, path)
                 );
                 CREATE TABLE IF NOT EXISTS implementation_mutations (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -239,100 +208,6 @@ class RoutingPersistence:
                   PRIMARY KEY(conversation_id, option_number)
                 );
             """)
-            columns = {row[1] for row in db.execute("PRAGMA table_info(implementation_jobs)")}
-            if "instruction" not in columns:
-                db.execute("ALTER TABLE implementation_jobs ADD COLUMN instruction TEXT NOT NULL DEFAULT ''")
-            if "conversation_id" not in columns:
-                db.execute("ALTER TABLE implementation_jobs ADD COLUMN conversation_id TEXT")
-            if "project_id" not in columns:
-                db.execute("ALTER TABLE implementation_jobs ADD COLUMN project_id TEXT")
-            if "plan_id" not in columns:
-                db.execute("ALTER TABLE implementation_jobs ADD COLUMN plan_id TEXT")
-            planning_columns = {row[1] for row in db.execute(
-                "PRAGMA table_info(wp_planning_sessions)")}
-            if "queued_wp_ids_json" not in planning_columns:
-                db.execute("""ALTER TABLE wp_planning_sessions ADD COLUMN
-                  queued_wp_ids_json TEXT NOT NULL DEFAULT '[]'""")
-            if "request" not in planning_columns:
-                db.execute("ALTER TABLE wp_planning_sessions ADD COLUMN request TEXT")
-            rollback_columns = {row[1] for row in db.execute(
-                "PRAGMA table_info(implementation_rollback_files)")}
-            if "native_json" not in rollback_columns:
-                # Git-baseline preimages of native (non-IDE) execution.
-                db.execute("ALTER TABLE implementation_rollback_files ADD COLUMN native_json TEXT")
-            task_columns = {row[1] for row in db.execute("PRAGMA table_info(implementation_job_tasks)")}
-            if "coder_report" not in task_columns:
-                db.execute("ALTER TABLE implementation_job_tasks ADD COLUMN coder_report TEXT")
-            if "review_question" not in task_columns:
-                db.execute("ALTER TABLE implementation_job_tasks ADD COLUMN review_question TEXT")
-            if "review_started_at" not in task_columns:
-                db.execute("ALTER TABLE implementation_job_tasks ADD COLUMN review_started_at REAL")
-            added_revision_attempts = "revision_attempts" not in task_columns
-            if added_revision_attempts:
-                db.execute("""ALTER TABLE implementation_job_tasks ADD COLUMN
-                  revision_attempts INTEGER NOT NULL DEFAULT 0""")
-            if "revision_budget" not in task_columns:
-                db.execute("""ALTER TABLE implementation_job_tasks ADD COLUMN
-                  revision_budget INTEGER NOT NULL DEFAULT 3""")
-            if added_revision_attempts:
-                # Preserve the exhausted state of jobs created before explicit
-                # revision counters existed. A running/waiting row means every
-                # needs_work review already launched a revision. Only the old
-                # exhausted review_pending state (three needs_work reviews under
-                # the former two-revision cap) has one review that did not launch.
-                db.execute("""UPDATE implementation_job_tasks AS task SET revision_attempts =
-                  MIN(3, MAX(0,
-                    (SELECT COUNT(*) FROM implementation_reviews AS review
-                     WHERE review.job_id=task.job_id AND review.position=task.position
-                       AND review.verdict='needs_work')
-                    - CASE WHEN task.status='review_pending' AND
-                        (SELECT COUNT(*) FROM implementation_reviews AS review
-                         WHERE review.job_id=task.job_id AND review.position=task.position
-                           AND review.verdict='needs_work') >= 3
-                      THEN 1 ELSE 0 END))""")
-                # Old exhausted jobs used review_pending for both retryable review
-                # failures and exhausted needs_work outcomes. Only the latter is a
-                # user-decision state; make that distinction durable before normal
-                # resolution queries deliberately exclude review_pending.
-                db.execute("""UPDATE implementation_job_tasks AS task
-                  SET status='awaiting_review_resolution'
-                  WHERE task.status='review_pending' AND
-                    (SELECT COUNT(*) FROM implementation_reviews AS review
-                     WHERE review.job_id=task.job_id AND review.position=task.position
-                       AND review.verdict='needs_work') >= 3""")
-                db.execute("""UPDATE implementation_jobs SET status='awaiting_review_resolution'
-                  WHERE job_id IN (SELECT job_id FROM implementation_job_tasks
-                                   WHERE status='awaiting_review_resolution')
-                    AND status='review_pending'""")
-            evidence_columns = {row[1] for row in db.execute(
-                "PRAGMA table_info(implementation_evidence)")}
-            if "metadata_json" not in evidence_columns:
-                db.execute("ALTER TABLE implementation_evidence ADD COLUMN metadata_json TEXT")
-            if "attempt" not in evidence_columns:
-                db.execute("""ALTER TABLE implementation_evidence ADD COLUMN
-                  attempt INTEGER NOT NULL DEFAULT 0""")
-            # Upgrade unfinished jobs from the previous two-revision default.
-            # Larger values were explicitly extended by a user and are preserved.
-            db.execute("""UPDATE implementation_job_tasks SET revision_budget=3
-              WHERE revision_budget=2 AND status NOT IN ('completed', 'undone', 'failed')""")
-            review_columns = {row[1] for row in db.execute("PRAGMA table_info(implementation_reviews)")}
-            if "details_json" not in review_columns:
-                db.execute("ALTER TABLE implementation_reviews ADD COLUMN details_json TEXT")
-            _migrate_workflow_proposals(db)
-            from agent.workflow.migration import migrate_paused_states
-            migrate_paused_states(db)
-            # Older jobs treated all coder errors as terminal. Expose only
-            # identifiable operational failures as resumable paused work.
-            rows = db.execute("""SELECT job_id, position, error
-              FROM implementation_job_tasks WHERE status='failed'""").fetchall()
-            for job_id, position, error in rows:
-                if operational_failure(error or ""):
-                    db.execute("""UPDATE implementation_job_tasks
-                      SET status='awaiting_coder_recovery' WHERE job_id=? AND position=?""",
-                      (job_id, position))
-                    db.execute("""UPDATE implementation_jobs
-                      SET status='awaiting_coder_recovery' WHERE job_id=? AND status='failed'""",
-                      (job_id,))
 
     async def record_decision(self, decision: ExecutionDecision) -> None:
         await asyncio.to_thread(self._record_decision, decision)
