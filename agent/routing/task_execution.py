@@ -30,7 +30,6 @@ from mcp_bridge.models import (
 )
 from mcp_bridge.registry import ToolSpec
 from providers import subagents
-from providers.compaction import compaction_brief
 from telemetry import tracing
 
 
@@ -102,8 +101,6 @@ class TaskExecutionService:
                 specs, direct_tool_handlers or {},
                 {**(owner_metadata or {}),
                  "enforce_scope": getattr(self.config.subagents, "enforce_scope", True),
-                 # Custom instructions for the CLI's own compaction, not a summarizer.
-                 "compaction_brief": compaction_brief(task, contract),
                  # The plan's files: the edits' preimages are kept for the review diff,
                  # and reads outside the scope are counted.
                  **({"edit_files": list(exploration_scope),

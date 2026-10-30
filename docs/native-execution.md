@@ -173,41 +173,6 @@ Other tasks' requirements, files and findings stay out. The shared `EXECUTION RU
 validation first. They never forbid the reads or checks needed to resolve uncertainty, and
 the agent can search for more context when the given context is not enough.
 
-### Context compaction
-
-CodePartner does not summarize agent history itself. It sets each CLI's own automatic
-compaction per invocation (`providers/compaction.py`) from
-`CODEPARTNER_AUTO_COMPACT_TOKENS` (default `250000`; `off` keeps each CLI's default).
-
-**Claude Code.** Gets `--settings` with `{"autoCompactWindow": N}`. For coder runs it also
-gets a `PreCompact` command hook that prints the task's preservation brief: the task id,
-goal, acceptance criteria, excluded files, and what to keep (modified files, outstanding
-steps, validation results, unresolved errors, the handoff). Claude Code uses the hook's
-output as custom instructions for its native summary. Limitations:
-- `autoCompactWindow` sets the window. Claude Code compacts at the window minus its summary
-  buffer. With Claude Code 2.1.303, measured with `get_context_usage()`, that buffer is
-  33k, so a 250k window compacts at about 217k tokens.
-- Claude Code uses `min(model context window, N)`. Haiku 4.5 has a 200k window, so it stays
-  at 200k (compacting at 167k). Sonnet 5 and Opus 5 drop from about 1M to 250k.
-- An operator-set `CLAUDE_CODE_AUTO_COMPACT_WINDOW` takes precedence over the setting.
-
-**Codex CLI.** Gets `-c model_auto_compact_token_limit=N`. Codex already runs with
-`--ignore-user-config`, so `~/.codex/config.toml` is neither read nor changed, and a `-c`
-override in `CODEX_ARGS` still wins. Codex has no hook for preservation instructions: its
-only knob, `compact_prompt`, would replace the whole native summarizer prompt, so it is not
-set. Codex keeps recent user messages, including the task prompt, next to its summary. A
-model whose context window is smaller than N cannot reach the threshold before its window
-fills. In the local Codex 0.146.0 model cache, the gpt-5.6 models have a 272k window with
-95% usable, about 258k, so 250k fits. Models missing from that cache (for example
-`gpt-6.1-sol`) have not been checked.
-
-**What is recorded.** Each run's metadata records
-`context_compaction: {requested_auto_compact_tokens, mechanism}` (what was asked for). It
-appends to `compactions` only when the CLI actually reports a compaction: Claude's
-`compact_boundary` message with its trigger and `pre_tokens`, or Codex's
-`context_compaction` item. The task contract and CodePartner's execution records stay
-authoritative after a compaction.
-
 ### Subagents: Delegation and source-reading rules
 
 Every tool result a native run receives stays in the CLI's transcript and is read again on

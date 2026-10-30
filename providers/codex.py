@@ -32,7 +32,7 @@ from mcp_bridge import mcp_http
 from mcp_bridge import server as engine
 from mcp_bridge.models import ErrorEvent, Event, ProgressEvent, Run, TextEvent
 from mcp_bridge.registry import ROLE_CODER, ToolSpec, allowed_for, native_bridged_specs
-from providers import compaction, scope_guard, subagents
+from providers import scope_guard, subagents
 from providers.base import Provider
 from telemetry import tracing
 
@@ -50,8 +50,6 @@ _TIER_ENV = {
 }
 
 
-# `codex exec --json` item types that mark a native context compaction.
-COMPACTION_ITEMS = frozenset({"context_compaction", "contextCompaction"})
 # Codex reports subagent spawns and waits as this item type; the child's own tool
 # calls never appear in the parent's stream.
 COLLAB_ITEM = "collab_tool_call"
@@ -323,8 +321,6 @@ class CodexProvider(Provider):
                 args += ["-c", "features.shell_tool=false"]
             if hosted_planner:
                 run.metadata["exploration_mode"] = "reader"
-            run.metadata["context_compaction"] = compaction.requested(
-                "codex model_auto_compact_token_limit")
             item_types: Counter[str] = Counter()
             reviewer_tool_activity: list[dict[str, str | bool]] = []
             turn_open = False
@@ -366,11 +362,6 @@ class CodexProvider(Provider):
                                 "status": str(item.get("status") or "unknown"),
                                 "has_error": bool(item.get("error")),
                             })
-                if (obj.get("type") == "item.completed"
-                        and (obj.get("item") or {}).get("type") in COMPACTION_ITEMS):
-                    run.metadata.setdefault("compactions", []).append(
-                        {"trigger": "auto", "item": (obj.get("item") or {}).get("type")})
-                    log.info("codex native compaction recorded")
                 event = parse_event(obj)
                 if event is not None:
                     await run.put(event)
@@ -456,8 +447,6 @@ class CodexProvider(Provider):
                 # persistent config mutation is required for this attempt.
                 "-c", "model_providers.agentgateway.requires_openai_auth=true",
             ]
-        # Native auto-compaction threshold; `CODEX_ARGS` below can still override it.
-        args += compaction.codex_args()
         # This run's subagent roles (`providers.subagents`); native runs only.
         args += subagent_args or []
         # Escape hatch for CLI-level choices we don't model (`--oss`, `--profile`,

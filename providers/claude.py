@@ -20,7 +20,6 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     HookMatcher,
     ResultMessage,
-    SystemMessage,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
@@ -37,7 +36,7 @@ from mcp_bridge.activity import describe_native
 from mcp_bridge.models import Event, ProgressEvent, Run, TextEvent
 from mcp_bridge.registry import (KB_NAVIGATION_TOOLS, ROLE_CODER, ToolSpec, allowed_for,
                                    native_bridged_specs)
-from providers import compaction, scope_guard, subagents
+from providers import scope_guard, subagents
 from providers.base import Provider
 from telemetry import tracing
 
@@ -125,14 +124,6 @@ async def _progress(run: Run, name: str, arguments: dict | None,
             return
         line = ("✏️ " if name in NATIVE_WRITE_TOOLS else "🔎 ") + line
     await run.put(ProgressEvent(f"- {line}\n"))
-
-
-def record_compaction(run: Run, data: dict) -> None:
-    """Record a compaction the CLI actually performed (not one merely configured)."""
-    meta = data.get("compact_metadata") or data
-    entry = {"trigger": meta.get("trigger"), "pre_tokens": meta.get("pre_tokens")}
-    run.metadata.setdefault("compactions", []).append(entry)
-    log.info("claude native compaction: %s", entry)
 
 
 def bash_exit_code(result: ToolResultBlock) -> int | None:
@@ -363,14 +354,9 @@ class ClaudeProvider(Provider):
                  # Only CodePartner's reader/checks subagents, never the built-in ones.
                  **({"CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS": "1"} if children else {}),
                  **(execution_env or {})},
-            # Native auto-compaction threshold and preservation brief for this run only.
-            settings=compaction.claude_settings(
-                (getattr(run, "metadata", None) or {}).get("compaction_brief")),
             **({"effort": reasoning_effort} if reasoning_effort else {}),
             **native_options,
         )
-        if isinstance(getattr(run, "metadata", None), dict):
-            run.metadata["context_compaction"] = compaction.requested("claude autoCompactWindow")
         terminal = "endTurn"
         commands: dict[str, str] = {}  # pending native Bash tool_use id -> command
         spawned: dict[str, str | None] = {}  # Agent tool_use id -> role; its result is a brief
@@ -447,8 +433,6 @@ class ClaudeProvider(Provider):
                         result = message.tool_use_result
                         if isinstance(result, dict):
                             tracker.child_usage(result.get("usage"))
-            elif isinstance(message, SystemMessage) and message.subtype == "compact_boundary":
-                record_compaction(run, message.data)
             elif isinstance(message, ResultMessage):
                 terminal = message.terminal_reason
                 run.usage = _add_usage(run.usage, message.usage)
