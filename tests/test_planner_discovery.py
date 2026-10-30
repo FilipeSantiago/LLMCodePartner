@@ -2,7 +2,7 @@
 
 import unittest
 
-from agent.planning.discovery import DiscoveryTracker, evidence_seed, paths_in
+from agent.kb_first import DiscoveryTracker, evidence_seed, paths_in
 from agent.routing.tool_metrics import instrument_handlers
 from mcp_bridge.registry import ToolSpec
 from tests import native_mode

@@ -1650,9 +1650,8 @@ class _SelectingReviewer(ReviewService):
 class ReviewerSelectionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         # These assertions cover the legacy preloaded-snapshot review mode.
-        config = load_routing_config()
-        selective = replace(config, discovery=replace(config.discovery, policy="selective"))
-        patch = mock.patch("agent.routing.review.load_routing_config", return_value=selective)
+        patch = mock.patch("agent.routing.review.load_routing_config",
+                           return_value=load_routing_config())
         patch.start()
         self.addCleanup(patch.stop)
 

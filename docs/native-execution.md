@@ -22,9 +22,8 @@ This covers every agent and Code Partner's own file work:
 The IDE MCP bridge stays available **only for IDE-specific extras**: inspections
 (`get_file_problems`), symbol lookups, `find_usages`, refactorings, formatting, run
 configurations and notebooks. The IDE chat also still identifies the conversation
-and its project. Codebase Memory (`kb_*`) stays available to native runs. Under
-`discovery.policy: kb_first` their prompt says they MUST consult it before the first
-read of each code file; nothing intercepts their reads (docs/codebase-memory.md).
+and its project. Codebase Memory (`kb_*`) stays available to native runs. Their prompt
+says they MUST consult it before the first read of each code file; nothing intercepts their reads (docs/codebase-memory.md).
 
 ## How a conversation finds its project
 
@@ -135,8 +134,7 @@ IDE-specific tools stay available: inspections (`get_file_problems`), symbol
 lookups, `find_usages`, refactorings, formatting, run configurations, notebooks
 and the IDE dispatcher. Codebase Memory `kb_*` tools stay too.
 
-**KB-first.** Native agents keep Codebase Memory `kb_*` tools under every policy. Under
-`discovery.policy: kb_first` their prompt requires a KB lookup before the first read of
+**KB-first.** Native agents keep Codebase Memory `kb_*` tools. Their prompt requires a KB lookup before the first read of
 each code file; it is a prompt rule, not an interception, so native execution is
 unaffected. See docs/codebase-memory.md.
 

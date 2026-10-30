@@ -234,7 +234,6 @@ class TaskExecutionNativeTests(_Fixture):
     async def _execute(self, owner=None, contract=None):
         executor = _Executor()
         config = load_routing_config()
-        config = replace(config, discovery=replace(config.discovery, policy="selective"))
         service = TaskExecutionService(
             config=config, router=ModelRoutingService(config, Router("claude-haiku")),
             persistence=RoutingPersistence(self.root / "routing.sqlite3"),
@@ -615,7 +614,6 @@ class NativePlannerTests(_Fixture):
         provider = PlannerProvider(plan_payload())
         persistence = RoutingPersistence(self.root / "routing.sqlite3")
         config = load_routing_config()
-        config = replace(config, discovery=replace(config.discovery, policy="selective"))
         planner = WPPlannerService(PlanArtifacts(), persistence, config=config,
                                    provider_lookup=lambda _name: provider)
         turn = asyncio.run(planner.start("conv", "WP4", "Let's do WP4", _specs(), {}))
@@ -633,7 +631,6 @@ class NativePlannerTests(_Fixture):
         from tests.test_wp_planner import PlanArtifacts, PlannerProvider, plan_payload
         provider = PlannerProvider(plan_payload())
         config = load_routing_config()
-        config = replace(config, discovery=replace(config.discovery, policy="selective"))
         planner = WPPlannerService(PlanArtifacts(),
                                    RoutingPersistence(self.root / "routing.sqlite3"),
                                    config=config,
@@ -658,7 +655,6 @@ class NativeReviewerTests(_Fixture):
             object.__setattr__(queued, "_review_reference_paths", frozenset({"src/ref.py"}))
         with mock.patch("agent.routing.review.providers.get", return_value=provider):
             config = load_routing_config()
-            config = replace(config, discovery=replace(config.discovery, policy="selective"))
             return asyncio.run(ReviewService(config=config).review(
                 SimpleNamespace(title="Change", work_packages=[]), queued, report,
                 "claude-haiku", [], {}))

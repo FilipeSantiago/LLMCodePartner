@@ -18,7 +18,6 @@ class RoutingConfigError(ValueError):
 
 
 ROLES = ("coder", "reviewer", "planner")
-KB_POLICIES = ("selective", "kb_first")
 PLANNER_TIERS = ("low", "medium", "high", "complex")
 _EFFORTS = {"low", "medium", "high", "xhigh"}
 
@@ -35,8 +34,8 @@ def _expand(value: object) -> object:
 
 DISCOVERY_MODES = ("off", "observe", "advise")
 DISCOVERY_LIMITS = ("tool_calls", "full_reads", "est_added_tokens", "repeated_or_unexplained_reads")
-ROLE_DISCOVERY_LIMITS = ("discovery_calls", "full_reads", "est_added_tokens",
-                         "repeated_or_unexplained_reads")
+PLANNER_DISCOVERY_LIMITS = ("discovery_calls", "full_reads", "est_added_tokens",
+                            "repeated_or_unexplained_reads")
 _DEFAULT_DISCOVERY_LIMITS = {
     "low": (15, 2, 40000, 3),
     "medium": (25, 4, 70000, 4),
@@ -47,43 +46,27 @@ _DEFAULT_DISCOVERY_LIMITS = {
 
 @dataclass(frozen=True)
 class DiscoveryConfig:
-    """Shared KB-first discovery settings; thresholds are advisory only."""
+    """The planner's KB-first discovery settings; thresholds are advisory only."""
     # off: no advisories; observe: record only; advise: soft-threshold advisories.
     mode: str = "advise"
-    # The KB rule in the agent prompts (`agent.prompt.PromptBuilder.read_pipeline`):
-    # kb_first: every role MUST consult Codebase Memory before the first read of each code
-    # file. selective: coders and reviewers use KB tools on demand; planners stay KB-first.
-    # A prompt rule only: nothing intercepts reads, and native execution is unaffected.
-    policy: str = "selective"
-    enabled: bool = True
     # A whole read whose returned response is smaller than this counts as targeted (L2).
     small_file_bytes: int = 6000
     thresholds: dict[str, dict[str, int]] = field(default_factory=lambda: {
         tier: dict(zip(DISCOVERY_LIMITS, values))
         for tier, values in _DEFAULT_DISCOVERY_LIMITS.items()})
-    role_modes: dict[str, str] = field(default_factory=dict)
-    role_thresholds: dict[str, dict[str, dict[str, int]]] = field(default_factory=dict)
+    # `roles.planner` in the config: its own mode and per-tier thresholds.
+    planner_mode: str | None = None
+    planner_thresholds: dict[str, dict[str, int]] = field(default_factory=dict)
 
-    def gated(self, role: str) -> bool:
-        """Whether this role is KB-first, so its discovery advisories apply."""
-        return self.policy == "kb_first" or role == "planner"
+    def planner_mode_or_default(self) -> str:
+        return self.planner_mode or self.mode
 
-    def mode_for(self, role: str) -> str:
-        if not self.gated(role):
-            return "observe"
-        return self.role_modes.get(role, self.mode)
-
-    def thresholds_for(self, role: str, tier: str) -> dict[str, int]:
-        if role == "planner":
-            base = dict(self.thresholds.get(tier, self.thresholds["medium"]))
-            override = self.role_thresholds.get(role, {}).get(tier, {})
-            if "discovery_calls" in override:
-                base.pop("tool_calls", None)
-            return {**base, **override}
-        defaults = {"coder": (25, 4, 60000, 5),
-                    "reviewer": (20, 3, 40000, 4)}
-        base = dict(zip(ROLE_DISCOVERY_LIMITS, defaults.get(role, defaults["coder"])))
-        return {**base, **self.role_thresholds.get(role, {}).get(tier, {})}
+    def planner_thresholds_for(self, tier: str) -> dict[str, int]:
+        base = dict(self.thresholds.get(tier, self.thresholds["medium"]))
+        override = self.planner_thresholds.get(tier, {})
+        if "discovery_calls" in override:
+            base.pop("tool_calls", None)
+        return {**base, **override}
 
 
 @dataclass(frozen=True)
@@ -417,32 +400,21 @@ def _discovery_config(raw: object) -> DiscoveryConfig:
             raise RoutingConfigError(
                 f"planner discovery thresholds.{tier} values must be positive integers")
         thresholds[tier] = merged
-    enabled = raw.get("enabled", default.enabled)
-    if not isinstance(enabled, bool):
-        raise RoutingConfigError("discovery enabled must be boolean")
     roles = raw.get("roles") or {}
-    if not isinstance(roles, dict) or set(roles) - set(ROLES):
-        raise RoutingConfigError("discovery roles must be planner, coder and reviewer")
-    role_modes = {}
-    role_thresholds = {}
-    for role, settings in roles.items():
-        if not isinstance(settings, dict):
-            raise RoutingConfigError(f"discovery roles.{role} must be a mapping")
-        selected = settings.get("mode", mode)
-        if selected not in DISCOVERY_MODES:
-            raise RoutingConfigError(f"invalid discovery mode for {role}")
-        role_modes[role] = selected
-        tiers = settings.get("thresholds") or {}
-        if not isinstance(tiers, dict):
-            raise RoutingConfigError(f"discovery roles.{role}.thresholds must be a mapping")
-        for tier, limits in tiers.items():
-            if not isinstance(limits, dict) or set(limits) - set(ROLE_DISCOVERY_LIMITS):
-                raise RoutingConfigError(f"invalid discovery thresholds for {role}/{tier}")
-            if not all(_positive(value) for value in limits.values()):
-                raise RoutingConfigError(f"discovery thresholds for {role}/{tier} must be positive")
-        role_thresholds[role] = tiers
-    policy = raw.get("policy", default.policy)
-    if policy not in KB_POLICIES:
-        raise RoutingConfigError(f"discovery policy must be one of {KB_POLICIES}")
-    return DiscoveryConfig(mode, policy, enabled, small, thresholds, role_modes,
-                           role_thresholds)
+    if not isinstance(roles, dict) or set(roles) - {"planner"}:
+        raise RoutingConfigError("discovery roles accepts only planner")
+    settings = roles.get("planner") or {}
+    if not isinstance(settings, dict):
+        raise RoutingConfigError("discovery roles.planner must be a mapping")
+    planner_mode = settings.get("mode")
+    if planner_mode is not None and planner_mode not in DISCOVERY_MODES:
+        raise RoutingConfigError("invalid discovery mode for planner")
+    tiers = settings.get("thresholds") or {}
+    if not isinstance(tiers, dict):
+        raise RoutingConfigError("discovery roles.planner.thresholds must be a mapping")
+    for tier, limits in tiers.items():
+        if not isinstance(limits, dict) or set(limits) - set(PLANNER_DISCOVERY_LIMITS):
+            raise RoutingConfigError(f"invalid discovery thresholds for planner/{tier}")
+        if not all(_positive(value) for value in limits.values()):
+            raise RoutingConfigError(f"discovery thresholds for planner/{tier} must be positive")
+    return DiscoveryConfig(mode, small, thresholds, planner_mode, tiers)

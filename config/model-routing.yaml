@@ -98,16 +98,9 @@ subagents:
     claude: claude-haiku
     codex: codex-luna-low
   max_turns: 20
-# Shared KB-first discovery and advisory telemetry (docs/codebase-memory.md).
-# Global disable preserves the original authorized tool behavior; advisories
-# never replace the hard planner caps above.
+# The planner's KB-first discovery advisories (docs/codebase-memory.md); they never
+# replace the hard planner caps above.
 discovery:
-  enabled: true
-  # kb_first: every agent's prompt says it MUST consult Codebase Memory before the first
-  # read of each code file, then read only the ranges it points to (KB to locate, files
-  # as truth). A prompt rule only: nothing intercepts reads, so native execution and
-  # subagents stay available. selective makes KB use optional for coders and reviewers.
-  policy: kb_first
   mode: advise
   small_file_bytes: 6000
   roles:
@@ -118,19 +111,6 @@ discovery:
         medium: {discovery_calls: 25, full_reads: 4, est_added_tokens: 70000, repeated_or_unexplained_reads: 4}
         high: {discovery_calls: 35, full_reads: 6, est_added_tokens: 100000, repeated_or_unexplained_reads: 6}
         complex: {discovery_calls: 45, full_reads: 8, est_added_tokens: 140000, repeated_or_unexplained_reads: 8}
-    coder:
-      mode: advise
-      thresholds:
-        simple: {discovery_calls: 18, full_reads: 3, est_added_tokens: 30000, repeated_or_unexplained_reads: 4}
-        medium: {discovery_calls: 25, full_reads: 4, est_added_tokens: 60000, repeated_or_unexplained_reads: 5}
-        complex: {discovery_calls: 35, full_reads: 6, est_added_tokens: 100000, repeated_or_unexplained_reads: 7}
-    reviewer:
-      mode: advise
-      thresholds:
-        low: {discovery_calls: 15, full_reads: 2, est_added_tokens: 25000, repeated_or_unexplained_reads: 3}
-        medium: {discovery_calls: 20, full_reads: 3, est_added_tokens: 40000, repeated_or_unexplained_reads: 4}
-        high: {discovery_calls: 30, full_reads: 5, est_added_tokens: 70000, repeated_or_unexplained_reads: 6}
-        complex: {discovery_calls: 40, full_reads: 6, est_added_tokens: 100000, repeated_or_unexplained_reads: 8}
   thresholds:
     low: {tool_calls: 15, full_reads: 2, est_added_tokens: 40000, repeated_or_unexplained_reads: 3}
     medium: {tool_calls: 25, full_reads: 4, est_added_tokens: 70000, repeated_or_unexplained_reads: 4}

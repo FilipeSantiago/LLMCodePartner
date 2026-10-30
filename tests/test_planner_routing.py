@@ -104,23 +104,13 @@ class PlannerConfigTests(unittest.TestCase):
         self.assertEqual(_load(lambda raw: raw["discovery"].update(mode="advise")
                                ).planner.discovery.mode, "advise")
 
-    def test_discovery_role_thresholds_and_global_disable(self):
+    def test_planner_discovery_role_mode_and_thresholds(self):
         discovery = _load().discovery
-        self.assertTrue(discovery.enabled)
-        self.assertEqual(discovery.policy, "kb_first")
-        # kb_first (configured): every role is gated.
-        self.assertEqual(discovery.mode_for("coder"), "advise")
-        self.assertTrue(discovery.gated("reviewer"))
-        # Selective: planners keep KB-first gates; coders and reviewers only observe.
-        selective = _load(lambda raw: raw["discovery"].update(policy="selective")).discovery
-        self.assertEqual(selective.mode_for("planner"), "advise")
-        self.assertEqual(selective.mode_for("coder"), "observe")
-        self.assertFalse(selective.gated("reviewer"))
-        with self.assertRaisesRegex(RoutingConfigError, "policy"):
-            _load(lambda raw: raw["discovery"].update(policy="always"))
-        self.assertEqual(discovery.thresholds_for("coder", "simple")["discovery_calls"], 18)
-        self.assertFalse(_load(lambda raw: raw["discovery"].update(enabled=False)
-                               ).discovery.enabled)
+        self.assertEqual(discovery.planner_mode_or_default(), "advise")
+        self.assertEqual(discovery.planner_thresholds_for("low")["discovery_calls"], 15)
+        self.assertNotIn("tool_calls", discovery.planner_thresholds_for("low"))
+        with self.assertRaisesRegex(RoutingConfigError, "planner"):
+            _load(lambda raw: raw["discovery"]["roles"].update(coder={"mode": "advise"}))
 
     def test_config_without_planner_or_roles_still_loads(self):
         def legacy(raw):

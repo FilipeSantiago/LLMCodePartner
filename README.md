@@ -131,9 +131,9 @@ into the image. `.dockerignore` excludes the local `.env` file.
   execution (routing, Claude/Codex runs, MCP tool calls; no prompts or source) to a
   separate OTel Collector + self-hosted Langfuse stack (`compose.observability.yaml`).
   See [docs/observability.md](docs/observability.md).
-- LLM provider: `.env` `LLM_PROVIDER=claude|codex|ollama` (see Providers).
+- LLM provider: `.env` `LLM_PROVIDER=claude|codex` (see Providers).
 - Coder provider: `.env` `CODER_PROVIDER=claude|codex`, independent of `LLM_PROVIDER`.
-- Ollama model: `.env` `OLLAMA_MODEL` (and `OLLAMA_HOST`).
+- Turn classifier model: `.env` `OLLAMA_MODEL` (and `OLLAMA_HOST`), or `IMPLEMENT_INTENT_MODEL`.
 
 ## OpenSpec planning commands
 
@@ -343,7 +343,6 @@ difference is how a tool call is intercepted:
 |---|---|---|
 | `claude` | local `claude` CLI (Agent SDK) | in-process **MCP server**; the SDK calls a Python handler mid-generation |
 | `codex` | local `codex` CLI (`codex exec --json`) | **MCP server over HTTP** (`mcp_bridge/mcp_http.py`): codex is a child process, so the run's tools are published at a private, run-scoped `/mcp/<token>` |
-| `ollama` | local Ollama `/api/chat` (`OLLAMA_HOST`/`OLLAMA_MODEL`) | **native tool calling**: a chat loop that sends `tools`, reads `message.tool_calls`, and feeds `role:"tool"` results back |
 
 Codex runs with `-s read-only`, so its own shell/`apply_patch` cannot write: the
 only way for it to change the project is the IDE-backed write tools. Its endpoint
@@ -352,7 +351,7 @@ Neutral model tiers (`haiku`/`sonnet`/`opus`) map to codex models via `CODEX_MOD
 (fallback `CODEX_MODEL`, then the CLI default); `MCP_PUBLIC_BASE` is how the child
 process addresses this app.
 
-All three strategies converge on `mcp_bridge.bridge.call_tool` (mint id → emit a
+Both strategies converge on `mcp_bridge.bridge.call_tool` (mint id → emit a
 `ToolCallEvent` → await the JetBrains result), so the events/SSE/resume layer and
 JetBrains itself are identical regardless of provider. The engine (`mcp_bridge/`)
 is provider-neutral — it imports no LLM SDK; the model-specific run strategy lives
@@ -426,8 +425,7 @@ so the security blocks live on its two borders, not in the model and not in the 
 - **Locked tool surface** (`providers/*.py`) — Claude gets `tools=[]` (no native
   Read/Write/Bash) and `allowed_tools=["mcp__jetbrains__…"]`; Codex runs `-s read-only`,
   so its own shell/`apply_patch` cannot write and its endpoint serves only the run's
-  registry; Ollama's choice is grammar-bound by a JSON schema and the name is
-  re-checked afterwards.
+  registry.
 - **Timeout** (`mcp_bridge/bridge.py`) — `MCP_TOOL_TIMEOUT`, 120 s per parked future.
   A late result is refused rather than applied.
 
@@ -440,46 +438,6 @@ IDE against the project you have open.
 
 ![MCP bridge, detailed](docs/img/mcp-bridge-detail.svg)
 
-</details>
-
-### Sequence diagram
-
-Detailed round trip for the **Ollama** provider (stateless: the client re-sends the
-full conversation each turn; the tool decision is constrained by a JSON schema).
-Claude follows the same wire shape but intercepts tools via its in-process MCP
-server instead of a `/api/chat` decision call.
-
-![Tool-call sequence diagram](docs/img/sequence.svg)
-
-<details><summary>Mermaid source (for editing)</summary>
-
-```mermaid
-sequenceDiagram
-    participant J as JetBrains Chat
-    participant B as Backend /v1/chat/completions
-    participant P as Ollama provider
-    participant O as Ollama (qwen2.5-coder)
-
-    Note over J,O: Turn 1 — model decides it needs a tool
-    J->>B: POST (messages + tools, stream:true)
-    B->>B: to_messages(history); select provider (LLM_PROVIDER)
-    B->>P: tool_chat(messages, tool specs)
-    P->>O: POST /api/chat (format=decision schema, stream:false, temp:0)
-    O-->>P: {"tool":"get_file_text_by_path","arguments":{...}}
-    P-->>B: ("tool_calls", [...])
-    B-->>J: SSE delta.tool_calls + finish_reason=tool_calls + [DONE]
-    J->>J: execute the tool against the ACTIVE project
-
-    Note over J,O: Turn 2 — client re-sends full history (incl. role:tool result) → answer
-    J->>B: POST (full history + role:"tool" result)
-    B->>P: tool_chat(history)
-    P->>O: POST /api/chat (decision schema)
-    O-->>P: {"tool":"none"}
-    P->>O: POST /api/chat (stream:true, no tools)
-    O-->>P: streamed answer tokens
-    P-->>B: ("text", chunks)
-    B-->>J: SSE content deltas + finish_reason=stop + [DONE]
-```
 </details>
 
 Because the tool runs in the IDE, a call is bounced out to JetBrains and its

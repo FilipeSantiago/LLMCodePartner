@@ -183,14 +183,12 @@ planner-vs-downstream cost comparison.
 
 ### KB-first discovery
 
-In `kb_first`, coder and reviewer prompts consult Codebase Memory before reading code.
+Coder and reviewer prompts consult Codebase Memory before reading code.
 The planner has one read pipeline: consult KB, choose the minimum current source needed,
 and delegate source inspection to its `reader` subagent when offered. The parent plans
 from its cited brief. If KB is unavailable, it still delegates narrow inspection; if
 the reader is unavailable or fails, it may make bounded direct reads and records why.
-This is prompt guidance only; nothing intercepts native reads.
-With the `selective` policy, coders and reviewers use the KB on demand. Set top-level
-`discovery.enabled` to false to disable discovery telemetry and advisories. See
+This is prompt guidance only; nothing intercepts native reads. See
 [Codebase Memory](codebase-memory.md).
 
 The planner uses this read pipeline in every discovery mode. KB results locate source;
@@ -229,9 +227,7 @@ needed, plus a sufficiency checklist. The first time a per-tier soft threshold
 is reached (`tool_calls`, `full_reads`, `est_added_tokens`,
 `repeated_or_unexplained_reads`), one `[Planning advisory, not a limit]` line is
 appended to that tool result and recorded in `threshold_crossings`. Advisories
-never refuse a call; the hard caps above stay in force. Coders and reviewers get the
-context-first `KB_SELECTIVE_GUIDANCE` under the default `selective` policy, and the
-shared KB-first guidance under `kb_first`. The baseline and rollout status are in
+never refuse a call; the hard caps above stay in force. The baseline and rollout status are in
 `openspec/changes/optimize-planner-discovery/design.md`. To compare benchmark arms:
 
 ```

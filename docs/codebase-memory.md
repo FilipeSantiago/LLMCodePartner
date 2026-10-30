@@ -98,20 +98,16 @@ every agent to batch lookups: one `search_graph` with a `name_pattern` alternati
 whether or not recorded edits are newer than the index; coding keeps the conditional
 catch-up.
 
-**Discovery policy.** `discovery.policy` in `config/model-routing.yaml` decides the KB
-rule for coders and reviewers (`PromptBuilder.read_pipeline` in `agent/prompt/base.py`;
-see [prompts](prompts.md)):
-- **`kb_first` (configured).** Coder and reviewer prompts, including their subagents,
-  get the read pipeline: before the first read of each code file they consult Codebase
-  Memory, then read only the relevant current-source ranges. The planner has a separate
-  single read pipeline: query KB, choose minimal files and ranges, delegate source
-  inspection to its reader when offered, and plan from the cited brief. Direct bounded
-  planner reads are the disclosed fallback when the reader is unavailable or fails.
-- **`selective`.** Coders and reviewers start from the task, the approved plan context
-  and current source, and query the KB on demand. The planner keeps its read pipeline.
+**KB-first rule** (`PromptBuilder.read_pipeline` in `agent/prompt/base.py`; see
+[prompts](prompts.md)). Coder and reviewer prompts, including their subagents, get the
+read pipeline: before the first read of each code file they consult Codebase Memory,
+then read only the relevant current-source ranges. The planner has a separate single
+read pipeline: query KB, choose minimal files and ranges, delegate source inspection to
+its reader when offered, and plan from the cited brief. Direct bounded planner reads are
+the disclosed fallback when the reader is unavailable or fails.
 
 This is a prompt rule only. Nothing intercepts, replaces or refuses a read or a search,
-so native execution and subagents work under either policy. Compliance is measured, not
+so native execution and subagents work with it. Compliance is measured, not
 enforced: native runs record `kb_calls` next to their reads in `native_tool_metrics`, and
 the planner's advise-mode `discovery` telemetry still records retrieval levels and may
 append a one-line advisory to a result.

@@ -333,7 +333,7 @@ class WPPlannerService:
         prompt = builder.with_context(PlannerPromptContext(
             brief, session["discussion"], session["draft"], message,
             narrate=self.config.planner.narrate, kb_status=kb_status,
-            discovery_guidance=self.config.planner.discovery.mode_for("planner") == "advise",
+            discovery_guidance=self.config.planner.discovery.planner_mode_or_default() == "advise",
             native=native_plan.native,
             subagent_request=None if hosted_reader else _planner_subagents(self.config),
             file_inventory=inventory,
@@ -342,7 +342,7 @@ class WPPlannerService:
                       if hosted_reader and any(spec.name == "kb_query_graph" for spec in specs)
                       else frozenset(spec.name for spec in specs)),
             hosted_reader=hosted_reader)).build().text
-        mode = self.config.planner.discovery.mode_for("planner")
+        mode = self.config.planner.discovery.planner_mode_or_default()
         evidence = evidence_seed(brief + "\n" + message, kb_status) if mode != "off" else None
         conversation = [{"role": "user", "content": prompt}]
         reply = await self._call(session, revision, kind, message, conversation, specs, handlers,
@@ -467,11 +467,11 @@ class WPPlannerService:
         # Read-only native run: its own file tools and the KB, under the KB-first prompt rule.
         native = read_only_session(plan.project) if plan.native else None
         discovery = self.config.planner.discovery
-        planner_mode = discovery.mode_for("planner")
+        planner_mode = discovery.planner_mode_or_default()
         # In observe the tracker changes nothing; in advise it may append advisories.
         tracker = (DiscoveryTracker(
             evidence, discovery.small_file_bytes, _kb_offered(specs),
-            thresholds=(discovery.thresholds_for("planner", session["wp_complexity"])
+            thresholds=(discovery.planner_thresholds_for(session["wp_complexity"])
                         if planner_mode == "advise" else None),
             tier=session["wp_complexity"])
                    if evidence is not None and planner_mode != "off" and native is None
