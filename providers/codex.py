@@ -40,8 +40,7 @@ log = logging.getLogger("codepartner.providers.codex")
 
 BIN = os.getenv("CODEX_BIN", "codex")
 
-# The neutral tiers the Optimizer emits (`agent.prompt_optimizer.MODEL_CHOICES`) are
-# Claude-shaped names; each provider maps them to its own models. Unset = whatever
+# Neutral model tiers are Claude-shaped names; each provider maps them to its own models. Unset = whatever
 # `CODEX_MODEL` says, and failing that the CLI's own default.
 _TIER_ENV = {
     "haiku": "CODEX_MODEL_SIMPLE",

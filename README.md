@@ -132,12 +132,8 @@ into the image. `.dockerignore` excludes the local `.env` file.
   separate OTel Collector + self-hosted Langfuse stack (`compose.observability.yaml`).
   See [docs/observability.md](docs/observability.md).
 - LLM provider: `.env` `LLM_PROVIDER=claude|codex|ollama` (see Providers).
-- Coder provider: `.env` `CODER_PROVIDER=claude|codex` — who executes the accepted
-  prompt in the pipeline, independent of `LLM_PROVIDER`.
+- Coder provider: `.env` `CODER_PROVIDER=claude|codex`, independent of `LLM_PROVIDER`.
 - Ollama model: `.env` `OLLAMA_MODEL` (and `OLLAMA_HOST`).
-- Prompt-optimizer pipeline (opt-in): `.env` `OPTIMIZER_ENABLED=true`; the
-  optimizer may run on a sturdier instruction-follower via `OPTIMIZER_MODEL`
-  (defaults to `OLLAMA_MODEL`). See **Prompt-optimizer pipeline**.
 
 ## OpenSpec planning commands
 
@@ -334,20 +330,8 @@ conversation-scoped server configuration. They do not require
 `JETBRAINS_MCP_URL` or `JETBRAINS_MCP_PROJECT_PATH`. If a source-write/refactor
 capability is absent or unsupported, implementation reports the missing capability;
 `/implement` can still execute genuine research deliverables. If the artifact store cannot be
-accessed, implementation cannot proceed. `/spec` and `/update` bypass the
-optimizer/coder pipeline and never execute generated tasks.
-
-Optimizer tuning — all optional, and every default reproduces the pre-existing
-behaviour (one rewrite call, no reads):
-
-| var | default | meaning |
-|---|---|---|
-| `OPTIMIZER_MODEL_LADDER` | `OPTIMIZER_MODEL` / `OLLAMA_MODEL` | comma-separated escalation ladder, **weakest first** |
-| `OPTIMIZER_MIN_CONFIDENCE` | `medium` | `low`\|`medium`\|`high` — below this, escalate |
-| `OPTIMIZER_READ_CONTEXT` | `true` | let the optimizer read the project before rewriting |
-| `OPTIMIZER_MAX_CONTEXT_CALLS` | `3` | read round trips before the rewrite is forced |
-
-An empty value (`FOO=`) counts as unset, not as "off".
+accessed, implementation cannot proceed. `/spec` and `/update` never execute
+generated tasks.
 
 ## Providers
 
@@ -364,7 +348,7 @@ difference is how a tool call is intercepted:
 Codex runs with `-s read-only`, so its own shell/`apply_patch` cannot write: the
 only way for it to change the project is the IDE-backed write tools. Its endpoint
 lives exactly as long as the run — a finished run leaves nothing callable behind.
-Optimizer tiers map to codex models via `CODEX_MODEL_SIMPLE`/`_MEDIUM`/`_COMPLEX`
+Neutral model tiers (`haiku`/`sonnet`/`opus`) map to codex models via `CODEX_MODEL_SIMPLE`/`_MEDIUM`/`_COMPLEX`
 (fallback `CODEX_MODEL`, then the CLI default); `MCP_PUBLIC_BASE` is how the child
 process addresses this app.
 
@@ -373,62 +357,6 @@ All three strategies converge on `mcp_bridge.bridge.call_tool` (mint id → emit
 JetBrains itself are identical regardless of provider. The engine (`mcp_bridge/`)
 is provider-neutral — it imports no LLM SDK; the model-specific run strategy lives
 in each `providers/<name>.py` and is injected by the controller.
-
-## Prompt-optimizer pipeline (opt-in)
-
-When `OPTIMIZER_ENABLED=true`, a tool-advertising stream is driven by a small
-workflow instead of a single provider call (`agent/pipeline.py`):
-
-```
-Optimizer (Ollama) → [read-only context round trips] → human `accept` → Coder (Claude)
-```
-
-- **Optimizer** (`agent/prompt_optimizer.py`) rewrites the user's request into a
-  single, self-contained prompt for the coder. It does **not** implement anything
-  or guess file paths. Its output is forced through a grammar-constrained JSON
-  schema (Ollama `format=`), so even a flaky local model can only fill the fields.
-- **Read-only context.** Before rewriting, the optimizer may spend a bounded number of
-  round trips reading the project through the IDE's tools, so the rewrite can name files
-  it actually looked at instead of guessing. It holds `ROLE_OPTIMIZER` (READ only), so it
-  cannot edit anything — see the allowlist section below. There is no internal loop:
-  because the backend is stateless, each invocation either emits **one** tool call and
-  returns, or decides it has seen enough and rewrites. The budget is derived from the
-  resent history (`OPTIMIZER_MAX_CONTEXT_CALLS`, default 3), which is what guarantees the
-  loop terminates. Disable with `OPTIMIZER_READ_CONTEXT=false`.
-- Alongside the rewritten prompt it **suggests a coder model tier** based on the
-  request's complexity — an enum-constrained choice, so it can't hallucinate:
-
-  | complexity | tier |
-  |---|---|
-  | `simple` (single-file, localized) | `haiku` |
-  | `medium` (a few files / moderate logic) | `sonnet` |
-  | `complex` (multi-file, cross-cutting, ambiguous) | `opus` |
-
-- **Weak→strong escalation.** The rewrite runs on a ladder of local models, **weakest
-  first** (`OPTIMIZER_MODEL_LADDER`, comma-separated). A rung's result is accepted only if
-  it clears both checks; otherwise the next rung retries the same request:
-
-  | check | escalates when |
-  |---|---|
-  | self-reported `confidence` | below `OPTIMIZER_MIN_CONFIDENCE` (default `medium`) |
-  | structural degeneracy | empty prompt, a tier outside `MODEL_CHOICES`, or a rewrite less than half the length of the request |
-
-  The second check is the load-bearing one — a small model's self-assessment is weak
-  signal, but an empty prompt is an empty prompt. If every rung is rejected, the
-  strongest rung's result is used anyway (a flawed prompt you can edit beats no
-  proposal). Unset, the ladder is a single rung — exactly one call, as before.
-- The turn is streamed back as a **two-section acceptance proposal**: the enhanced
-  prompt, then a `--- suggested model config ---` block carrying the tier, the reasoning,
-  and an `Analyzed by:` line naming the local model that produced it and how many rungs it
-  took. Reply `accept` to send it to the coder, or reply with feedback to keep refining.
-- On `accept`, the clean prompt (suggestion block stripped) goes to the **Coder**
-  (`agent/coder.py`, `CODER_PROVIDER`), and the accepted tier is applied by that
-  provider — `ClaudeAgentOptions.model` for Claude, `CODEX_MODEL_*` for Codex. The
-  Optimizer's tier vocabulary stays provider-neutral: each provider maps it to its
-  own models, so switching coders needs no change here. Because the backend is
-  stateless (JetBrains re-sends
-  the whole conversation each turn), the current stage is a pure function of the
-  resent history — no server-side session.
 
 ## How Claude reaches the project (MCP bridge over JetBrains tools)
 
@@ -457,17 +385,13 @@ And who gets what (`ROLES`, resolved via `allowed_for(role)`):
 
 | role | tools | why |
 |---|---|---|
-| `optimizer` (`agent/prompt_optimizer.py`) | `READ` | it reasons about the request; it must never modify the repo |
-| `coder` (`agent/coder.py`, and the direct no-pipeline path) | `READ + WRITE + REFACTOR` | it applies the accepted change |
+| `optimizer` (planner, reviewer and other read-only roles) | `READ` | it must never modify the repo |
+| `coder` | `READ + WRITE + REFACTOR` | it applies the accepted change |
 
 An **unrecognized** role fails closed to `READ` — a typo'd role name costs capability,
 not safety. `allowed_for(None)` yields the full ceiling (`SUPPORTED`) for un-roled
 callers. The role is fixed on the `Run` at `start_run`, so later tool-result resumes
 stay inside the same allowlist.
-
-The optimizer's `READ` grant is live, not theoretical: it now makes real tool calls to
-gather context before rewriting (see **Prompt-optimizer pipeline**), and the write tools
-are filtered out before it is ever asked which tool to call.
 
 > The exact write-tool identifiers your IDE advertises are version-specific.
 > During the temporary bridge investigation, inspect `codepartner.*` DEBUG logs to
@@ -497,7 +421,7 @@ so the security blocks live on its two borders, not in the model and not in the 
 
 - **Per-role allowlist** (`mcp_bridge/registry.py`) — `ToolRegistry.register` keeps only
   `allowed_for(role)` ∩ what the IDE advertised. The list is per agent, not global: the
-  optimizer gets `READ`, the coder `READ + WRITE + REFACTOR`. A name outside the role
+  read-only roles get `READ`, the coder `READ + WRITE + REFACTOR`. A name outside the role
   never becomes a callable tool, so no handler is ever built for it.
 - **Locked tool surface** (`providers/*.py`) — Claude gets `tools=[]` (no native
   Read/Write/Bash) and `allowed_tools=["mcp__jetbrains__…"]`; Codex runs `-s read-only`,
@@ -506,8 +430,6 @@ so the security blocks live on its two borders, not in the model and not in the 
   re-checked afterwards.
 - **Timeout** (`mcp_bridge/bridge.py`) — `MCP_TOOL_TIMEOUT`, 120 s per parked future.
   A late result is refused rather than applied.
-- **Human accept gate** (`agent/pipeline.py`, opt-in) — nothing reaches the writing
-  model until a user message is `accept`.
 
 What the bridge deliberately does *not* do: confine paths to a project root, sandbox
 anything, cap result size, or authenticate `/v1/chat/completions` — and it logs tool
@@ -588,11 +510,8 @@ open in the meantime by an `asyncio.Future` keyed by `tool_call_id`.
 - **State:** in process memory only — no database, no auth, no IDE plugin.
 - **Logs (`mcp_bridge`):** tools received · mcp tool registration · tool call
   emitted · tool result received · tool timeout · cleanup.
-- **Usage & observability:** each stage logs its token spend — `ollama usage`
-  (optimizer: `prompt_eval_count`/`eval_count`) and `claude coder usage` (coder:
-  per-model `model_usage` + `total_cost_usd`). Because the optimizer (Ollama) and
-  coder (Claude) are separate calls, this attributes tokens per model per request.
-  The terminal SSE event also carries an OpenAI-style `usage` chunk
+- **Usage & observability:** each run logs its token spend (`claude coder usage`:
+  per-model `model_usage` + `total_cost_usd`). The terminal SSE event also carries an OpenAI-style `usage` chunk
   (`conversation/streaming_responder.py`).
 
 All MCP/bridge code lives in the `mcp_bridge/` package

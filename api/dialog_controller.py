@@ -19,7 +19,6 @@ from fastapi import APIRouter, HTTPException
 from starlette.responses import StreamingResponse
 
 import providers
-from agent import pipeline
 from agent.spec import (
     ArtifactSelectionError,
     ArtifactStoreError,
@@ -1306,20 +1305,11 @@ async def chat_completions(request: ChatCompletionRequest):
 
     provider = providers.active()
 
-    # OPTIMIZER PIPELINE (opt-in): when enabled, tool-advertising streams are driven
-    # by the workflow (Optimizer → human accept → Coder) instead of a single provider.
-    # The pipeline yields the same neutral events, so drain_events serializes it too.
-    if pipeline.is_enabled() and request.stream and active_specs:
-        return StreamingResponder().drain_events(
-            pipeline.run(request, active_specs, direct_handlers), request.model, created
-        )
-
     # TOOL TURN: hand the full resent history to the active provider's uniform
     # `tools()` and drain its neutral events. Every stateful/stateless detail —
     # start vs. resume, background run vs. one-shot — is private to the provider,
-    # so this controller (and the engine) stay provider-agnostic. With the pipeline
-    # off this is a coding agent talking straight to the IDE, so it runs as
-    # ROLE_CODER — stated explicitly rather than inheriting the un-roled ceiling.
+    # so this controller (and the engine) stay provider-agnostic. This is a coding
+    # agent talking straight to the IDE, so it runs as ROLE_CODER — stated explicitly rather than inheriting the un-roled ceiling.
     if request.stream and (active_specs or results):
         if not results and last.get("role") == "user" and not _workflow_replay.get():
             # A fresh user turn reaches the coding agent only through a confirmed
